@@ -554,7 +554,7 @@ On Android, the system SHALL force a relayout once the resume sequence (`_onResu
 
 The resume sequence is ordered so the repaint is deterministic. `_onResumed` SHALL run the app-lifecycle resume (`_resumeAfterLifecyclePause`) to completion, then handle any pinned-shortcut and share intents, and only then fire `_nudgeSurfaceRepaint` once — against the final `_currentIndex`. Running the lifecycle resume and the shortcut switch concurrently (the previous fire-and-forget pair) raced over `_currentIndex` and webview pause/resume, and let two repaint loops interleave on the shared `_repaintNudge`. `_nudgeSurfaceRepaint` then:
 
-- Toggles a transient 1px body inset around the IndexedStack several times over ~0.5s.
+- Toggles a transient 1px body inset on the right edge around the IndexedStack several times over ~0.5s; using the right edge preserves the vertical viewport height and composer/navigation spacing while recompositing.
 - Each `setState` repaints the Flutter base surface (status-bar strip and chrome); each size flip resizes the webview platform view, forcing its `SurfaceView` to recomposite.
 - The nudge is spread across multiple frames because the recreated surface may not be attached on the first frame after resume — a single rebuild (the one already in `_setCurrentIndex`) fires too early to help.
 - The inset is always 0 in steady state and the nudge is a no-op on non-Android platforms.

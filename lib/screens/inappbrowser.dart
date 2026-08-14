@@ -825,12 +825,13 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
                 _toggleFind();
               },
             ),
-          // 1px inset toggled by _nudgeSurfaceRepaint forces the nested
-          // hybrid-composition SurfaceView to recomposite after a back
-          // navigation (BUG-001 gap #1). Zero inset in steady state.
+          // The transient 1px inset uses the right edge so the recomposite
+          // after back navigation preserves vertical viewport height
+          // (BUG-001 gap #1).
+          // Zero inset in steady state.
           Expanded(
             child: Padding(
-              padding: EdgeInsets.only(bottom: _repaintNudge ? 1.0 : 0.0),
+              padding: EdgeInsets.only(right: _repaintNudge ? 1.0 : 0.0),
               // KeyedSubtree key bumped by _handleRendererGone remounts a fresh
               // InAppWebView after a renderer death (BUG-002 gap #1).
               child: KeyedSubtree(key: ValueKey(_rendererGen), child: _webView),

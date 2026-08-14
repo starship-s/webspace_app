@@ -7919,13 +7919,12 @@ class _WebSpacePageState extends State<WebSpacePage>
                 if (_loadedIndices.isNotEmpty)
                   Offstage(
                     offstage: _currentIndex == null || _currentIndex! >= _webViewModels.length,
-                    // The 1px inset is toggled by _nudgeSurfaceRepaint after
-                    // the activity is recreated (shortcut/resume) to force the
-                    // hybrid-composition webview SurfaceView to recomposite —
-                    // otherwise it can come back black on Android. No-op
-                    // (zero inset) in steady state.
+                    // The transient 1px inset uses the right edge so
+                    // recompositing does not change the vertical viewport
+                    // height or composer/navigation spacing. No-op (zero
+                    // inset) in steady state.
                     child: Padding(
-                      padding: EdgeInsets.only(bottom: _repaintNudge ? 1.0 : 0.0),
+                      padding: EdgeInsets.only(right: _repaintNudge ? 1.0 : 0.0),
                       child: IndexedStack(
                       index: _currentIndex ?? 0,
                       children: _webViewModels.asMap().entries.map<Widget>((entry) {
@@ -8120,11 +8119,11 @@ class _WebSpacePageState extends State<WebSpacePage>
                       ),
                     ),
                   ),
-                // Fullscreen exit zone: touch target at the top edge with a
-                // visible handle just below the status bar / notch area.
+                // Fullscreen exit zone: invisible touch target at the top edge
+                // spanning the safe-area height plus 20px.
                 // The back button/gesture keeps its normal behavior (web
                 // history back, open drawer, etc.) even while in fullscreen.
-                // KIOSK-003: no exit handle in a locked session.
+                // KIOSK-003: no exit target in a locked session.
                 if (_isFullscreen && !_kioskLocked)
                   Builder(builder: (context) {
                     final topPadding = MediaQuery.of(context).padding.top;
@@ -8133,29 +8132,19 @@ class _WebSpacePageState extends State<WebSpacePage>
                       left: 0,
                       right: 0,
                       height: topPadding + 20,
-                      // Only the centered handle catches the exit tap. The rest
-                      // of the strip stays transparent to pointers so web-app
-                      // controls in the top corners (e.g. a sidebar toggle) get
-                      // the tap instead of exiting fullscreen. github #401
+                      // Only the centered 96px-wide target catches the exit
+                      // tap. The rest of the strip stays transparent to
+                      // pointers so web-app controls in the top corners (e.g.
+                      // a sidebar toggle) get the tap instead of exiting
+                      // fullscreen. github #401
                       child: Align(
                         alignment: Alignment.topCenter,
                         child: GestureDetector(
                           behavior: HitTestBehavior.opaque,
                           onTap: _exitFullscreen,
-                          child: Container(
+                          child: SizedBox(
                             width: 96,
                             height: topPadding + 20,
-                            alignment: Alignment.bottomCenter,
-                            color: Colors.transparent,
-                            child: Container(
-                              margin: const EdgeInsets.only(bottom: 5),
-                              width: 36,
-                              height: 5,
-                              decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.5),
-                                borderRadius: BorderRadius.circular(2.5),
-                              ),
-                            ),
                           ),
                         ),
                       ),

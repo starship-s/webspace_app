@@ -73,16 +73,17 @@ The system SHALL allow the user to exit full screen by tapping the top edge of t
 
 **Given** the user enters full screen mode
 **Then** a brief SnackBar is shown: "Tap the top of the screen to exit full screen"
-**And** a visible translucent handle is displayed just below the status bar / notch area
+**And** an invisible centered exit target spans the safe-area height just below the status bar / notch area
 
-**Rationale:** The exit zone spans `MediaQuery.padding.top + 20px` vertically but only a centered 96px-wide band catches the tap; the top corners stay transparent to pointers so web-app controls there (e.g. a sidebar toggle) receive the tap instead of exiting fullscreen. The back gesture is not consumed by fullscreen so users can navigate normally while immersed.
+**Rationale:** The exit zone spans `MediaQuery.padding.top + 20px` vertically but only an invisible centered 96px-wide target catches the tap; the top corners stay transparent to pointers so web-app controls there (e.g. a sidebar toggle) remain tappable instead of exiting fullscreen. The back gesture is not consumed by fullscreen so users can navigate normally while immersed.
 
 #### Scenario: Web control in top corner stays tappable
 
 **Given** the user is in full screen mode on a site with a control in the top-left or top-right corner
 **When** the user taps that corner
 **Then** the tap reaches the web content (full screen is not exited)
-**And** tapping the centered handle still exits full screen
+**And** the top corners remain tappable
+**And** tapping the centered invisible target still exits full screen
 
 ---
 
@@ -346,7 +347,7 @@ The presentation is backed by two booleans, `showTabStrip` (pinned) and `tabBarB
 - **Input bar**: `_buildInputBar()` returns null when `_isFullscreen`
 - **Body insets**: The fullscreen body keeps top/bottom `SafeArea` active (`top: _isFullscreen`, `bottom: _isFullscreen || ...`). Android uses `edgeToEdge`, so its status/navigation bars remain visible; on non-Android platforms, `immersiveSticky` hides them when supported. When a bar persists, the inset keeps the site's top/bottom controls clear of it. When the bars are truly hidden the inset is ~0 and the webview still fills the screen. Left/right insets are dropped in fullscreen (`left: !_isFullscreen`, `right: !_isFullscreen`) so the webview uses the display-cutout strip beside a landscape notch (FS-010); out of fullscreen they stay active so chrome avoids the notch.
 - **Display cutout (FS-010)**: `MainActivity.onCreate` sets `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` (API 28+) so the window may extend into the cutout on short edges. This keeps Android edge-to-edge content from letterboxing the cutout strip black.
-- **Exit zone**: top edge when fullscreen (`MediaQuery.padding.top + 20px`, measured inside the body `SafeArea`) with a visible handle just below the notch/status bar. Only a centered 96px-wide `GestureDetector` catches the exit tap; the rest of the strip is transparent to pointers so web-app controls in the top corners stay tappable (github #401)
+- **Exit zone**: top edge when fullscreen (`MediaQuery.padding.top + 20px`, measured inside the body `SafeArea`) with an invisible centered 96px-wide `GestureDetector` target. Only that target catches the exit tap; the rest of the strip is transparent to pointers so web-app controls in the top corners stay tappable (github #401)
 - **Fullscreen hint**: SnackBar shown on entering fullscreen to explain exit method
 - **Menu items**: "Full Screen" added to both app bar and tab strip popup menus
 
