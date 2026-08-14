@@ -175,10 +175,8 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
   /// Surface-repaint nudge for this nested webview (BUG-001 gap #1). A back
   /// navigation that restores a bfcached page re-attaches a blank Android
   /// SurfaceView; mirror the main page's `_goBackAndRepaint`/`_nudgeSurfaceRepaint`
-  /// here so the nested screen recomposites too. Pure-Dart engine drives the
-  /// 1px-inset toggle rendered below; no-op off Android.
+  /// here so the nested screen recomposites too. No-op off Android.
   final SurfaceRepaintEngine _surfaceRepaint = SurfaceRepaintEngine();
-  bool _repaintNudge = false;
 
   /// Recovery state for a load the OS stranded while the app was backgrounded
   /// (PAUSE-022). The nested screen is as exposed as the main page: it is the
@@ -424,9 +422,19 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
         _surfaceRepaint.abort();
         return;
       }
+      final controller = _controller;
+      if (controller == null) {
+        _surfaceRepaint.abort();
+        return;
+      }
       final t = _surfaceRepaint.tick();
-      setState(() => _repaintNudge = t.inset);
       if (t.done) return;
+      try {
+        unawaited(controller.requestRepaint().catchError((_) {}));
+      } catch (_) {
+        _surfaceRepaint.abort();
+        return;
+      }
       Future.delayed(const Duration(milliseconds: 100), tick);
     }
 
@@ -825,17 +833,10 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
                 _toggleFind();
               },
             ),
-          // The transient 1px inset uses the right edge so the recomposite
-          // after back navigation preserves vertical viewport height
-          // (BUG-001 gap #1).
-          // Zero inset in steady state.
           Expanded(
-            child: Padding(
-              padding: EdgeInsets.only(right: _repaintNudge ? 1.0 : 0.0),
-              // KeyedSubtree key bumped by _handleRendererGone remounts a fresh
-              // InAppWebView after a renderer death (BUG-002 gap #1).
-              child: KeyedSubtree(key: ValueKey(_rendererGen), child: _webView),
-            ),
+            // KeyedSubtree key bumped by _handleRendererGone remounts a fresh
+            // InAppWebView after a renderer death (BUG-002 gap #1).
+            child: KeyedSubtree(key: ValueKey(_rendererGen), child: _webView),
           ),
           if (_showUrlBar)
             SafeArea(

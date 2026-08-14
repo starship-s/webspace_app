@@ -22,6 +22,11 @@ class _RecordingController extends Fake implements WebViewController {
   }
 
   @override
+  Future<void> requestRepaint() async {
+    calls.add('requestRepaint');
+  }
+
+  @override
   Future<void> pauseAllJsTimers() async {
     calls.add('pauseAllJsTimers');
   }
@@ -46,6 +51,14 @@ WebViewModel _modelWith(
 }
 
 void main() {
+  group('WebViewController native repaint wrapper', () {
+    test('exposes the native repaint request through the WebSpace API', () async {
+      final c = _RecordingController();
+      await c.requestRepaint();
+      expect(c.calls, ['requestRepaint']);
+    });
+  });
+
   group('WebViewModel pause/resume API split', () {
     test('pauseWebView() invokes only the per-instance pause', () async {
       final c = _RecordingController();

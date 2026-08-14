@@ -25,20 +25,19 @@ void main() {
   });
 
   group('coalescing tick machine', () {
-    test('first request starts the loop and drains to a settled zero inset', () {
+    test('first request emits six repaint pulses and terminates', () {
       final e = SurfaceRepaintEngine();
       expect(e.request(), isTrue);
       expect(e.isLooping, isTrue);
 
-      final insets = <bool>[];
+      var pulses = 0;
       RepaintTick t;
       do {
         t = e.tick();
-        if (!t.done) insets.add(t.inset);
+        if (!t.done) pulses++;
       } while (!t.done);
 
-      expect(insets, [true, false, true, false, true, false]);
-      expect(e.inset, isFalse, reason: 'settled at zero');
+      expect(pulses, SurfaceRepaintEngine.ticksPerRequest);
       expect(e.isLooping, isFalse);
     });
 
@@ -50,7 +49,7 @@ void main() {
       expect(e.isLooping, isTrue);
     });
 
-    test('refill mid-loop extends the budget and still settles at zero', () {
+    test('refill mid-loop extends the budget and still terminates', () {
       final e = SurfaceRepaintEngine();
       e.request();
       e.tick();
@@ -66,28 +65,27 @@ void main() {
       } while (!t.done);
 
       expect(ticks, greaterThan(3), reason: 'budget was refilled, not exhausted');
-      expect(e.inset, isFalse);
       expect(e.isLooping, isFalse);
     });
 
-    test('abort stops the loop with no inset owed', () {
+    test('abort stops the loop before the next repaint pulse', () {
       final e = SurfaceRepaintEngine();
       e.request();
-      e.tick(); // inset now true
+      expect(e.tick().done, isFalse);
       e.abort();
       expect(e.isLooping, isFalse);
-      expect(e.inset, isFalse);
+      expect(e.tick().done, isTrue);
     });
   });
 
   group('interleaving under FakeAsync (the nudge-loop race)', () {
     // Host harness mirroring _nudgeSurfaceRepaint but Timer-based (no Flutter):
-    // two nudges fired mid-loop must coalesce onto ONE loop that terminates at a
-    // zero inset — the race attempts 2-3 fixed by making the loop re-entrant.
+    // two nudges fired mid-loop must coalesce onto ONE loop that terminates —
+    // the race attempts 2-3 fixed by making the loop re-entrant.
     test('two nudges 50ms apart run a single terminating loop', () {
       fakeAsync((async) {
         final e = SurfaceRepaintEngine();
-        var rendered = false; // stands in for setState(_repaintNudge = ...)
+        var pulses = 0;
         var loopsStarted = 0;
 
         void nudge() {
@@ -95,8 +93,8 @@ void main() {
           loopsStarted++;
           void tick() {
             final t = e.tick();
-            rendered = t.inset;
             if (t.done) return;
+            pulses++;
             Future.delayed(const Duration(milliseconds: 100), tick);
           }
 
@@ -109,7 +107,8 @@ void main() {
 
         expect(loopsStarted, 1, reason: 'coalesced onto a single loop');
         expect(e.isLooping, isFalse, reason: 'loop terminated');
-        expect(rendered, isFalse, reason: 'settled at zero inset');
+        expect(pulses, greaterThan(SurfaceRepaintEngine.ticksPerRequest),
+            reason: 'the coalesced request refilled the shared budget');
       });
     });
   });

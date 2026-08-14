@@ -985,13 +985,9 @@ class _WebSpacePageState extends State<WebSpacePage>
   bool _isBackHandling = false;
   bool _isFindVisible = false;
   bool _isFullscreen = false;
-  // Toggled by _nudgeSurfaceRepaint to apply a transient 1px inset that
-  // forces Android hybrid-composition platform views to recomposite after
-  // the activity is recreated (shortcut/resume). Always false in steady state.
-  bool _repaintNudge = false;
-  // Coalescing tick machine for _nudgeSurfaceRepaint. Pure-Dart engine (no
-  // Timer/setState); the host drives the clock and renders _repaintNudge from
-  // its tick output. See lib/services/surface_repaint_engine.dart and
+  // Coalescing tick machine for _nudgeSurfaceRepaint. The host drives the
+  // clock and requests a native repaint for the current controller from each
+  // active tick. See lib/services/surface_repaint_engine.dart and
   // formal/kernel.tla (RepaintLiveness).
   final SurfaceRepaintEngine _surfaceRepaint = SurfaceRepaintEngine();
   /// When true, a full-screen opaque mask covers every webview so the
@@ -1657,8 +1653,8 @@ class _WebSpacePageState extends State<WebSpacePage>
   // Warm-start blank-surface repaint window (PAUSE-020 / BUG-001 Attempt 8).
   // On Android the hybrid-composition webview SurfaceView can re-attach a frame
   // or more AFTER `resumed` fires, later than the single tail nudge in
-  // `_onResumed`, so that nudge flips the 1px inset before the surface exists
-  // and the page comes back blank-white. A surface (re)attach re-lays-out the
+  // `_onResumed`, so that nudge lands before the surface exists and the page
+  // comes back blank-white. A surface (re)attach re-lays-out the
   // window, which Flutter delivers as `didChangeMetrics`. That is the closest
   // Dart-side signal to the actual attach (every prior attempt nudged on a
   // lifecycle event instead), so we re-nudge on it — but only inside a short
@@ -1687,7 +1683,7 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// intent is handled: both mutate `_currentIndex` and pause/resume
   /// webviews, and the previous fire-and-forget pair let the shortcut's site
   /// switch race the resume. Sequencing also lets a single surface repaint
-  /// run once, against the final visible site, instead of two `_repaintNudge`
+  /// run once, against the final visible site, instead of two repaint
   /// loops interleaving. Re-entry guarded in case `resumed` fires twice.
   Future<void> _onResumed() async {
     if (_isResuming) return;
@@ -1863,28 +1859,37 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// confirmed recover the screen. A JS `offsetHeight` read does not, because
   /// it relayouts web content, not the Android surface.
   ///
-  /// Toggle a 1px body inset a few times over ~0.5s: each setState repaints
-  /// the Flutter surface (status-bar strip, chrome) and each size flip forces
-  /// the webview platform view to recomposite. Spread across several frames
-  /// because the new surface may not be attached on the first frame after
-  /// resume, which is why a single rebuild (e.g. the one in _setCurrentIndex)
-  /// is not enough on its own.
+  /// Request a native platform-view repaint a few times over ~0.5s. Spread
+  /// across several frames because the new surface may not be attached on the
+  /// first frame after resume, which is why a single request is not enough.
   void _nudgeSurfaceRepaint() {
     if (!Platform.isAndroid) return;
     // Coalesce concurrent callers (e.g. _setCurrentIndex from a warm-shortcut
-    // _openShortcutIndex, then _onResumed's tail call) onto a single loop: the
-    // engine refills the tick budget and reports whether a loop is already
-    // running, so two interleaving loops can't toggle the inset against each
-    // other. Settling at a zero inset on an odd refill is the engine's job.
+    // _openShortcutIndex, then _onResumed's tail call) onto a single loop.
     if (!_surfaceRepaint.request()) return;
     void tick() {
       if (!mounted) {
         _surfaceRepaint.abort();
         return;
       }
+      final index = _currentIndex;
+      if (index == null || index < 0 || index >= _webViewModels.length) {
+        _surfaceRepaint.abort();
+        return;
+      }
+      final controller = _webViewModels[index].controller;
+      if (controller == null) {
+        _surfaceRepaint.abort();
+        return;
+      }
       final t = _surfaceRepaint.tick();
-      setState(() => _repaintNudge = t.inset);
       if (t.done) return;
+      try {
+        unawaited(controller.requestRepaint().catchError((_) {}));
+      } catch (_) {
+        _surfaceRepaint.abort();
+        return;
+      }
       Future.delayed(const Duration(milliseconds: 100), tick);
     }
     tick();
@@ -7919,13 +7924,7 @@ class _WebSpacePageState extends State<WebSpacePage>
                 if (_loadedIndices.isNotEmpty)
                   Offstage(
                     offstage: _currentIndex == null || _currentIndex! >= _webViewModels.length,
-                    // The transient 1px inset uses the right edge so
-                    // recompositing does not change the vertical viewport
-                    // height or composer/navigation spacing. No-op (zero
-                    // inset) in steady state.
-                    child: Padding(
-                      padding: EdgeInsets.only(right: _repaintNudge ? 1.0 : 0.0),
-                      child: IndexedStack(
+                    child: IndexedStack(
                       index: _currentIndex ?? 0,
                       children: _webViewModels.asMap().entries.map<Widget>((entry) {
                         final index = entry.key;
@@ -8091,7 +8090,6 @@ class _WebSpacePageState extends State<WebSpacePage>
                           ),
                         );
                       }).toList(),
-                      ),
                     ),
                   ),
                 // Fullscreen sessions (including kiosk-locked, where

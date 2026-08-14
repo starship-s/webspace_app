@@ -35,6 +35,20 @@ for (const rel of GUARDED) {
   const near = (i, b, a) =>
     lines.slice(Math.max(0, i - b), i + a + 1).join('\n');
 
+  test(`${rel}: repaint ticks call the native wrapper without geometry changes`, () => {
+    const defIdx = lines.findIndex((l) =>
+      /void\s+_nudgeSurfaceRepaint\s*\(/.test(l),
+    );
+    assert.ok(defIdx >= 0, '_nudgeSurfaceRepaint must be defined');
+    const body = lines.slice(defIdx, defIdx + 32).join('\n');
+    assert.match(body, /controller\.requestRepaint\(\)/,
+      'each active tick must invoke the WebSpace controller wrapper');
+    assert.doesNotMatch(body, /setState\(|_repaintNudge|EdgeInsets|Padding\(/,
+      'repaint must not mutate Flutter widget geometry');
+    assert.doesNotMatch(src, /_repaintNudge/,
+      'repaint-only geometry state must not exist in either host');
+  });
+
   test(`${rel}: _goBackAndRepaint funnel exists and recomposites the surface`, () => {
     const defIdx = lines.findIndex((l) =>
       /Future<void>\s+_goBackAndRepaint\s*\(/.test(l),

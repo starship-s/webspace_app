@@ -552,12 +552,11 @@ On Android the probe doubles as the surface paint nudge: reading `offsetHeight` 
 
 On Android, the system SHALL force a relayout once the resume sequence (`_onResumed`) has settled the active site, to repaint a platform-view surface that re-attached blank. When the activity is recreated (e.g. a pinned-shortcut tap), the Flutter base surface and the hybrid-composition webview `SurfaceView` can re-attach without receiving a paint: the renderer is alive (taps, scroll, JS all work) but the **web page area renders black, and the strip behind the edge-to-edge status bar renders black too** — distinct from a dead renderer (PAUSE-013/PAUSE-014), which a JS probe cannot detect because the renderer is healthy. The blank surface clears the moment a relayout occurs (device rotation, lock/unlock, or a tab switch).
 
-The resume sequence is ordered so the repaint is deterministic. `_onResumed` SHALL run the app-lifecycle resume (`_resumeAfterLifecyclePause`) to completion, then handle any pinned-shortcut and share intents, and only then fire `_nudgeSurfaceRepaint` once — against the final `_currentIndex`. Running the lifecycle resume and the shortcut switch concurrently (the previous fire-and-forget pair) raced over `_currentIndex` and webview pause/resume, and let two repaint loops interleave on the shared `_repaintNudge`. `_nudgeSurfaceRepaint` then:
+The resume sequence is ordered so the repaint is deterministic. `_onResumed` SHALL run the app-lifecycle resume (`_resumeAfterLifecyclePause`) to completion, then handle any pinned-shortcut and share intents, and only then fire `_nudgeSurfaceRepaint` once — against the final `_currentIndex`. Running the lifecycle resume and the shortcut switch concurrently (the previous fire-and-forget pair) raced over `_currentIndex` and webview pause/resume, and let two repaint loops interleave. `_nudgeSurfaceRepaint` then:
 
-- Toggles a transient 1px body inset on the right edge around the IndexedStack several times over ~0.5s; using the right edge preserves the vertical viewport height and composer/navigation spacing while recompositing.
-- Each `setState` repaints the Flutter base surface (status-bar strip and chrome); each size flip resizes the webview platform view, forcing its `SurfaceView` to recomposite.
-- The nudge is spread across multiple frames because the recreated surface may not be attached on the first frame after resume — a single rebuild (the one already in `_setCurrentIndex`) fires too early to help.
-- The inset is always 0 in steady state and the nudge is a no-op on non-Android platforms.
+- Calls the fork's geometry-free native `requestRepaint()` operation for the currently visible controller on each active tick.
+- Spreads six active repaint pulses across ~0.5s because the recreated surface may not be attached on the first frame after resume — a single request can fire too early to help.
+- Leaves Flutter widget constraints and the platform-view dimensions unchanged; it is a no-op on non-Android platforms.
 
 This is complementary to PAUSE-014: the probe recreates a *dead* renderer; the surface nudge repaints a *live* renderer whose surface came back blank. A JS `offsetHeight` read addresses neither the Flutter base surface nor the Android `SurfaceView` composition, which is why it is insufficient on its own.
 
@@ -567,8 +566,8 @@ This is complementary to PAUSE-014: the probe recreates a *dead* renderer; the s
 **And** the user taps its pinned shortcut, which recreates the Android activity
 **And** the webview platform-view surface re-attaches without a paint (page area and status-bar strip are black, page is alive)
 **When** `_onResumed` finishes the lifecycle resume, then `_handleShortcutIntent` activates the site, then fires `_nudgeSurfaceRepaint`
-**Then** `_nudgeSurfaceRepaint` toggles the 1px inset across several frames against the activated site
-**And** the Flutter surface repaints and the webview `SurfaceView` recomposites
+**Then** `_nudgeSurfaceRepaint` requests native repaint across six active ticks against the activated site
+**And** the webview `SurfaceView` relayouts and invalidates without a dimension change
 **And** the page and status-bar strip become visible without the user rotating or locking the device
 
 #### Scenario: Shortcut switch does not race the lifecycle resume
@@ -584,7 +583,7 @@ This is complementary to PAUSE-014: the probe recreates a *dead* renderer; the s
 **Given** the app is running on iOS/macOS/Linux, or no activity restart occurred
 **When** `_nudgeSurfaceRepaint` would run
 **Then** it is a no-op on non-Android platforms
-**And** `_repaintNudge` remains false so the body inset stays 0 — no visible jitter during normal use
+**And** no repaint-only widget state or geometry change occurs — no visible jitter during normal use
 
 ### Requirement: PAUSE-017 — Surface Repaint On Fresh Controller Attach
 
@@ -645,11 +644,11 @@ Every `_probeRendererAndRecover` call SHALL carry a `trigger` label and emit one
 
 ### Requirement: PAUSE-020 — Warm-Start Repaint On The Surface-Attach Signal
 
-On Android, the system SHALL re-fire the surface repaint when the visible webview's `SurfaceView` re-attaches after a warm resume, not only once at the tail of `_onResumed`. On a warm start (the process stayed alive; the user backgrounded the app and returned) the hybrid-composition `SurfaceView`'s surface is destroyed on background and re-created on foreground. That re-attach can land a frame or more **after** `AppLifecycleState.resumed` fires — later than `_onResumed`'s single tail nudge (PAUSE-015), so the 1px inset toggles before the surface exists and the freshly-attached-but-unpainted surface stays blank (rendering **white**, the fresh surface's default fill). This is the same class as PAUSE-015/017/018 reached through a new trigger: every prior fix nudged on a Dart-side *lifecycle event*, but the defect is tied to the *surface (re)attach*, which those events only approximate in time.
+On Android, the system SHALL re-fire the surface repaint when the visible webview's `SurfaceView` re-attaches after a warm resume, not only once at the tail of `_onResumed`. On a warm start (the process stayed alive; the user backgrounded the app and returned) the hybrid-composition `SurfaceView`'s surface is destroyed on background and re-created on foreground. That re-attach can land a frame or more **after** `AppLifecycleState.resumed` fires — later than `_onResumed`'s single tail nudge (PAUSE-015), so the native repaint requests can land before the surface exists and the freshly-attached-but-unpainted surface stays blank (rendering **white**, the fresh surface's default fill). This is the same class as PAUSE-015/017/018 reached through a new trigger: every prior fix nudged on a Dart-side *lifecycle event*, but the defect is tied to the *surface (re)attach*, which those events only approximate in time.
 
 A surface (re)attach re-lays-out the window, which Flutter delivers to the host as `didChangeMetrics` — the closest Dart-side signal to the actual attach. The host SHALL, on `resumed`, open a bounded repaint window (`_openResumeRepaintWindow`, ~3s) and, while it is open, fire `_nudgeSurfaceRepaint` from `didChangeMetrics`. The window bound keeps steady-state metric changes (keyboard show/hide, rotation) from nudging; `_nudgeSurfaceRepaint` coalesces, so a burst of metric changes keeps a single tick loop alive rather than spawning competing loops. This is additive to PAUSE-015's tail nudge (which still covers the surface that was already attached by the time the sequence settled) and is a no-op off Android.
 
-This narrows BUG-001 open gap #3 (the fix should key on the attach, not the lifecycle event) without closing it: `didChangeMetrics` is a proxy for the attach, not a native surface-changed callback from the fork, which remains the durable single-chokepoint fix.
+This narrows BUG-001 open gap #3 (the fix should key on the attach, not the lifecycle event) without closing trigger coverage: `didChangeMetrics` is a proxy for the attach, not a native surface-changed callback from the fork. Attempt 10 removes the geometry dependency from the repaint operation, while the callback remains a future way to reduce the list of Dart-side triggers.
 
 The ordering is model-checked in [formal/warmstart.tla](../../../formal/warmstart.tla): with only the resume one-shot nudge (`Fix="none"`) an async `SurfaceReattach` landing after it drains leaves the surface blank forever and `RepaintLiveness` is violated (the reproduction); an attach-triggered re-nudge (`Fix="attach"`) makes it hold. This is the ordering the kernel's atomic `Resume == Attach` plus `WF_vars(Nudge)` cannot express (BUG-001 gap #4). The runnable counterpart is `test/surface_repaint_engine_test.dart` (the `SurfaceRepaintEngine` `owed`/`attach` characterization), and the wiring is held by the `surface_repaint_funnel` structural gate. The device premise (that `didChangeMetrics` fires on the webview surface reattach) is confirmed by the `SurfaceDiag` `trigger=metrics-resume` log line, not by these models.
 
@@ -676,7 +675,7 @@ Repainting only when `reload()` is issued is insufficient, and for the same orde
 
 Every reload of a webview SHALL go through a funnel that fires the latch: `WebViewModel.reloadAndRepaint` for the main page (covering the Refresh button and Clear-cookies via `userDrivenReload`, pull-to-refresh, the `restoreState` materialize reload, and the notification background refresh) and `_reloadAndRepaint` in `InAppWebViewScreen` for the nested screen (menu Refresh and pull-to-refresh). Reloads the webview factory issues on its own — the cached-HTML one-shot live refresh — SHALL report through `WebViewConfig.onReloadIssued` so they latch identically. The funnels are held by the `surface_repaint_funnel` structural gate; a new raw `controller.reload()` fails CI. All of it is a no-op off Android.
 
-This is per-path like every prior attempt and does not close BUG-001 open gap #3; a native surface-changed callback from the fork remains the durable fix.
+This is per-path like every prior attempt and does not close BUG-001 open gap #3; a native surface-changed callback from the fork remains the durable trigger fix. Attempt 10 makes each existing repaint operation geometry-free.
 
 The ordering is the one already model-checked in [formal/warmstart.tla](../../../formal/warmstart.tla) (a one-shot nudge draining before an async attach violates `RepaintLiveness`; an attach-triggered re-nudge restores it), with the reload's commit playing the part of `SurfaceReattach`. The runnable counterpart is the reload group in `test/surface_repaint_engine_test.dart`, including the timing-faithful case where a 2s reload is recovered only by the settled re-nudge.
 
@@ -700,6 +699,35 @@ Both nudges SHALL emit a non-sensitive `SurfaceDiag` line (`trigger=reload -> nu
 **Given** the notification background refresh reloads a loaded site that is not the current one
 **When** that site's load settles
 **Then** neither the latch nor the nudge fires, because both host hooks are gated on the model being the visible site
+
+---
+
+### Requirement: PAUSE-024 — Geometry-Free Native Surface Repaint (Attempt 10)
+
+On Android, the system SHALL repaint a live blank platform-view surface without changing Flutter widget geometry. The WebSpace `WebViewController.requestRepaint()` wrapper SHALL call the fork's `InAppWebViewController.requestRepaint()`, whose native operation requests layout and posts an animation invalidation without changing the WebView dimensions. Off Android the wrapper and the repaint funnel are no-ops.
+
+The main and nested hosts SHALL retain every existing `_nudgeSurfaceRepaint` trigger funnel, the shared `SurfaceRepaintEngine` coalescing behavior, its reload-pending/owed latches, and its six active ticks spaced 100 ms apart. Each active tick SHALL resolve the currently visible and attached controller and invoke `requestRepaint()`; a missing controller or unmounted host SHALL abort the loop without a force unwrap or `setState`. The engine SHALL no longer model or return an inset, and the steady and transient WebView constraints SHALL be identical.
+
+This removes the horizontal and vertical wobble caused by the former 1 px padding nudge. It does not prove that a particular Android System WebView device paints the invalidated surface, so physical validation remains required for both no-wobble geometry and blank-surface recovery.
+
+#### Scenario: Existing trigger funnels use native repaint pulses
+
+**Given** the visible Android WebView is reached through activation, controller attach, resume metrics, memory pressure, back navigation, or either reload signal
+**When** the existing trigger calls `_nudgeSurfaceRepaint`
+**Then** one coalesced loop invokes the native controller repaint operation six times at 100 ms spacing
+**And** no Flutter widget is rebuilt and no platform-view dimension changes
+
+#### Scenario: Controller disappearance aborts safely
+
+**Given** a repaint loop is active
+**When** the visible controller disappears or the host unmounts before the next tick
+**Then** the engine aborts without another native call, without throwing, and without changing reload-pending or owed latch state
+
+#### Scenario: Repaint geometry is stable
+
+**Given** the main or nested host is steady or inside a repaint loop
+**When** Flutter lays out the WebView
+**Then** the constraints are identical in both states, with no repaint-only `Padding`, `EdgeInsets`, or inset state
 
 ---
 
@@ -903,6 +931,9 @@ unawaited at the call site and failures are logged, never surfaced.
 
 ```dart
 abstract class WebViewController {
+  // Android platform-view relayout + invalidation; no-op elsewhere.
+  Future<void> requestRepaint();
+
   // Per-instance: site switching uses this only.
   Future<void> pause();
   Future<void> resume();
@@ -964,12 +995,23 @@ class _WebViewController implements WebViewController {
 - PAUSE-016: `perInstanceLifecycleCallFor` returns `none` for Android and
   desktop, `timers` for iOS — verifying the Android per-instance no-op without
   a native controller.
+- `SurfaceRepaintEngine` emits six geometry-free repaint ticks, coalesces
+  concurrent requests, and aborts safely; the native repaint call is exposed
+  through the WebSpace `WebViewController` wrapper.
+- `surface_repaint_funnel.test.js` retains the activation/back/reload/resume
+  trigger funnels and rejects repaint-only geometry in both hosts.
 
 ## Files
 
 ### Modified
 
 - `lib/services/webview.dart` — split the `WebViewController` interface; `_WebViewController.pause()` no longer calls `pauseTimers()`.
+- `lib/services/surface_repaint_engine.dart` — six-tick native repaint model
+  without inset state (Attempt 10).
+- `lib/main.dart` and `lib/screens/inappbrowser.dart` — native repaint pulses
+  with unchanged WebView geometry (Attempt 10).
+- `pubspec.yaml` / `pubspec.lock` — pin the existing flutter_inappwebview
+  overrides to the starship-s geometry-free repaint fork commit.
 - `lib/web_view_model.dart` — added `pauseForAppLifecycle()` / `resumeFromAppLifecycle()`; updated docs on `pauseWebView()` / `resumeWebView()`.
 - `lib/main.dart` — `didChangeAppLifecycleState` and `_resumeAfterLifecyclePause` use the lifecycle-named methods.
 

@@ -24,8 +24,9 @@ be saved. So the only recovery is to **dispose the dead webview and recreate it*
 `currentUrl`.
 
 **Not the same bug as [BUG-001](001-white-screen.md).** That one is a *blank surface with a
-live renderer* — JS runs, and a relayout (rotate / nudge) repaints it; the fix is a 1px
-surface nudge, never a dispose. Here the **renderer is dead** — a nudge does nothing; the
+live renderer* — JS runs, and a native geometry-free relayout plus invalidation (or a
+rotate) repaints it; the fix is a native surface repaint, never a dispose. Here the
+**renderer is dead** — a repaint request does nothing; the
 fix is destroy-and-rebuild. The two are told apart by one question: *does the page respond
 to taps / does a rotate fix it?* Yes → BUG-001 (surface). No, and JS is dead → BUG-002
 (renderer).

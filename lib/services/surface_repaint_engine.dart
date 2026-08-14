@@ -3,9 +3,9 @@
 /// two decisions and no side effects: (1) which transitions re-attach the
 /// visible hybrid-composition SurfaceView and therefore owe a repaint, and
 /// (2) the coalescing tick loop that drives `_nudgeSurfaceRepaint`. The host
-/// supplies the clock (`Future.delayed`) and the side effect (`setState` of the
-/// 1px inset); this class never imports Flutter, so it is unit- and
-/// interleaving-testable. See test/surface_repaint_engine_test.dart.
+/// supplies the clock (`Future.delayed`) and native repaint side effect; this
+/// class never imports Flutter, so it is unit- and interleaving-testable. See
+/// test/surface_repaint_engine_test.dart.
 library;
 
 /// Surface lifecycle transitions on the visible site. Every value except
@@ -24,26 +24,21 @@ enum SurfaceTransition {
   appBackground, // app going to background: no attach, no repaint owed
 }
 
-/// The action the host applies for one tick: render [inset] (the 1px inset
-/// state) via setState, then schedule the next tick unless [done].
+/// The action the host applies for one tick, then schedules the next tick
+/// unless [done].
 class RepaintTick {
-  final bool inset;
   final bool done;
-  const RepaintTick({required this.inset, required this.done});
+  const RepaintTick({required this.done});
 }
 
 class SurfaceRepaintEngine {
-  /// Number of inset toggles per request. Spread across frames because a
-  /// freshly-attached surface may not be composited on the first frame.
+  /// Number of native repaint requests per nudge. Spread across frames because
+  /// a freshly-attached surface may not be composited on the first frame.
   static const int ticksPerRequest = 6;
 
   int _ticksRemaining = 0;
   bool _looping = false;
-  bool _inset = false;
   bool _owed = false;
-
-  /// Current 1px-inset state to render.
-  bool get inset => _inset;
 
   /// Whether a tick loop is currently running.
   bool get isLooping => _looping;
@@ -97,8 +92,8 @@ class SurfaceRepaintEngine {
 
   /// Request a nudge. Refills the tick budget and returns whether the host
   /// should START the tick loop (true), or an already-running loop absorbed
-  /// the request (false). Coalescing: concurrent callers never start two loops
-  /// that would toggle the inset against each other.
+  /// the request (false). Coalescing: concurrent callers never start two
+  /// loops.
   bool request() {
     _ticksRemaining = ticksPerRequest;
     if (_looping) return false;
@@ -106,29 +101,24 @@ class SurfaceRepaintEngine {
     return true;
   }
 
-  /// Advance one tick. Toggles the inset until the budget drains, then settles
-  /// at a zero inset (an odd refill mid-loop could otherwise strand the 1px
-  /// inset, leaving a thin sliver between the webview and the tab strip).
+  /// Advance one tick until the budget drains.
   RepaintTick tick() {
     if (_ticksRemaining <= 0) {
       _looping = false;
-      _inset = false;
-      return const RepaintTick(inset: false, done: true);
+      return const RepaintTick(done: true);
     }
     _ticksRemaining--;
-    _inset = !_inset;
-    // A relayout tick recomposites whatever surface is currently attached, so
-    // it clears any owed repaint. A late attach with no subsequent tick is the
+    // A repaint tick recomposites whatever surface is currently attached, so it
+    // clears any owed repaint. A late attach with no subsequent tick is the
     // warm-start defect: `owed` stays true (formal/warmstart.tla, Fix="none").
     _owed = false;
-    return RepaintTick(inset: _inset, done: false);
+    return const RepaintTick(done: false);
   }
 
-  /// Abort the loop with no further ticks (host unmounted mid-loop). The widget
-  /// is gone, so there is no inset to settle on screen.
+  /// Abort the loop with no further ticks (host unmounted or its controller
+  /// disappeared mid-loop).
   void abort() {
     _ticksRemaining = 0;
     _looping = false;
-    _inset = false;
   }
 }

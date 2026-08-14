@@ -30,10 +30,10 @@ Two colors, two sub-causes:
 A dead *renderer* (the process was actually killed) is a **different** bug — covered
 by `PAUSE-013`/`PAUSE-014` (detect via JS probe → destroy-and-rebuild). A JS
 `offsetHeight` read relayouts *web content*, not the Android surface, so it can
-**never** fix the blank-surface case. The only remedy that works is to **force a
-relayout of the platform view** — see `_nudgeSurfaceRepaint` (toggle a 1px inset
-around the `IndexedStack` a few times over ~0.5s; each size flip recomposites the
-`SurfaceView`, each `setState` repaints the Flutter base surface).
+**never** fix the blank-surface case. The remedy is a native platform-view
+relayout plus invalidation — see `_nudgeSurfaceRepaint`, which calls the fork's
+geometry-free `requestRepaint()` operation across several frames. Recovery does
+not require changing the WebView's dimensions.
 
 **Why it keeps recurring:** the fix is always "nudge the surface," but the *trigger*
 is "a code path that mounts/re-attaches a surface." Every fix has wired the nudge
@@ -214,29 +214,51 @@ recommit, which is what the fix rests on. The `trigger=reload -> nudge` /
 `trigger=reload-settled -> nudge` pair exists to close that; until such a trace exists the
 causal claim is unverified, exactly as in Attempt 8.
 
+### Attempt 10 — Geometry-free native relayout + invalidation
+**Date:** 2026-08-14 · **Files:** pubspec.yaml, pubspec.lock, lib/services/webview.dart,
+lib/services/surface_repaint_engine.dart, lib/main.dart, lib/screens/inappbrowser.dart,
+test/surface_repaint_engine_test.dart, test/webview_pause_lifecycle_test.dart,
+test/js/surface_repaint_funnel.test.js, openspec/specs/webview-pause-lifecycle/spec.md
+**What it did:** Pinned the existing `flutter_inappwebview` overrides to the
+`starship-s/flutter_inappwebview` fork at commit
+`643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64`, which adds
+`InAppWebViewController.requestRepaint()`. The native operation calls
+`WebView.requestLayout()` and `postInvalidateOnAnimation()` without changing
+dimensions. WebSpace exposes it through `WebViewController.requestRepaint()`;
+the main and nested hosts keep every existing trigger funnel and the coalesced
+six-pulse/100 ms loop, but each active tick invokes the currently attached
+controller instead of `setState` or repaint-only padding.
+**Why:** The old right-edge and earlier bottom-edge 1 px nudges caused visible
+horizontal or vertical wobble. Steady and transient WebView constraints are now
+identical, so the repaint mechanism cannot move the page area while it recovers
+the same live blank-surface class.
+**Why partial:** The engine and structural tests prove pulse count, coalescing,
+abort behavior, trigger coverage, wrapper invocation, and the cross-file
+geometry invariant. They cannot reach Android SurfaceFlinger. A physical device
+must still confirm both that repeated recovery produces no horizontal/vertical
+wobble and that a blank surface after resume, attach, back navigation, memory
+pressure, or reload is actually painted by the native relayout plus invalidation.
+
 ## Known open gaps (candidates for the next recurrence)
 
 1. ~~Nested `InAppWebViewScreen`~~ — **closed by Attempt 6** (now funneled + gated).
 2. **Forward navigation** (`goForward`) into a bfcached entry is the symmetric case of
    Attempts 5–6 and is currently unnudged. (There is no `goForward` call site today,
    but adding one on Android would need the same funnel.)
-3. **The class isn't closed.** Every fix is per-path. The durable fix is a **single
-   chokepoint** that nudges on *every* surface (re)attach — ideally a native
-   surface-changed/-redrawn callback from the fork driving the repaint — instead of
-   enumerating Dart-side navigation paths forever. **Attempt 8 narrows this**: it keys the
-   warm-start repaint on `didChangeMetrics` (a Dart-side *proxy* for the surface attach)
-   rather than a lifecycle event, but a proxy is not the native callback and is not
-   guaranteed to fire on every device, so the gap stands. **Attempt 9 is the same shape
-   once more** — a reload, keyed on the load-settled proxy — and is the second recurrence
-   in a row whose fix was an *ordering* one (nudge at the trigger, re-nudge at the attach
-   proxy). Two data points that the durable fix is the native callback, not a longer list
-   of triggers.
+3. **The class isn't closed.** Every fix is per-path. Attempt 10 removes the old
+   geometry dependency and gives every existing trigger a native relayout + invalidation
+   operation, but the trigger list is still Dart-side. The durable trigger fix is a
+   **single chokepoint** that observes every surface (re)attach — ideally a native
+   surface-changed/-redrawn callback from the fork — instead of enumerating navigation
+   paths forever. **Attempt 8 narrows this** with `didChangeMetrics`, and **Attempt 9**
+   with the load-settled proxy; both remain useful retained triggers, but neither is the
+   native attach callback.
 6. **Proxies fire before the compositor.** Both attach proxies now in use are upstream of
    the actual first paint: `didChangeMetrics` (Attempt 8) tracks the main FlutterView's
    metrics, and `onLoadingChanged(false)` (Attempt 9) maps to `onLoadStop`, i.e. document
    parse rather than frame commit. A surface that receives its first frame materially
-   later than either signal still outruns the nudge budget. This is gap #3 seen from the
-   timing side: the native callback is the only signal that *is* the attach.
+   later than the six-pulse native repaint budget can still outrun it. This is gap #3 seen
+   from the timing side: the native callback is the only signal that *is* the attach.
 4. **The TLAPS proof doesn't cover the recurrence — by construction.**
    `RepaintLiveness` is proved over `GoodSpec`/`GoodNext`, a *fixed* set of attach actions
    (`Activate`, `Resume`, `ControllerAttach`, `Back`, `Forward`, `LoadSite`, `Evict`), each of
@@ -255,13 +277,11 @@ causal claim is unverified, exactly as in Attempt 8.
    unmodeled path; the `surface_repaint_funnel` gate now also covers the `didChangeMetrics`
    resume path. The kernel's TLAPS proof is still over the atomic-attach `GoodNext`, so the
    two models disagree by design — `warmstart.tla` is the faithful one for this ordering.
-5. **The device link is unproven.** The whole fix rests on `didChangeMetrics` actually firing
-   when the webview `SurfaceView` re-attaches on a real warm resume. Flutter can dedupe
-   identical window metrics, and the callback tracks the main FlutterView, not the webview
-   platform view. If it does not fire on the affected device, Attempt 8 is a no-op there. The
-   new `SurfaceDiag` line `trigger=metrics-resume -> nudge` exists to confirm this from a
-   device log; until such a trace exists, the causal claim (this fixes the reported warm-start
-   white screen) is unverified.
+5. **The device link is unproven.** The native operation now requests layout and an
+   animation invalidation without a size change, but automated tests cannot prove that the
+   Android System WebView paints the surface on the affected device. Device validation must
+   confirm both the absence of horizontal/vertical wobble and recovery from a blank surface;
+   the existing `SurfaceDiag` trigger lines identify which retained funnel fired.
 
 ## Guardrails now in place
 
@@ -277,9 +297,10 @@ causal claim is unverified, exactly as in Attempt 8.
   proves the attach-triggered re-nudge closes it; `warmstart_reach.cfg` proves the
   ordering is reachable (non-vacuous).
 - **Engine characterization** ([test/surface_repaint_engine_test.dart](../../test/surface_repaint_engine_test.dart),
-  runs under `fvm flutter test`): the same ordering in runnable Dart. `SurfaceRepaintEngine`
-  tracks `owed`; a late `attach()` with no re-nudge stays `owed` (reproduction), the metrics
-  re-nudge clears it (fix), including a timing-faithful 800ms-reattach case.
+  runs under `fvm flutter test`): `SurfaceRepaintEngine` tracks `owed`, emits six
+  geometry-free repaint ticks, coalesces refills, and aborts safely; a late `attach()` with
+  no re-nudge stays `owed` (reproduction), the metrics re-nudge clears it (fix), including
+  a timing-faithful 800ms-reattach case.
 - **Structural gate** ([test/js/surface_repaint_funnel.test.js](../../test/js/surface_repaint_funnel.test.js),
   runs under `npm run test:js` in CI): on the main page, every Android `controller.goBack()`
   must route through `_goBackAndRepaint`. A new raw back path (the recurrence shape of
@@ -290,6 +311,8 @@ causal claim is unverified, exactly as in Attempt 8.
   `inappbrowser.dart` must sit inside a `reloadAndRepaint` funnel that latches the reload,
   `main.dart` must wire both host hooks to the engine, and each file must drive the repaint
   off the load-settled signal. A new raw reload fails CI.
+- Attempt 10 additionally checks that both hosts invoke the native repaint wrapper from
+  their tick funnels and contain no repaint-only geometry state or padding.
 
 ## Diagnostic checklist (when this recurs)
 

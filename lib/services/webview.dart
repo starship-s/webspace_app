@@ -782,6 +782,9 @@ abstract class WebViewController {
   Future<void> loadUrl(String url, {String? language});
   Future<void> loadHtmlString(String html, {String? baseUrl});
   Future<void> reload();
+  /// Request a native platform-view repaint without changing its geometry.
+  /// This is a no-op off Android.
+  Future<void> requestRepaint();
   Future<Uri?> getUrl();
   Future<String?> getTitle();
   Future<String?> getHtml();
@@ -972,6 +975,12 @@ class _WebViewController implements WebViewController {
 
   @override
   Future<void> reload() => _c.reload();
+
+  @override
+  Future<void> requestRepaint() async {
+    if (!Platform.isAndroid) return;
+    await _c.requestRepaint();
+  }
 
   @override
   Future<Uri?> getUrl() => _c.getUrl();
