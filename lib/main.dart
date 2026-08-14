@@ -114,6 +114,12 @@ enum AccentColor {
   yellow,
 }
 
+SystemUiMode fullscreenSystemUiMode(TargetPlatform platform) {
+  return platform == TargetPlatform.android
+      ? SystemUiMode.edgeToEdge
+      : SystemUiMode.immersiveSticky;
+}
+
 /// LicenseEntry that emits one [LicenseParagraph] per source line,
 /// so structural single line breaks (license titles, numbered
 /// section headers, template lines) survive the renderer.
@@ -978,7 +984,7 @@ class _WebSpacePageState extends State<WebSpacePage>
 
   bool _isBackHandling = false;
   bool _isFindVisible = false;
-  bool _isFullscreen = false; // Runtime fullscreen state (hides appBar, tabStrip, system UI)
+  bool _isFullscreen = false;
   // Toggled by _nudgeSurfaceRepaint to apply a transient 1px inset that
   // forces Android hybrid-composition platform views to recomposite after
   // the activity is recreated (shortcut/resume). Always false in steady state.
@@ -1791,7 +1797,9 @@ class _WebSpacePageState extends State<WebSpacePage>
     }
     // Re-apply fullscreen system UI mode after resume
     if (_isFullscreen) {
-      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      SystemChrome.setEnabledSystemUIMode(
+        fullscreenSystemUiMode(defaultTargetPlatform),
+      );
     }
   }
 
@@ -5041,7 +5049,9 @@ class _WebSpacePageState extends State<WebSpacePage>
     setState(() {
       _isFullscreen = true;
     });
-    SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    SystemChrome.setEnabledSystemUIMode(
+      fullscreenSystemUiMode(defaultTargetPlatform),
+    );
     // Removing the app bar / changing the bottom bar resizes the webview; on
     // Android the hybrid-composition SurfaceView can come back with a 1px dark
     // seam at the bottom edge until it recomposites. github #421-followup
@@ -7868,12 +7878,11 @@ class _WebSpacePageState extends State<WebSpacePage>
     final hasTabStrip = _tabStripShown;
     return SafeArea(
       // Out of fullscreen the AppBar absorbs the top inset, so top stays false.
-      // In fullscreen there is no AppBar, and immersiveSticky does not reliably
-      // hide the status/navigation bars on Android 15 (edge-to-edge enforced) —
-      // when they remain, edge-to-edge content lands behind them and the site's
-      // top/bottom controls become untappable. Inset the body on both edges so
-      // it stays clear of any bars that persist; when they are truly hidden the
-      // padding is ~0 and the webview still fills the screen. github #385
+      // In fullscreen there is no AppBar. Android keeps its status/navigation
+      // bars visible under edge-to-edge, and any platform may leave a bar
+      // visible. Inset the body on both edges so it stays clear of persistent
+      // bars; when they are hidden the padding is ~0 and the webview fills the
+      // screen. github #385
       top: _isFullscreen,
       bottom: !hasTabStrip && inputBar == null,
       // Out of fullscreen, inset around a landscape display cutout so chrome

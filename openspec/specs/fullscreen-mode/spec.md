@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Allow users to view sites in full screen mode, hiding the app bar, tab strip, URL bar, and system UI for an immersive experience. Supports both on-demand toggling and a per-site auto-fullscreen setting.
+Allow users to view sites in full screen mode, hiding the app bar, tab strip, and URL bar. Android keeps its status and navigation bars visible while other platforms hide system UI for an immersive experience. Supports both on-demand toggling and a per-site auto-fullscreen setting.
 
 ## Status
 
@@ -13,7 +13,7 @@ Allow users to view sites in full screen mode, hiding the app bar, tab strip, UR
 
 ## Problem Statement
 
-Users who use WebSpace as a web-app launcher want a full app experience without browser chrome. The app bar, tab strip, and system status/navigation bars consume screen space that could be used by the web content. A full screen mode gives users an immersive, app-like experience.
+Users who use WebSpace as a web-app launcher want a full app experience without browser chrome. The app bar, tab strip, and URL bar consume screen space that could be used by the web content; on non-Android platforms, system status/navigation bars can also consume space. A full screen mode gives users an immersive, app-like experience.
 
 ---
 
@@ -27,8 +27,11 @@ The system SHALL allow users to enter full screen mode from the overflow menu or
 
 **Given** the user has a site loaded
 **When** the user opens the overflow menu (app bar or tab strip) and taps "Full Screen"
-**Then** the app bar, tab strip, URL bar, find toolbar, and system UI are hidden
-**And** the webview fills the entire screen
+**Then** the app bar, tab strip, URL bar, and find toolbar are hidden
+**And** Android keeps the status and navigation bars visible
+**And** other platforms hide system UI
+**And** on non-Android platforms, the webview fills the entire screen
+**And** on Android, the webview fills the area available around its system bars
 
 #### Scenario: Toggle full screen by double-tapping title
 
@@ -124,7 +127,7 @@ The system SHALL maintain the correct full screen state across app lifecycle tra
 
 **Given** the user is in full screen mode
 **When** the app is backgrounded and then resumed
-**Then** the immersive system UI mode is re-applied
+**Then** the platform-appropriate fullscreen system UI mode is re-applied
 
 ---
 
@@ -149,7 +152,9 @@ The system SHALL support a global option to keep the site tab strip visible in f
 **Given** "Site Tab Strip" is enabled
 **And** "Keep Tab Strip in Full Screen" is enabled
 **When** the user enters full screen mode
-**Then** the app bar, URL bar, find toolbar, and system UI are hidden
+**Then** the app bar, URL bar, and find toolbar are hidden
+**And** Android keeps the status and navigation bars visible
+**And** other platforms hide system UI
 **And** the tab strip remains visible at the bottom
 
 #### Scenario: Tab strip hidden in full screen (default)
@@ -199,7 +204,7 @@ The system SHALL support a global option, enabled by default, to enter full scre
 
 ### Requirement: FS-006 - Content Reachable Under Persistent System Bars
 
-The system SHALL keep the site's content reachable in full screen even when the platform fails to hide the system bars (e.g. Android 15 edge-to-edge, where `immersiveSticky` does not always hide the status/navigation bars).
+The system SHALL keep the site's content reachable in full screen when Android keeps the status and navigation bars visible and when a non-Android platform leaves a system bar visible.
 
 #### Scenario: System bar persists in full screen
 
@@ -209,7 +214,7 @@ The system SHALL keep the site's content reachable in full screen even when the 
 
 #### Scenario: System bars fully hidden
 
-**Given** the user is in full screen mode on a device where `immersiveSticky` hides both bars
+**Given** the user is in full screen mode on a non-Android platform where `immersiveSticky` hides both bars
 **Then** the body safe-area inset is ~0
 **And** the webview fills the entire screen
 
@@ -339,15 +344,16 @@ The presentation is backed by two booleans, `showTabStrip` (pinned) and `tabBarB
 - **Tab strip**: `_buildTabStrip()` returns null when `_isFullscreen` unless the global `tabStripInFullscreen` pref is set (then it stays in `bottomNavigationBar` and owns the bottom safe-area inset). The `_tabStripShown` getter also renders it on demand in either mode when `_tabBarButton && _tabBarOverlayVisible`; the revealed strip carries an inline close button.
 - **Tab bar button**: the `_tabBarButtonShown` getter places `TabBarCornerButton` (`lib/widgets/tab_bar_corner_button.dart`) in the body `Stack` inside a hit-test-transparent `Positioned.fill > Padding > AnimatedAlign`, resting at the corner from `_tabBarButtonCornerEffective` (the active site's `tabBarButtonCorner`, or the legacy app-wide default mapped to a bottom corner when null). Shown when `_tabBarButton` is on, a site is loaded, the overlay is not already revealed, and the strip is not pinned for the current mode (`_showTabStrip` out of fullscreen / `_tabStripInFullscreen` in fullscreen). Tapping sets `_tabBarOverlayVisible = true` (FS-009). The widget recognizes both an immediate pan and a long-press drag (same callbacks; one recognizer wins per gesture); the drag tracks the finger through the runtime-only `_tabBarButtonDragAlignment` (fractional position from `tabBarCornerDragFraction`, measured against the body `Stack` keyed by `_bodyStackKey`; `AnimatedAlign` runs with `Duration.zero` while dragging so the button follows instantly). On release `_endTabBarButtonDrag` picks `tabBarCornerNearest` (quadrant of the drop point), stores it on the current site's model, persists via `_saveWebViewModels`, and the `AnimatedAlign` glides the button to its corner (250ms ease-out). Corner math is pure and covered by `test/tab_bar_corner_test.dart`; gesture recognition by `test/tab_bar_corner_button_test.dart`.
 - **Input bar**: `_buildInputBar()` returns null when `_isFullscreen`
-- **Body insets**: The fullscreen body keeps top/bottom `SafeArea` active (`top: _isFullscreen`, `bottom: _isFullscreen || ...`). `immersiveSticky` does not reliably hide the system bars on Android 15 (edge-to-edge enforced); when a bar persists, the inset keeps the site's top/bottom controls clear of it. When the bars are truly hidden the inset is ~0 and the webview still fills the screen. Left/right insets are dropped in fullscreen (`left: !_isFullscreen`, `right: !_isFullscreen`) so the webview uses the display-cutout strip beside a landscape notch (FS-010); out of fullscreen they stay active so chrome avoids the notch.
-- **Display cutout (FS-010)**: `MainActivity.onCreate` sets `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` (API 28+) so the window may extend into the cutout on short edges. Without it, hiding the system bars makes Android letterbox the cutout strip black.
+- **Body insets**: The fullscreen body keeps top/bottom `SafeArea` active (`top: _isFullscreen`, `bottom: _isFullscreen || ...`). Android uses `edgeToEdge`, so its status/navigation bars remain visible; on non-Android platforms, `immersiveSticky` hides them when supported. When a bar persists, the inset keeps the site's top/bottom controls clear of it. When the bars are truly hidden the inset is ~0 and the webview still fills the screen. Left/right insets are dropped in fullscreen (`left: !_isFullscreen`, `right: !_isFullscreen`) so the webview uses the display-cutout strip beside a landscape notch (FS-010); out of fullscreen they stay active so chrome avoids the notch.
+- **Display cutout (FS-010)**: `MainActivity.onCreate` sets `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` (API 28+) so the window may extend into the cutout on short edges. This keeps Android edge-to-edge content from letterboxing the cutout strip black.
 - **Exit zone**: top edge when fullscreen (`MediaQuery.padding.top + 20px`, measured inside the body `SafeArea`) with a visible handle just below the notch/status bar. Only a centered 96px-wide `GestureDetector` catches the exit tap; the rest of the strip is transparent to pointers so web-app controls in the top corners stay tappable (github #401)
 - **Fullscreen hint**: SnackBar shown on entering fullscreen to explain exit method
 - **Menu items**: "Full Screen" added to both app bar and tab strip popup menus
 
 ### System UI
 
-- Enter: `SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky)`
+- Policy: `fullscreenSystemUiMode(TargetPlatform)` in `lib/main.dart` returns `SystemUiMode.edgeToEdge` for Android and `SystemUiMode.immersiveSticky` otherwise.
+- Enter: `SystemChrome.setEnabledSystemUIMode(fullscreenSystemUiMode(defaultTargetPlatform))`
 - Exit: `SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge)`
 - Re-applied on app resume via `_resumeAfterLifecyclePause()`
 
@@ -383,7 +389,7 @@ The back gesture/button is NOT consumed by fullscreen — it retains its normal 
 
 1. Open the app and navigate to a site
 2. Open the overflow menu and tap "Full Screen"
-3. Verify: app bar, tab strip, URL bar, and system bars are hidden
+3. Verify: app bar, tab strip, and URL bar are hidden; Android status/navigation bars remain visible and other platforms hide system bars
 4. Tap the top edge of the screen to exit full screen
 5. Verify: all UI elements are restored
 6. Enter full screen again, then perform a back gesture
@@ -394,4 +400,4 @@ The back gesture/button is NOT consumed by fullscreen — it retains its normal 
 11. Switch to a site without full screen mode enabled
 12. Verify: full screen is exited
 13. In full screen, background the app and resume
-14. Verify: immersive mode is re-applied
+14. Verify: the platform-appropriate fullscreen system UI mode is re-applied

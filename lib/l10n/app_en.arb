@@ -1991,7 +1991,7 @@
   "@siteSettingsFullscreenHintTitle": {
     "description": "Hint title for full screen mode."
   },
-  "siteSettingsFullscreenHint": "Automatically enters full screen when this site is selected. Hides the app bar, tab strip, and system UI for an immersive experience. Tap the edge of the screen or use the back gesture to exit full screen.",
+  "siteSettingsFullscreenHint": "Automatically enters full screen when this site is selected. Hides WebSpace app chrome (app bar, tab strip, and URL bar). On Android, the status and navigation bars remain visible; other platforms hide system UI for an immersive experience. Tap the edge of the screen or use the back gesture to exit full screen.",
   "@siteSettingsFullscreenHint": {
     "description": "Hint body describing full screen mode."
   },
