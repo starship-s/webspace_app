@@ -160,6 +160,21 @@ void main() {
     });
   });
 
+  test('page zoom uses native initial scale only for non-default Android zoom', () {
+    expect(
+      initialScaleForPageZoom(isAndroid: true, zoomPercent: 80),
+      80,
+    );
+    expect(
+      initialScaleForPageZoom(isAndroid: true, zoomPercent: 100),
+      0,
+    );
+    expect(
+      initialScaleForPageZoom(isAndroid: false, zoomPercent: 80),
+      0,
+    );
+  });
+
   group('cold-start restore initial-load deferral', () {
     test('Android with pending restore defers the initial load', () {
       expect(

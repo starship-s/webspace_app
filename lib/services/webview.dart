@@ -541,9 +541,9 @@ class WebViewConfig {
   /// Language code for Accept-Language header (e.g., 'en', 'es', 'fr').
   /// If null, uses system default.
   final String? language;
-  /// Browser-style page zoom (percent, 100 = unscaled). Applied via a
-  /// DOCUMENT_START CSS `zoom` shim so it survives navigations and reaches
-  /// iframes. Distinct from the OS font-scale `textZoom`.
+  /// Browser-style page zoom (percent, 100 = unscaled). Android uses the
+  /// native WebView initial scale; other platforms use a DOCUMENT_START CSS
+  /// `zoom` shim. Distinct from the OS font-scale `textZoom`.
   final int zoomPercent;
   final Function(String url)? onUrlChanged;
   final Function(List<Cookie> cookies)? onCookiesChanged;
@@ -932,10 +932,20 @@ bool deferInitialLoadForRestore({
 }) =>
     hasPendingRestoreState && isAndroid && !isFileImport;
 
+/// Native page scale for Android zoom, or 0 for the platform default.
+@visibleForTesting
+int initialScaleForPageZoom({
+  required bool isAndroid,
+  required int zoomPercent,
+}) =>
+    isAndroid && zoomPercent != 100 ? zoomPercent : 0;
+
 /// InAppWebView controller wrapper
 class _WebViewController implements WebViewController {
   final inapp.InAppWebViewController _c;
-  _WebViewController(this._c);
+  final int _initialScale;
+  _WebViewController(this._c, {int initialScale = 0})
+      : _initialScale = initialScale;
 
   @override
   inapp.InAppWebViewController get nativeController => _c;
@@ -1042,6 +1052,7 @@ class _WebViewController implements WebViewController {
       userAgentMetadata: buildUserAgentMetadata(userAgent),
       thirdPartyCookiesEnabled: thirdPartyCookiesEnabled ?? false,
       incognito: incognito ?? false,
+      initialScale: _initialScale,
       // Preserve system-derived textZoom — the InAppWebViewSettings
       // constructor defaults it to 100 and toMap always emits it, so any
       // setSettings call without this resets the user's font scale.
@@ -1082,7 +1093,10 @@ class _WebViewController implements WebViewController {
   Future<void> setTextZoom(int zoomPercent) async {
     if (Platform.isAndroid) {
       await _c.setSettings(
-        settings: inapp.InAppWebViewSettings(textZoom: zoomPercent),
+        settings: inapp.InAppWebViewSettings(
+          initialScale: _initialScale,
+          textZoom: zoomPercent,
+        ),
       );
       return;
     }
@@ -1437,12 +1451,11 @@ class WebViewFactory {
   else{document.addEventListener('DOMContentLoaded',apply);}
 })();''';
 
-  /// Per-site browser-style page zoom. CSS `zoom` scales the whole page
-  /// (text and images) and is honoured by Chromium and modern WebKit
-  /// (Safari 17+/WPE 2.40+), so a single CSS path covers every platform —
-  /// no native textZoom split. Injected at DOCUMENT_START via a re-applied
-  /// style element so it survives same-document navigations and reaches
-  /// iframes.
+  /// Per-site browser-style page zoom for non-Android platforms. CSS `zoom`
+  /// scales the whole page (text and images) and is honoured by Chromium and
+  /// modern WebKit (Safari 17+/WPE 2.40+). Android uses the native WebView
+  /// initial scale instead. Injected at DOCUMENT_START via a re-applied style
+  /// element so it survives same-document navigations and reaches iframes.
   static String _pageZoomCss(int zoomPercent) =>
       'html{zoom:$zoomPercent% !important;}';
 
@@ -1691,6 +1704,10 @@ class WebViewFactory {
     var pendingLiveReload = usesCachedHtml && !isFileImport;
 
     final textZoom = systemTextZoomPercent();
+    final initialScale = initialScaleForPageZoom(
+      isAndroid: Platform.isAndroid,
+      zoomPercent: config.zoomPercent,
+    );
 
     final userScripts = <inapp.UserScript>[];
 
@@ -1871,9 +1888,10 @@ class WebViewFactory {
       ));
     }
 
-    // Per-site browser-style page zoom (all platforms). Skipped at 100%
-    // so the default site carries no zoom shim.
-    if (config.zoomPercent != 100) {
+    // Per-site browser-style page zoom for non-Android. Android uses the
+    // native initialScale setting below. Skipped at 100% so the default site
+    // carries no zoom shim.
+    if (!Platform.isAndroid && config.zoomPercent != 100) {
       userScripts.add(inapp.UserScript(
         groupName: 'page_zoom',
         source: '${_pageZoomScript(config.zoomPercent)}\n;null;',
@@ -2665,6 +2683,10 @@ class WebViewFactory {
       // Enable DevTools inspection in debug mode (chrome://inspect on Android)
       ..isInspectable = kDebugMode;
 
+    if (initialScale != 0) {
+      settings.initialScale = initialScale;
+    }
+
     final inapp.InAppWebView webViewWidget = inapp.InAppWebView(
       key: config.key,
       initialUrlRequest: (renderInitialData || suppressInitialLoad) ? null : inapp.URLRequest(
@@ -2711,7 +2733,10 @@ class WebViewFactory {
                 }
               : null,
       onWebViewCreated: (controller) async {
-        final wrappedController = _WebViewController(controller);
+        final wrappedController = _WebViewController(
+          controller,
+          initialScale: initialScale,
+        );
         onControllerCreated(wrappedController);
         // Live geolocation: forward navigator.geolocation calls from the
         // shim into the platform's native location service. Permission is

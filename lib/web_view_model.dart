@@ -361,9 +361,10 @@ class WebViewModel {
   bool kioskMode;
   String? language; // Language code (e.g., 'en', 'es'), null = system default
   /// Browser-style page zoom for this site, as a percent (100 = unscaled).
-  /// Scales the whole page (text and images) via CSS `zoom`, independent of
-  /// the OS accessibility font scale that [WebViewController.setTextZoom]
-  /// tracks. Clamped to [kMinZoomPercent]..[kMaxZoomPercent].
+  /// Android uses native WebView scaling; other platforms use CSS `zoom`.
+  /// Independent of the OS accessibility font scale that
+  /// [WebViewController.setTextZoom] tracks. Clamped to
+  /// [kMinZoomPercent]..[kMaxZoomPercent].
   int zoomPercent;
   bool clearUrlEnabled; // Strip tracking parameters from URLs via ClearURLs
   bool dnsBlockEnabled; // Block navigation to domains on Hagezi DNS blocklist
