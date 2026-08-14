@@ -1,0 +1,109 @@
+name: Build Fork APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NDK_VERSION: "4.1.2"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Setup Flutter (for Dart SDK)
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.6'
+          channel: 'stable'
+
+      - name: Install fvm
+        run: |
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
+
+      - name: Setup Flutter with fvm
+        run: |
+          fvm install
+          fvm use --force
+
+      - name: Get dependencies
+        run: fvm flutter pub get --enforce-lockfile
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Read Rust toolchain
+        id: rust
+        run: echo "channel=$(sed -n -E 's/channel = \"(.*)\"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.rust.outputs.channel }}
+          targets: aarch64-linux-android
+
+      - name: Install cargo-ndk
+        run: cargo install --locked "cargo-ndk@${CARGO_NDK_VERSION}"
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+
+      - name: Export ANDROID_NDK_HOME
+        run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.13"
+
+      - name: Build APK
+        run: fvm flutter build apk --release --flavor fdroid --target-platform android-arm64 --split-per-abi
+
+      - name: Verify APK
+        run: |
+          apk=build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk
+          bash scripts/verify_adblock_shipped.sh android
+          bash scripts/check_no_gms.sh "$apk"
+          bash scripts/check_jni_intact.sh "$apk"
+
+      - name: Verify APK signature
+        run: |
+          set -euo pipefail
+          apk=build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk
+          if command -v apksigner >/dev/null 2>&1; then
+            apksigner verify --verbose "$apk"
+          else
+            sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID_HOME is not set}}"
+            apksigner_path="$(find "$sdk_root/build-tools" -type f -name apksigner -print -quit)"
+            test -x "$apksigner_path"
+            "$apksigner_path" verify --verbose "$apk"
+          fi
+
+      - name: Generate SHA-256 checksum
+        run: sha256sum build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk > build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk.sha256
+
+      - name: Upload ARM64 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: webspace-android-arm64
+          path: |
+            build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk
+            build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk.sha256
+          retention-days: 7
