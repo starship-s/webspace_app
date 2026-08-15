@@ -74,14 +74,23 @@ String buildThemeColorSchemeShim(String themeValue) => '''
   };
   asNative(_patchedMM, 'matchMedia');
   window.matchMedia = _patchedMM;
-  let metaTag = document.querySelector('meta[name="color-scheme"]');
-  if (!metaTag) {
-    metaTag = document.createElement('meta');
-    metaTag.name = 'color-scheme';
-    document.head.appendChild(metaTag);
+  function applyDomTheme() {
+    var head = document.head;
+    if (!head) return false;
+    var metaTag = document.querySelector('meta[name="color-scheme"]');
+    if (!metaTag) {
+      metaTag = document.createElement('meta');
+      metaTag.name = 'color-scheme';
+      head.appendChild(metaTag);
+    }
+    metaTag.content = actualTheme;
+    var root = document.documentElement;
+    if (root) root.style.colorScheme = actualTheme;
+    return !!root;
   }
-  metaTag.content = actualTheme;
-  document.documentElement.style.colorScheme = actualTheme;
+  if (!applyDomTheme()) {
+    document.addEventListener('DOMContentLoaded', applyDomTheme, { once: true });
+  }
   if (window.__themeChangeListeners) {
     window.__themeChangeListeners.forEach(item => {
       const isDarkQuery = item.query.includes('dark');

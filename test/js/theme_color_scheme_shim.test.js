@@ -10,7 +10,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { loadShim } = require('./helpers/load_shim');
+const { loadShim, makeDom, readFixture, runInDom } = require('./helpers/load_shim');
 
 test('dark fixture: matchMedia(prefers-color-scheme: dark) → matches=true', () => {
   const dom = loadShim('theme_color_scheme/dark.js');
@@ -59,6 +59,31 @@ test('shim creates <meta name="color-scheme"> with the resolved theme', () => {
 test('shim sets documentElement.style.colorScheme', () => {
   const dom = loadShim('theme_color_scheme/light.js');
   assert.equal(dom.window.document.documentElement.style.colorScheme, 'light');
+});
+
+test('DOCUMENT_START without head/documentElement defers DOM work until ready', () => {
+  const dom = makeDom();
+  const { document } = dom.window;
+  document.documentElement.remove();
+
+  assert.equal(document.head, null);
+  assert.equal(document.documentElement, null);
+  assert.doesNotThrow(() => {
+    runInDom(dom, readFixture('theme_color_scheme/dark.js'));
+  });
+  assert.equal(
+    dom.window.matchMedia('(prefers-color-scheme: dark)').matches, true);
+  assert.equal(document.querySelector('meta[name="color-scheme"]'), null);
+
+  const root = document.createElement('html');
+  root.appendChild(document.createElement('head'));
+  document.appendChild(root);
+  document.dispatchEvent(new dom.window.Event('DOMContentLoaded'));
+
+  const meta = document.querySelector('meta[name="color-scheme"]');
+  assert.ok(meta, 'meta tag must be created after DOM readiness');
+  assert.equal(meta.getAttribute('content'), 'dark');
+  assert.equal(document.documentElement.style.colorScheme, 'dark');
 });
 
 test('synthetic MediaQueryList carries addEventListener / removeEventListener', () => {
