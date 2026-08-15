@@ -7,7 +7,7 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart' show ConsoleMessageLevel;
 import 'package:flutter_inappwebview/flutter_inappwebview.dart' as inapp
-    show CookieManager, PullToRefreshController, PullToRefreshSettings, SslCertificate, WebUri;
+    show CookieManager, SslCertificate, WebUri;
 import 'package:webspace/services/connectivity_service.dart';
 import 'package:webspace/services/container_cookie_manager.dart';
 import 'package:webspace/services/domain_claim.dart';
@@ -909,13 +909,6 @@ class WebViewModel {
         'Using cached HTML: ${initialHtml != null} (${initialHtml?.length ?? 0} bytes)',
         sensitivity: LogSensitivity.sensitive,
       );
-      final bool isMobile = Platform.isIOS || Platform.isAndroid;
-      final pullToRefreshController = isMobile ? inapp.PullToRefreshController(
-        settings: inapp.PullToRefreshSettings(enabled: true),
-        onRefresh: () async {
-          await userDrivenReload();
-        },
-      ) : null;
       // Track last user gesture on same-domain navigation, so we can
       // propagate it to cross-domain redirects (e.g., search engine
       // redirect links like DuckDuckGo's /l/?uddg=... or Google's /url?q=...).
@@ -1029,7 +1022,6 @@ class WebViewModel {
                     _protectedMediaDecisionInFlight = null;
                   }
                 },
-          pullToRefreshController: pullToRefreshController,
           onWindowRequested: onWindowRequested,
           shouldOverrideUrlLoading: (url, hasGesture) {
             LogService.instance.log(
