@@ -671,8 +671,8 @@ class WebViewConfig {
   /// webview always cancels such navigations; the host UI decides
   /// whether to launch the target app after confirming with the user.
   final Future<void> Function(String url, ExternalUrlInfo info)? onExternalSchemeUrl;
-  /// Optional Android handoff for ordinary HTTP(S) downloads. When unset,
-  /// the WebView keeps using the native Dart downloader below.
+  /// Optional Android fallback for ordinary HTTP(S) downloads when the
+  /// internal downloader cannot complete the request.
   final Future<bool> Function(String url)? onHttpDownload;
   /// Prompt for an untrusted (typically self-signed) TLS certificate
   /// surfaced by the platform's `onReceivedServerTrustAuthRequest`. The
@@ -3199,15 +3199,13 @@ class WebViewFactory {
               try {
                 await controller.stopLoading();
               } catch (_) {}
-              if (config.onHttpDownload != null) {
-                await config.onHttpDownload!(urlString);
-              } else {
-                await _handleHttpDownload(
-                  req,
-                  referer: liveUrl,
-                  proxy: config.proxySettings,
-                );
-              }
+              await _handleHttpDownload(
+                controller,
+                req,
+                config: config,
+                referer: liveUrl,
+                proxy: config.proxySettings,
+              );
               return null;
             },
           );
@@ -4416,11 +4414,13 @@ class WebViewFactory {
     switch (scheme) {
       case 'http':
       case 'https':
-        if (Platform.isAndroid && config.onHttpDownload != null) {
-          await config.onHttpDownload!(req.url.toString());
-        } else {
-          await _handleHttpDownload(req, referer: referer, proxy: proxy);
-        }
+        await _handleHttpDownload(
+          controller,
+          req,
+          config: config,
+          referer: referer,
+          proxy: proxy,
+        );
         return;
       case 'data':
         _handleDataDownload(req);
@@ -4434,7 +4434,9 @@ class WebViewFactory {
   }
 
   static Future<void> _handleHttpDownload(
+    inapp.InAppWebViewController controller,
     inapp.DownloadStartRequest req, {
+    required WebViewConfig config,
     String? referer,
     UserProxySettings? proxy,
   }) async {
@@ -4443,19 +4445,78 @@ class WebViewFactory {
       url: req.url.toString(),
       mimeType: req.mimeType,
     );
+    Future<bool> handOffToBrowser(String reason) async {
+      final fallback = config.onHttpDownload;
+      if (fallback == null) return false;
+      try {
+        final launched = await fallback(req.url.toString());
+        if (!launched) {
+          LogService.instance.log(
+            'Download',
+            '$reason: system browser launch returned false',
+            level: LogLevel.warning,
+            sensitivity: LogSensitivity.sensitive,
+          );
+        }
+        return launched;
+      } catch (e, stack) {
+        LogService.instance.log(
+          'Download',
+          '$reason: system browser launch failed: $e\n$stack',
+          level: LogLevel.warning,
+          sensitivity: LogSensitivity.sensitive,
+        );
+        return false;
+      }
+    }
+
+    final List<inapp.Cookie> cookies;
+    try {
+      // Passing the controller is what selects the active Android container;
+      // an unbound CookieManager reads the default jar and misses site
+      // sessions (including HttpOnly authentication cookies).
+      cookies = await inapp.CookieManager.instance().getCookies(
+        url: req.url,
+        webViewController: controller,
+      );
+    } catch (e, stack) {
+      if (await handOffToBrowser('Internal cookie read failed')) {
+        LogService.instance.log(
+          'Download',
+          'Internal cookie read failed; handed off to system browser: $e',
+          level: LogLevel.warning,
+          sensitivity: LogSensitivity.sensitive,
+        );
+        return;
+      }
+      LogService.instance.log(
+        'Download',
+        'Cookie read failed: $e\n$stack',
+        level: LogLevel.error,
+        sensitivity: LogSensitivity.sensitive,
+      );
+      final task = DownloadsService.instance.start(
+        filename: initialFilename,
+        url: req.url.toString(),
+        bytesTotal: req.contentLength > 0 ? req.contentLength : null,
+      );
+      DownloadsService.instance.fail(task.id, 'Could not read site cookies');
+      return;
+    }
+
     final task = DownloadsService.instance.start(
       filename: initialFilename,
       url: req.url.toString(),
       bytesTotal: req.contentLength > 0 ? req.contentLength : null,
     );
+
+    final cookieHeader = DownloadEngine.buildCookieHeader(
+      cookies.map((c) => MapEntry(c.name, c.value.toString())),
+    );
+    final DownloadResult result;
     try {
-      final cookies = await inapp.CookieManager.instance()
-          .getCookies(url: req.url);
-      final cookieHeader = DownloadEngine.buildCookieHeader(
-        cookies.map((c) => MapEntry(c.name, c.value.toString())),
-      );
       final engine = DownloadEngine(proxy: proxy);
-      final result = await engine.fetch(
+      result = await engine.fetch(
         url: req.url.toString(),
         cookieHeader: cookieHeader,
         userAgent: req.userAgent,
@@ -4465,19 +4526,36 @@ class WebViewFactory {
         onProgress: (done, total) => DownloadsService.instance
             .updateProgress(task.id, bytesDone: done, bytesTotal: total),
       );
-      task.filename = result.filename;
+    } on DownloadException catch (e) {
+      if (await handOffToBrowser('Internal download failed')) {
+        DownloadsService.instance.cancel(task.id);
+      } else {
+        DownloadsService.instance.fail(task.id, e.message);
+      }
+      return;
+    } catch (e, stack) {
+      LogService.instance.log(
+        'Download',
+        'Download error: $e\n$stack',
+        level: LogLevel.error,
+        sensitivity: LogSensitivity.sensitive,
+      );
+      DownloadsService.instance.fail(task.id, e.toString());
+      return;
+    }
+
+    task.filename = result.filename;
+    try {
       final savedPath = await _saveViaPicker(result);
       if (savedPath == null) {
         DownloadsService.instance.cancel(task.id);
       } else {
         DownloadsService.instance.complete(task.id, savedPath: savedPath);
       }
-    } on DownloadException catch (e) {
-      DownloadsService.instance.fail(task.id, e.message);
     } catch (e, stack) {
       LogService.instance.log(
         'Download',
-        'Download error: $e\n$stack',
+        'Download save error: $e\n$stack',
         level: LogLevel.error,
         sensitivity: LogSensitivity.sensitive,
       );

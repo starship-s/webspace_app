@@ -92,17 +92,32 @@ void main() {
     expect(source, contains('await _handleHttpDownload('));
   });
 
-  test('Android HTTP downloads hand off to the system browser', () {
+  test('Android HTTP downloads fall back after internal failures', () {
     final source = File('lib/services/webview.dart').readAsStringSync();
     final bindings = [
       File('lib/web_view_model.dart').readAsStringSync(),
       File('lib/screens/inappbrowser.dart').readAsStringSync(),
     ].join().replaceAll(RegExp(r'\s+'), ' ');
 
-    expect(source, contains('await config.onHttpDownload!(urlString);'));
-    expect(source, contains('await config.onHttpDownload!(req.url.toString());'));
+    expect(source, contains('webViewController: controller'));
+    expect(source, contains('Internal cookie read failed'));
+    expect(
+      source,
+      contains("await handOffToBrowser('Internal cookie read failed')"),
+    );
+    expect(source, contains('on DownloadException catch (e)'));
+    expect(
+      source,
+      contains("await handOffToBrowser('Internal download failed')"),
+    );
+    expect(source, contains('DownloadsService.instance.cancel(task.id);'));
+    expect(source, contains('final savedPath = await _saveViaPicker(result);'));
     expect(source, contains("case 'data':"));
     expect(source, contains("case 'blob':"));
+    expect(
+      source,
+      contains('await _handleHttpDownload(\n          controller,'),
+    );
     expect(
       RegExp(
         'onHttpDownload: Platform.isAndroid '
