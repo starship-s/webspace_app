@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '17 6 * * 0'
   workflow_dispatch:
+    inputs:
+      sync_upstream:
+        description: Merge upstream/master before building
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -33,6 +39,7 @@ jobs:
         id: sync
         env:
           EVENT_NAME: ${{ github.event_name }}
+          SYNC_UPSTREAM: ${{ inputs.sync_upstream }}
         run: |
           set -euo pipefail
           git config user.name 'starship-s'
@@ -52,6 +59,17 @@ jobs:
             exit 1
           }
           upstream_sha="$(git rev-parse upstream/master)"
+
+          if [ "$EVENT_NAME" = workflow_dispatch ] && [ "$SYNC_UPSTREAM" = false ]; then
+            echo 'workflow_dispatch requested a downstream-only release without upstream synchronization'
+            {
+              echo 'should_build=true'
+              echo 'merged=false'
+              echo "base_sha=$base_sha"
+              echo "upstream_sha=$upstream_sha"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           if git merge-base --is-ancestor "$upstream_sha" HEAD; then
             if [ "$EVENT_NAME" = schedule ]; then
