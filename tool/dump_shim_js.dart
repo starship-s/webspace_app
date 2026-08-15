@@ -19,6 +19,7 @@
 import 'dart:io';
 
 import 'package:webspace/services/anti_fingerprinting_shim.dart';
+import 'package:webspace/services/android_page_zoom.dart';
 import 'package:webspace/services/blob_url_capture.dart';
 import 'package:webspace/services/content_blocker_shim.dart';
 import 'package:webspace/services/procedural_cosmetic_shim.dart';
@@ -43,6 +44,8 @@ Map<String, String> buildAllFixtures() {
   fixtures['blob_url_capture/shim.js'] = blobUrlCaptureScript;
   fixtures['blob_url_capture/click_intercept.js'] =
       blobDownloadClickInterceptScript;
+  fixtures['android_page_zoom/80.js'] = buildAndroidPageZoomScript(80);
+  fixtures['android_page_zoom/125.js'] = buildAndroidPageZoomScript(125);
   // Pinned test triple — the Node-side test minds the polyfill so the
   // first createObjectURL call returns 'blob:https://example.test/test-blob-1',
   // matching the URL baked into this IIFE.

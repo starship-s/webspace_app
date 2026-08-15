@@ -182,8 +182,9 @@ const String blobUrlCaptureScript = r'''
 /// 1. **In-DOM click**: the anchor is in the document and the user (or
 ///    a `synthetic click event`) triggers a normal click. A capturing
 ///    listener on `document` intercepts before any page handler can cancel
-///    the event; it bridges blob links, or removes `download` from HTTP(S)
-///    links and lets the original event continue.
+///    the event; it bridges blob links, bridges same-origin HTTP(S) links,
+///    or removes `download` from cross-origin HTTP(S) links and lets the
+///    original event continue.
 ///
 /// 2. **Detached `link.click()`**: the very common SaveAs pattern is
 ///    ```js
@@ -195,14 +196,17 @@ const String blobUrlCaptureScript = r'''
 ///    where the anchor is never appended to the document. The click
 ///    event does not bubble to `document`, so the document-level
 ///    listener never fires. `HTMLAnchorElement.prototype.click` is
-///    patched to handle the blob-download case directly, or remove
-///    `download` before calling the original implementation for HTTP(S).
+///    patched to handle blob and same-origin HTTP(S) downloads directly, or
+///    remove `download` before calling the original implementation for
+///    cross-origin HTTP(S).
 ///
 /// Blob paths bridge through `_webspaceBlobDownloadStart(blobUrl,
 /// filename)`. The Dart handler dispatches to the same
 /// `_handleBlobDownload` flow that iOS/macOS' `onDownloadStartRequest`
 /// uses, so the captured-Blob fast path in `window.__webspaceBlobs`
 /// (populated by [blobUrlCaptureScript]) keeps working transparently.
+/// Same-origin HTTP(S) paths bridge through `_webspaceHttpDownloadStart`; the
+/// Dart side checks the live main-frame origin before starting a request.
 const String blobDownloadClickInterceptScript = r'''
 (function() {
   if (window.__webspaceBlobClickHooked) return;
@@ -231,6 +235,15 @@ const String blobDownloadClickInterceptScript = r'''
       var href = downloadHref(el);
       return href.indexOf('http:') === 0 || href.indexOf('https:') === 0;
     }
+    function isSameOriginHttpDownloadAnchor(el) {
+      if (!isHttpDownloadAnchor(el)) return false;
+      try {
+        return new URL(downloadHref(el), document.baseURI).origin ===
+          window.location.origin;
+      } catch (_) {
+        return false;
+      }
+    }
     function removeDownloadAttribute(el) {
       try { el.removeAttribute('download'); } catch (_) {}
     }
@@ -241,6 +254,15 @@ const String blobDownloadClickInterceptScript = r'''
       try {
         window.flutter_inappwebview.callHandler(
           '_webspaceBlobDownloadStart', href, name);
+      } catch (_) {}
+    }
+    function dispatchHttpDownload(el) {
+      var href = downloadHref(el);
+      var name = '';
+      try { name = el.getAttribute('download') || ''; } catch (_) {}
+      try {
+        window.flutter_inappwebview.callHandler(
+          '_webspaceHttpDownloadStart', href, name);
       } catch (_) {}
     }
     var listener = function(e) {
@@ -255,6 +277,10 @@ const String blobDownloadClickInterceptScript = r'''
           try { e.preventDefault(); } catch (_) {}
           try { e.stopPropagation(); } catch (_) {}
           dispatchDownload(el);
+        } else if (isSameOriginHttpDownloadAnchor(el)) {
+          try { e.preventDefault(); } catch (_) {}
+          try { e.stopPropagation(); } catch (_) {}
+          dispatchHttpDownload(el);
         } else if (isHttpDownloadAnchor(el)) {
           removeDownloadAttribute(el);
         }
@@ -268,6 +294,10 @@ const String blobDownloadClickInterceptScript = r'''
       var patched = function click() {
         if (isBlobDownloadAnchor(this)) {
           dispatchDownload(this);
+          return;
+        }
+        if (isSameOriginHttpDownloadAnchor(this)) {
+          dispatchHttpDownload(this);
           return;
         }
         if (isHttpDownloadAnchor(this)) {
@@ -362,4 +392,3 @@ String buildBlobDownloadIife({
 })($blobJson, $fnJson, $idJson);
 ''';
 }
-

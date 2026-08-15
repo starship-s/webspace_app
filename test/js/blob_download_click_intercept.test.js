@@ -7,8 +7,10 @@
 //     fires _webspaceBlobDownloadStart with (href, filename).
 //   - Detached link.click() (the SaveAs idiom that never appends to the
 //     DOM) does the same via HTMLAnchorElement.prototype.click.
-//   - HTTP(S) hrefs remove `download` and fall through to the original
-//     click semantics (no bridge, no preventDefault).
+//   - Same-origin HTTP(S) hrefs prevent navigation and bridge through
+//     _webspaceHttpDownloadStart with (absolute href, filename).
+//   - Cross-origin HTTP(S) hrefs remove `download` and fall through to the
+//     original click semantics.
 //   - Other hrefs and blob hrefs without `download` fall through unchanged.
 //   - Re-evaluating the shim is idempotent — no double-bridge.
 //   - Click on a child of the anchor still resolves to the anchor.
@@ -127,36 +129,34 @@ test('blob href WITHOUT `download` attribute falls through (navigation intent)',
   assert.equal(ev.defaultPrevented, false);
 });
 
-test('HTTP(S) hrefs remove download and fall through', () => {
-  // HTTP downloads still go through onDownloadStartRequest; the shim only
-  // removes the attribute that can make Android WebView ignore the click.
+test('same-origin HTTP(S) hrefs bridge and cancel navigation', () => {
   for (const href of [
-    'http://example.com/file.zip',
     'https://example.com/file.zip',
+    'https://example.com:443/file.zip',
   ]) {
     const { dom, calls } = bootDom();
     const a = dom.window.document.createElement('a');
     a.href = href;
     a.download = 'file.zip';
-    let reachedAnchor = false;
-    a.addEventListener('click', () => { reachedAnchor = true; });
     dom.window.document.body.appendChild(a);
     const ev = new dom.window.MouseEvent('click', {
       bubbles: true,
       cancelable: true,
     });
     a.dispatchEvent(ev);
-    assert.equal(a.hasAttribute('download'), false);
-    assert.equal(reachedAnchor, true);
-    assert.equal(calls.length, 0);
-    assert.equal(ev.defaultPrevented, false);
+    assert.equal(a.hasAttribute('download'), true);
+    assert.equal(ev.defaultPrevented, true);
+    assert.deepEqual(calls, [{
+      name: '_webspaceHttpDownloadStart',
+      args: [a.href, 'file.zip'],
+    }]);
   }
 });
 
-test('detached HTTP(S) link.click() removes download before original click', () => {
+test('cross-origin HTTP(S) hrefs strip download and fall through', () => {
   for (const href of [
     'http://example.com/file.zip',
-    'https://example.com/file.zip',
+    'https://other.example/file.zip',
   ]) {
     const { dom, calls } = bootDom();
     const a = dom.window.document.createElement('a');
@@ -164,11 +164,33 @@ test('detached HTTP(S) link.click() removes download before original click', () 
     a.download = 'file.zip';
     let clicked = false;
     a.addEventListener('click', () => { clicked = true; });
-    a.click();
+    dom.window.document.body.appendChild(a);
+    const ev = new dom.window.MouseEvent('click', {
+      bubbles: true,
+      cancelable: true,
+    });
+    a.dispatchEvent(ev);
     assert.equal(a.hasAttribute('download'), false);
     assert.equal(clicked, true);
     assert.equal(calls.length, 0);
+    assert.equal(ev.defaultPrevented, false);
   }
+});
+
+test('detached same-origin HTTP(S) link.click() bridges without navigation', () => {
+  const { dom, calls } = bootDom();
+  const a = dom.window.document.createElement('a');
+  a.href = 'https://example.com/file.zip';
+  a.download = 'file.zip';
+  let clicked = false;
+  a.addEventListener('click', () => { clicked = true; });
+  a.click();
+  assert.equal(a.hasAttribute('download'), true);
+  assert.equal(clicked, false);
+  assert.deepEqual(calls, [{
+    name: '_webspaceHttpDownloadStart',
+    args: [a.href, 'file.zip'],
+  }]);
 });
 
 test('re-evaluating the shim is idempotent (no double bridge)', () => {

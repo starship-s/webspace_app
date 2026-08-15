@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart' as inapp;
 import 'package:webspace/services/anti_fingerprinting_shim.dart';
+import 'package:webspace/services/android_page_zoom.dart';
 import 'package:webspace/services/blob_url_capture.dart';
 import 'package:webspace/services/clearurl_service.dart';
 import 'package:webspace/services/do_not_track_shim.dart';
@@ -119,6 +120,30 @@ Cookie cookieFromJson(Map<String, dynamic> json) => inapp.Cookie(
         )
       : null,
 );
+
+/// Whether [candidate] and [current] are absolute HTTP(S) URLs with the same
+/// scheme, host, and effective port.
+@visibleForTesting
+bool isSameHttpOrigin(String candidate, String current) {
+  final a = Uri.tryParse(candidate);
+  final b = Uri.tryParse(current);
+  if (a == null || b == null) return false;
+
+  bool isHttp(Uri uri) {
+    final scheme = uri.scheme.toLowerCase();
+    if ((scheme != 'http' && scheme != 'https') || uri.host.isEmpty) {
+      return false;
+    }
+    return !uri.hasPort || (uri.port > 0 && uri.port <= 65535);
+  }
+
+  if (!isHttp(a) || !isHttp(b)) return false;
+  int effectivePort(Uri uri) =>
+      uri.hasPort ? uri.port : (uri.scheme.toLowerCase() == 'http' ? 80 : 443);
+  return a.scheme.toLowerCase() == b.scheme.toLowerCase() &&
+      a.host.toLowerCase() == b.host.toLowerCase() &&
+      effectivePort(a) == effectivePort(b);
+}
 
 /// Cookie manager - thin wrapper around inapp.CookieManager
 class CookieManager {
@@ -541,9 +566,9 @@ class WebViewConfig {
   /// Language code for Accept-Language header (e.g., 'en', 'es', 'fr').
   /// If null, uses system default.
   final String? language;
-  /// Browser-style page zoom (percent, 100 = unscaled). Android uses the
-  /// native WebView initial scale; other platforms use a DOCUMENT_START CSS
-  /// `zoom` shim. Distinct from the OS font-scale `textZoom`.
+  /// Browser-style page zoom (percent, 100 = unscaled). Android combines a
+  /// DOCUMENT_START viewport contract with native page zoom; other platforms
+  /// use a CSS `zoom` shim. Distinct from the OS font-scale `textZoom`.
   final int zoomPercent;
   final Function(String url)? onUrlChanged;
   final Function(List<Cookie> cookies)? onCookiesChanged;
@@ -932,20 +957,10 @@ bool deferInitialLoadForRestore({
 }) =>
     hasPendingRestoreState && isAndroid && !isFileImport;
 
-/// Native page scale for Android zoom, or 0 for the platform default.
-@visibleForTesting
-int initialScaleForPageZoom({
-  required bool isAndroid,
-  required int zoomPercent,
-}) =>
-    isAndroid && zoomPercent != 100 ? zoomPercent : 0;
-
 /// InAppWebView controller wrapper
 class _WebViewController implements WebViewController {
   final inapp.InAppWebViewController _c;
-  final int _initialScale;
-  _WebViewController(this._c, {int initialScale = 0})
-      : _initialScale = initialScale;
+  _WebViewController(this._c);
 
   @override
   inapp.InAppWebViewController get nativeController => _c;
@@ -1052,7 +1067,6 @@ class _WebViewController implements WebViewController {
       userAgentMetadata: buildUserAgentMetadata(userAgent),
       thirdPartyCookiesEnabled: thirdPartyCookiesEnabled ?? false,
       incognito: incognito ?? false,
-      initialScale: _initialScale,
       // Preserve system-derived textZoom — the InAppWebViewSettings
       // constructor defaults it to 100 and toMap always emits it, so any
       // setSettings call without this resets the user's font scale.
@@ -1094,7 +1108,6 @@ class _WebViewController implements WebViewController {
     if (Platform.isAndroid) {
       await _c.setSettings(
         settings: inapp.InAppWebViewSettings(
-          initialScale: _initialScale,
           textZoom: zoomPercent,
         ),
       );
@@ -1704,12 +1717,19 @@ class WebViewFactory {
     var pendingLiveReload = usesCachedHtml && !isFileImport;
 
     final textZoom = systemTextZoomPercent();
-    final initialScale = initialScaleForPageZoom(
-      isAndroid: Platform.isAndroid,
-      zoomPercent: config.zoomPercent,
-    );
 
     final userScripts = <inapp.UserScript>[];
+
+    if (Platform.isAndroid && config.zoomPercent != 100) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'android_page_zoom',
+          source: '${buildAndroidPageZoomScript(config.zoomPercent)}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: true,
+        ),
+      );
+    }
 
     // WebGL kill-switch, folded under tracking protection. Stripping the
     // entire WebGL surface is the strongest answer to WebGL
@@ -1890,8 +1910,8 @@ class WebViewFactory {
     }
 
     // Per-site browser-style page zoom for non-Android. Android uses the
-    // native initialScale setting below. Skipped at 100% so the default site
-    // carries no zoom shim.
+    // viewport contract and native zoom below. Skipped at 100% so the default
+    // site carries no zoom shim.
     if (!Platform.isAndroid && config.zoomPercent != 100) {
       userScripts.add(inapp.UserScript(
         groupName: 'page_zoom',
@@ -2684,10 +2704,6 @@ class WebViewFactory {
       // Enable DevTools inspection in debug mode (chrome://inspect on Android)
       ..isInspectable = kDebugMode;
 
-    if (initialScale != 0) {
-      settings.initialScale = initialScale;
-    }
-
     final inapp.InAppWebView webViewWidget = inapp.InAppWebView(
       key: config.key,
       initialUrlRequest: (renderInitialData || suppressInitialLoad) ? null : inapp.URLRequest(
@@ -2734,10 +2750,7 @@ class WebViewFactory {
                 }
               : null,
       onWebViewCreated: (controller) async {
-        final wrappedController = _WebViewController(
-          controller,
-          initialScale: initialScale,
-        );
+        final wrappedController = _WebViewController(controller);
         onControllerCreated(wrappedController);
         // Live geolocation: forward navigator.geolocation calls from the
         // shim into the platform's native location service. Permission is
@@ -3149,6 +3162,48 @@ class WebViewFactory {
             return null;
           },
         );
+        if (Platform.isAndroid) {
+          controller.addJavaScriptHandler(
+            handlerName: '_webspaceHttpDownloadStart',
+            callback: (args) async {
+              if (args.isEmpty || args[0] is! String) return null;
+              final urlString = args[0] as String;
+              final suggested = args.length >= 2 && args[1] is String
+                  ? args[1] as String
+                  : '';
+              final controllerUrl = (await controller.getUrl())?.toString();
+              final liveUrl = lastStableUrl ?? controllerUrl;
+              if (liveUrl == null || !isSameHttpOrigin(urlString, liveUrl)) {
+                return null;
+              }
+              String? userAgent = config.userAgent;
+              if (userAgent == null) {
+                try {
+                  userAgent =
+                      await inapp.InAppWebViewController.getDefaultUserAgent();
+                } catch (_) {}
+              }
+              final req = inapp.DownloadStartRequest(
+                url: inapp.WebUri(urlString),
+                userAgent: userAgent,
+                contentDisposition: null,
+                contentLength: -1,
+                mimeType: null,
+                suggestedFilename: suggested.isEmpty ? null : suggested,
+                textEncodingName: null,
+              );
+              try {
+                await controller.stopLoading();
+              } catch (_) {}
+              await _handleHttpDownload(
+                req,
+                referer: liveUrl,
+                proxy: config.proxySettings,
+              );
+              return null;
+            },
+          );
+        }
         // Cached-HTML → live-URL swap is wired up in onLoadStop below.
         // Don't fire loadUrl here — `onWebViewCreated` runs while chromium
         // is still parsing the initialData, and a synchronous loadUrl in
@@ -3607,6 +3662,15 @@ class WebViewFactory {
         // Skip all post-load work in that case; onDownloadStartRequest's
         // revert handles URL bar restoration.
         if (!DownloadUrlRevertEngine.isRenderable(urlStr)) return;
+
+        if (Platform.isAndroid && config.zoomPercent != 100) {
+          final targetScale = config.zoomPercent / 100;
+          final currentScale = await controller.getZoomScale() ?? 1;
+          final relativeFactor = targetScale / currentScale;
+          if ((relativeFactor - 1).abs() > 0.001) {
+            await controller.zoomBy(zoomFactor: relativeFactor);
+          }
+        }
 
         // Cached-HTML one-shot live refresh. After the cached HTML
         // parse settles, fire a single `controller.reload()` to fetch

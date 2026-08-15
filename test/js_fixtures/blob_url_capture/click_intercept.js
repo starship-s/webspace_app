@@ -25,6 +25,15 @@
       var href = downloadHref(el);
       return href.indexOf('http:') === 0 || href.indexOf('https:') === 0;
     }
+    function isSameOriginHttpDownloadAnchor(el) {
+      if (!isHttpDownloadAnchor(el)) return false;
+      try {
+        return new URL(downloadHref(el), document.baseURI).origin ===
+          window.location.origin;
+      } catch (_) {
+        return false;
+      }
+    }
     function removeDownloadAttribute(el) {
       try { el.removeAttribute('download'); } catch (_) {}
     }
@@ -35,6 +44,15 @@
       try {
         window.flutter_inappwebview.callHandler(
           '_webspaceBlobDownloadStart', href, name);
+      } catch (_) {}
+    }
+    function dispatchHttpDownload(el) {
+      var href = downloadHref(el);
+      var name = '';
+      try { name = el.getAttribute('download') || ''; } catch (_) {}
+      try {
+        window.flutter_inappwebview.callHandler(
+          '_webspaceHttpDownloadStart', href, name);
       } catch (_) {}
     }
     var listener = function(e) {
@@ -49,6 +67,10 @@
           try { e.preventDefault(); } catch (_) {}
           try { e.stopPropagation(); } catch (_) {}
           dispatchDownload(el);
+        } else if (isSameOriginHttpDownloadAnchor(el)) {
+          try { e.preventDefault(); } catch (_) {}
+          try { e.stopPropagation(); } catch (_) {}
+          dispatchHttpDownload(el);
         } else if (isHttpDownloadAnchor(el)) {
           removeDownloadAttribute(el);
         }
@@ -62,6 +84,10 @@
       var patched = function click() {
         if (isBlobDownloadAnchor(this)) {
           dispatchDownload(this);
+          return;
+        }
+        if (isSameOriginHttpDownloadAnchor(this)) {
+          dispatchHttpDownload(this);
           return;
         }
         if (isHttpDownloadAnchor(this)) {
