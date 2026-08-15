@@ -148,7 +148,8 @@ const PLUMBING = new Set([
   'cookieSiteId', 'onFindResult', 'shouldOverrideUrlLoading', 'onLoadingChanged',
   'onProgressChanged', 'onReloadIssued', 'onMainFrameLoad',
   'onWindowRequested', 'onHtmlLoaded', 'shouldFetchHtml', 'onConsoleMessage',
-  'onConfirmScriptFetch', 'onExternalSchemeUrl', 'pullToRefreshController',
+  'onConfirmScriptFetch', 'onExternalSchemeUrl', 'onHttpDownload',
+  'pullToRefreshController',
   'onRendererGone', 'onProtectedMediaRequest',
 ]);
 

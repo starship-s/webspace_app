@@ -5070,15 +5070,6 @@ class _WebSpacePageState extends State<WebSpacePage>
     // Android the hybrid-composition SurfaceView can come back with a 1px dark
     // seam at the bottom edge until it recomposites. github #421-followup
     _nudgeSurfaceRepaint();
-    // KIOSK-003: the hint promises an exit that a locked session won't honor.
-    if (_kioskLocked) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(AppLocalizations.of(context).homeExitFullscreenHint),
-        duration: const Duration(seconds: 2),
-        behavior: SnackBarBehavior.floating,
-      ),
-    );
   }
 
   void _exitFullscreen() {

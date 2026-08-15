@@ -28,6 +28,10 @@
 
 WebSpace is a mobile app that brings all your favorite websites and web apps together in one organized, streamlined interface.
 
+## Obtainium fork
+
+Track the signed fork from [https://github.com/starship-s/webspace_app](https://github.com/starship-s/webspace_app) with package ID `io.github.starship_s.webspace`. Keep the same stable signing key across releases so Android can update the installed app. Weekly syncs merge `upstream/master` into `preserve-android-system-ui`; manual runs can build and release without a new upstream commit. Conflicting merges fail closed and require manual resolution.
+
 ## Screenshots
 
 <p align="center">

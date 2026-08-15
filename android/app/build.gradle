@@ -57,7 +57,7 @@ android {
     }
 
     defaultConfig {
-        applicationId "org.codeberg.theoden8.webspace"
+        applicationId "io.github.starship_s.webspace"
         // You can update the following values to match your application needs.
         // For more information, see: https://docs.flutter.dev/deployment/android#reviewing-the-gradle-build-configuration.
         minSdkVersion flutter.minSdkVersion

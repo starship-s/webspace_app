@@ -1,110 +1,406 @@
-name: Build Fork APK
+name: Sync and Release Fork
 
 on:
+  schedule:
+    - cron: '17 6 * * 0'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: webspace-fork-sync-release
+  cancel-in-progress: false
 
 env:
-  CARGO_NDK_VERSION: "4.1.2"
+  INTEGRATION_BRANCH: preserve-android-system-ui
+  UPSTREAM_REPOSITORY: https://github.com/theoden8/webspace_app.git
+  CARGO_NDK_VERSION: '4.1.2'
 
 jobs:
-  build:
+  sync-release:
     runs-on: ubuntu-latest
+    env:
+      GRADLE_OPTS: -Xmx4g -XX:MaxMetaspaceSize=512m -XX:+HeapDumpOnOutOfMemoryError
     steps:
-      - name: Checkout code
+      - name: Checkout integration branch
         uses: actions/checkout@v4
+        with:
+          ref: preserve-android-system-ui
+          fetch-depth: 0
+
+      - name: Sync upstream
+        id: sync
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          git config user.name 'starship-s'
+          git config user.email '45587122+starship-s@users.noreply.github.com'
+
+          if git remote get-url upstream >/dev/null 2>&1; then
+            git remote set-url upstream "$UPSTREAM_REPOSITORY"
+          else
+            git remote add upstream "$UPSTREAM_REPOSITORY"
+          fi
+          git fetch --prune origin "$INTEGRATION_BRANCH"
+          git fetch --prune upstream master
+
+          base_sha="$(git rev-parse "origin/$INTEGRATION_BRANCH")"
+          test "$(git rev-parse HEAD)" = "$base_sha" || {
+            echo "::error::checked-out integration branch moved during checkout" >&2
+            exit 1
+          }
+          upstream_sha="$(git rev-parse upstream/master)"
+
+          if git merge-base --is-ancestor "$upstream_sha" HEAD; then
+            if [ "$EVENT_NAME" = schedule ]; then
+              echo "upstream/master is already an ancestor; scheduled run has nothing to build"
+              {
+                echo 'should_build=false'
+                echo 'merged=false'
+                echo "base_sha=$base_sha"
+                echo "upstream_sha=$upstream_sha"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo 'workflow_dispatch requested a release without a new upstream commit'
+            {
+              echo 'should_build=true'
+              echo 'merged=false'
+              echo "base_sha=$base_sha"
+              echo "upstream_sha=$upstream_sha"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-ff --no-edit -m 'chore(sync): merge upstream master' upstream/master; then
+            :
+          else
+            merge_status=$?
+            git merge --abort || true
+            echo "::error::upstream merge conflicted or failed; merge was aborted" >&2
+            exit "$merge_status"
+          fi
+
+          {
+            echo 'should_build=true'
+            echo 'merged=true'
+            echo "base_sha=$base_sha"
+            echo "upstream_sha=$upstream_sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Compute fork version
+        if: steps.sync.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          upstream_version="$(sed -n -E 's/^version:[[:space:]]*([^+[:space:]]+).*/\1/p' pubspec.yaml | head -n 1)"
+          test -n "$upstream_version"
+          fork_build_number=$((100000 + GITHUB_RUN_NUMBER))
+          apk_version_code=$((fork_build_number * 1000 + 2))
+          if (( apk_version_code >= 2100000000 )); then
+            echo "::error::fork build number would exceed the Android version-code ceiling" >&2
+            exit 1
+          fi
+          fork_version_name="${upstream_version}-fork.${GITHUB_RUN_NUMBER}"
+          release_tag="fork-v${fork_version_name}-run-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ID}"
+          {
+            echo "FORK_BUILD_NUMBER=$fork_build_number"
+            echo "EXPECTED_APK_VERSION_CODE=$apk_version_code"
+            echo "FORK_VERSION_NAME=$fork_version_name"
+            echo "RELEASE_TAG=$release_tag"
+            echo 'APK_PATH=build/app/outputs/flutter-apk/app-arm64-v8a-fmain-release.apk'
+          } >> "$GITHUB_ENV"
+
+      - name: Check merge whitespace
+        if: steps.sync.outputs.should_build == 'true'
+        env:
+          BASE_SHA: ${{ steps.sync.outputs.base_sha }}
+          MERGED: ${{ steps.sync.outputs.merged }}
+        run: |
+          git diff --check
+          if [ "$MERGED" = true ]; then
+            git diff --check "$BASE_SHA" HEAD
+          fi
+
+      - name: Decode release signing secrets
+        if: steps.sync.outputs.should_build == 'true'
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          for secret_name in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEYSTORE_PASSWORD \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD \
+            ANDROID_SIGNING_CERT_SHA256; do
+            if [ -z "${!secret_name:-}" ]; then
+              echo "::error::required Actions secret $secret_name is missing" >&2
+              exit 1
+            fi
+          done
+
+          keystore_path="$RUNNER_TEMP/webspace-fork-release.jks"
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$keystore_path"
+          test -s "$keystore_path" || {
+            echo '::error::ANDROID_KEYSTORE_BASE64 did not decode to a keystore' >&2
+            exit 1
+          }
+          {
+            printf 'storeFile=%s\n' "$keystore_path"
+            printf 'storePassword=%s\n' "$ANDROID_KEYSTORE_PASSWORD"
+            printf 'keyAlias=%s\n' "$ANDROID_KEY_ALIAS"
+            printf 'keyPassword=%s\n' "$ANDROID_KEY_PASSWORD"
+          } > android/key.properties
+          chmod 600 android/key.properties "$keystore_path"
 
       - name: Setup Java
+        if: steps.sync.outputs.should_build == 'true'
         uses: actions/setup-java@v4
         with:
-          distribution: 'zulu'
+          distribution: zulu
           java-version: '17'
-          cache: 'gradle'
+          cache: gradle
+
+      - name: Setup Node
+        if: steps.sync.outputs.should_build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
 
       - name: Setup Flutter (for Dart SDK)
+        if: steps.sync.outputs.should_build == 'true'
         uses: subosito/flutter-action@v2
         with:
           flutter-version: '3.38.6'
-          channel: 'stable'
+          channel: stable
 
-      - name: Install fvm
+      - name: Install FVM
+        if: steps.sync.outputs.should_build == 'true'
         run: |
           dart pub global activate fvm
           echo "$HOME/.pub-cache/bin" >> "$GITHUB_PATH"
 
-      - name: Setup Flutter with fvm
+      - name: Setup Flutter with FVM
+        if: steps.sync.outputs.should_build == 'true'
         run: |
           fvm install
           fvm use --force
 
-      - name: Get dependencies
+      - name: Get Flutter dependencies
+        if: steps.sync.outputs.should_build == 'true'
         run: fvm flutter pub get --enforce-lockfile
 
+      - name: Install JavaScript dependencies
+        if: steps.sync.outputs.should_build == 'true'
+        run: npm ci
+
       - name: Setup Android SDK
+        if: steps.sync.outputs.should_build == 'true'
         uses: android-actions/setup-android@v3
 
       - name: Read Rust toolchain
+        if: steps.sync.outputs.should_build == 'true'
         id: rust
         run: echo "channel=$(sed -n -E 's/channel = \"(.*)\"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
 
       - name: Setup Rust
+        if: steps.sync.outputs.should_build == 'true'
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.rust.outputs.channel }}
           targets: aarch64-linux-android
 
       - name: Install cargo-ndk
+        if: steps.sync.outputs.should_build == 'true'
         run: cargo install --locked "cargo-ndk@${CARGO_NDK_VERSION}"
 
       - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
+        if: steps.sync.outputs.should_build == 'true'
         id: setup-ndk
+        uses: nttld/setup-ndk@v1
         with:
           ndk-version: r26d
           add-to-path: false
 
-      - name: Export ANDROID_NDK_HOME
+      - name: Export Android NDK path
+        if: steps.sync.outputs.should_build == 'true'
         run: echo "ANDROID_NDK_HOME=${{ steps.setup-ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       - name: Setup Gradle
+        if: steps.sync.outputs.should_build == 'true'
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: "8.13"
+          gradle-version: '8.13'
 
-      - name: Build APK
-        run: fvm flutter build apk --release --flavor fdroid --target-platform android-arm64 --split-per-abi
-
-      - name: Verify APK
+      - name: Run focused overlay tests
+        if: steps.sync.outputs.should_build == 'true'
         run: |
-          apk=build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk
-          bash scripts/verify_adblock_shipped.sh android
-          bash scripts/check_no_gms.sh "$apk"
-          bash scripts/check_jni_intact.sh "$apk"
+          fvm flutter test \
+            test/fullscreen_system_ui_test.dart \
+            test/android_page_zoom_test.dart \
+            test/blob_url_capture_test.dart \
+            test/download_engine_test.dart \
+            test/surface_repaint_engine_test.dart \
+            test/webview_pause_lifecycle_test.dart
 
-      - name: Verify APK signature
+      - name: Run overlay JavaScript fixture tests
+        if: steps.sync.outputs.should_build == 'true'
+        run: npm run test:js
+
+      - name: Analyze touched overlay production files
+        if: steps.sync.outputs.should_build == 'true'
+        run: |
+          fvm flutter analyze --no-fatal-warnings --no-fatal-infos \
+            lib/main.dart \
+            lib/screens/inappbrowser.dart \
+            lib/services/android_page_zoom.dart \
+            lib/services/blob_url_capture.dart \
+            lib/services/diag_seed.dart \
+            lib/services/download_engine.dart \
+            lib/services/surface_diag_native.dart \
+            lib/services/surface_repaint_engine.dart \
+            lib/services/webview.dart \
+            lib/web_view_model.dart
+
+      - name: Build signed ARM64 fmain APK
+        if: steps.sync.outputs.should_build == 'true'
+        run: |
+          fvm flutter build apk --release --flavor fmain \
+            --target-platform android-arm64 --split-per-abi \
+            --build-number "$FORK_BUILD_NUMBER" \
+            --build-name "$FORK_VERSION_NAME"
+
+      - name: Verify APK contents
+        if: steps.sync.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          apk=build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk
+          test -f "$APK_PATH"
+          bash scripts/verify_adblock_shipped.sh android "$APK_PATH"
+          bash scripts/check_no_gms.sh "$APK_PATH"
+          bash scripts/check_jni_intact.sh "$APK_PATH"
+
+      - name: Verify APK signature and metadata
+        if: steps.sync.outputs.should_build == 'true'
+        env:
+          ANDROID_SIGNING_CERT_SHA256: ${{ secrets.ANDROID_SIGNING_CERT_SHA256 }}
+        run: |
+          set -euo pipefail
+          apk="$APK_PATH"
+          sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID_HOME is not set}}"
+
           if command -v apksigner >/dev/null 2>&1; then
-            apksigner verify --verbose "$apk"
+            apksigner_path=apksigner
           else
-            sdk_root="${ANDROID_SDK_ROOT:-${ANDROID_HOME:?ANDROID_HOME is not set}}"
-            apksigner_path="$(find "$sdk_root/build-tools" -type f -name apksigner -print -quit)"
+            apksigner_path="$(find "$sdk_root/build-tools" -type f -name apksigner -print | sort -V | tail -n 1)"
             test -x "$apksigner_path"
-            "$apksigner_path" verify --verbose "$apk"
           fi
+          "$apksigner_path" verify --verbose "$apk"
+          cert_output="$("$apksigner_path" verify --print-certs "$apk")"
+          actual_cert_sha256="$(
+            printf '%s\n' "$cert_output" |
+              awk -F': ' '/certificate SHA-256 digest:/ {print $2; exit}'
+          )"
+          normalize_fingerprint() {
+            printf '%s' "$1" | tr -d '[:space:]:-' | tr '[:lower:]' '[:upper:]'
+          }
+          expected_cert_sha256="$(normalize_fingerprint "$ANDROID_SIGNING_CERT_SHA256")"
+          actual_cert_sha256="$(normalize_fingerprint "$actual_cert_sha256")"
+          [[ "$expected_cert_sha256" =~ ^[0-9A-F]{64}$ ]] || {
+            echo '::error::ANDROID_SIGNING_CERT_SHA256 must be a SHA-256 certificate fingerprint' >&2
+            exit 1
+          }
+          [[ "$actual_cert_sha256" =~ ^[0-9A-F]{64}$ ]] || {
+            echo '::error::apksigner did not return a SHA-256 signer certificate fingerprint' >&2
+            exit 1
+          }
+          if [ "$actual_cert_sha256" != "$expected_cert_sha256" ]; then
+            echo '::error::APK signer certificate SHA-256 does not match ANDROID_SIGNING_CERT_SHA256' >&2
+            exit 1
+          fi
+          echo 'APK signer certificate SHA-256 matches the configured release certificate'
+
+          if command -v apkanalyzer >/dev/null 2>&1; then
+            apkanalyzer_path=apkanalyzer
+          else
+            apkanalyzer_path="$(find "$sdk_root" -type f -name apkanalyzer -print | sort -V | tail -n 1)"
+            test -x "$apkanalyzer_path"
+          fi
+          package_id="$("$apkanalyzer_path" manifest application-id "$apk")"
+          version_code="$("$apkanalyzer_path" manifest version-code "$apk")"
+          version_name="$("$apkanalyzer_path" manifest version-name "$apk")"
+          test "$package_id" = io.github.starship_s.webspace
+          test "$version_code" = "$EXPECTED_APK_VERSION_CODE"
+          test "$version_name" = "$FORK_VERSION_NAME"
+          echo "Verified $package_id versionCode=$version_code versionName=$version_name"
 
       - name: Generate SHA-256 checksum
-        working-directory: build/app/outputs/flutter-apk
-        run: sha256sum app-arm64-v8a-fdroid-release.apk > app-arm64-v8a-fdroid-release.apk.sha256
+        if: steps.sync.outputs.should_build == 'true'
+        run: sha256sum "$APK_PATH" > "$APK_PATH.sha256"
 
-      - name: Upload ARM64 APK
+      - name: Upload verified APK artifact
+        if: steps.sync.outputs.should_build == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: webspace-android-arm64
+          name: webspace-fork-arm64-${{ github.run_id }}
           path: |
-            build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk
-            build/app/outputs/flutter-apk/app-arm64-v8a-fdroid-release.apk.sha256
+            build/app/outputs/flutter-apk/app-arm64-v8a-fmain-release.apk
+            build/app/outputs/flutter-apk/app-arm64-v8a-fmain-release.apk.sha256
           retention-days: 7
+
+      - name: Push tested merge without force
+        if: steps.sync.outputs.should_build == 'true' && steps.sync.outputs.merged == 'true'
+        env:
+          EXPECTED_REMOTE_SHA: ${{ steps.sync.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --prune origin "$INTEGRATION_BRANCH"
+          remote_sha="$(git rev-parse "origin/$INTEGRATION_BRANCH")"
+          test "$remote_sha" = "$EXPECTED_REMOTE_SHA" || {
+            echo "::error::integration branch moved during the build; refusing to force-push" >&2
+            exit 1
+          }
+          git push origin "HEAD:$INTEGRATION_BRANCH"
+
+      - name: Create or update GitHub Release
+        if: steps.sync.outputs.should_build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_SHA: ${{ steps.sync.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          fork_sha="$(git rev-parse HEAD)"
+          checksum="$(cut -d ' ' -f 1 "$APK_PATH.sha256")"
+          notes_file="$RUNNER_TEMP/webspace-fork-release-notes.md"
+          {
+            echo "Upstream commit: $UPSTREAM_SHA"
+            echo "Fork commit: $fork_sha"
+            echo "Package ID: io.github.starship_s.webspace"
+            echo "SHA-256: $checksum"
+          } > "$notes_file"
+
+          if git ls-remote --exit-code --refs origin "refs/tags/$RELEASE_TAG" >/dev/null 2>&1; then
+            git fetch --no-tags origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+            test "$(git rev-list -n 1 "$RELEASE_TAG")" = "$fork_sha" || {
+              echo "::error::release tag already points at a different commit" >&2
+              exit 1
+            }
+          else
+            git tag "$RELEASE_TAG" "$fork_sha"
+            git push origin "$RELEASE_TAG"
+          fi
+
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APK_PATH" "$APK_PATH.sha256" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$APK_PATH" "$APK_PATH.sha256" \
+              --title "WebSpace Fork $FORK_VERSION_NAME" \
+              --notes-file "$notes_file" \
+              --verify-tag --latest
+          fi

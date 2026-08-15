@@ -12,7 +12,7 @@
 # Kotlin side of the JNI bridge is covered separately by check_jni_intact.sh.
 set -euo pipefail
 
-platform="${1:?usage: verify_adblock_shipped.sh <ios|macos|linux|android>}"
+platform="${1:?usage: verify_adblock_shipped.sh <ios|macos|linux|android> [apk]}"
 min_syms=15
 
 first_match() {
@@ -62,10 +62,15 @@ case "$platform" in
     ;;
   android)
     shopt -s nullglob
-    apks=( build/app/outputs/flutter-apk/*-fdroid-release.apk )
-    [ ${#apks[@]} -gt 0 ] || { echo "::error::android: no fdroid APK to scan" >&2; exit 1; }
+    if [ "$#" -gt 1 ]; then
+      [ "$#" -eq 2 ] || { echo "::error::android: expected one APK path" >&2; exit 2; }
+      apks=( "$2" )
+    else
+      apks=( build/app/outputs/flutter-apk/*-fdroid-release.apk )
+    fi
+    [ ${#apks[@]} -gt 0 ] || { echo "::error::android: no APK to scan" >&2; exit 1; }
     for apk in "${apks[@]}"; do
-      if ! unzip -l "$apk" | grep -qE 'lib/[^/]+/libwebspace_adblock\.so'; then
+      if ! unzip -l "$apk" | grep -E 'lib/[^/]+/libwebspace_adblock\.so' >/dev/null; then
         echo "::error::android: libwebspace_adblock.so missing from $apk" >&2
         unzip -l "$apk" | grep -E 'lib/' | head || true
         exit 1
