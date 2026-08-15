@@ -302,10 +302,17 @@ jobs:
             test -x "$apksigner_path"
           fi
           "$apksigner_path" verify --verbose "$apk"
-          cert_output="$("$apksigner_path" verify --print-certs "$apk" 2>&1)"
+          cert_dump="$RUNNER_TEMP/webspace-signer-certs.txt"
+          signer_pem="$RUNNER_TEMP/webspace-signer.pem"
+          "$apksigner_path" verify --print-certs-pem "$apk" > "$cert_dump" 2>&1
+          awk '
+            /-----BEGIN CERTIFICATE-----/ { capture = 1 }
+            capture { print }
+            /-----END CERTIFICATE-----/ { exit }
+          ' "$cert_dump" > "$signer_pem"
           actual_cert_sha256="$(
-            printf '%s\n' "$cert_output" |
-              awk -F': ' '/certificate SHA-256 digest:/ {print $2; exit}'
+            openssl x509 -in "$signer_pem" -noout -fingerprint -sha256 |
+              cut -d= -f2
           )"
           normalize_fingerprint() {
             printf '%s' "$1" | tr -d '[:space:]:-' | tr '[:lower:]' '[:upper:]'
