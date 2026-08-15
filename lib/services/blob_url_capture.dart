@@ -164,8 +164,10 @@ const String blobUrlCaptureScript = r'''
 })();
 ''';
 
-/// Click interceptor that bridges `<a download href="blob:">` activations
-/// to Dart on Android. Required because Android System WebView's
+/// Click interceptor that repairs `<a download>` activations on Android:
+/// it bridges `blob:` links to Dart and removes `download` from HTTP(S)
+/// links so the original navigation reaches the native download listener.
+/// Required because Android System WebView's
 /// `DownloadListener.onDownloadStart` (the upstream hook behind
 /// `onDownloadStartRequest`) only fires for HTTP(S) responses the engine
 /// decides to download — `blob:` URLs are JS-internal references that
@@ -179,8 +181,9 @@ const String blobUrlCaptureScript = r'''
 ///
 /// 1. **In-DOM click**: the anchor is in the document and the user (or
 ///    a `synthetic click event`) triggers a normal click. A capturing
-///    listener on `document` intercepts before any page handler can
-///    cancel the event, preventDefaults the navigation, and bridges.
+///    listener on `document` intercepts before any page handler can cancel
+///    the event; it bridges blob links, or removes `download` from HTTP(S)
+///    links and lets the original event continue.
 ///
 /// 2. **Detached `link.click()`**: the very common SaveAs pattern is
 ///    ```js
@@ -192,9 +195,10 @@ const String blobUrlCaptureScript = r'''
 ///    where the anchor is never appended to the document. The click
 ///    event does not bubble to `document`, so the document-level
 ///    listener never fires. `HTMLAnchorElement.prototype.click` is
-///    patched to detect the blob-download case directly.
+///    patched to handle the blob-download case directly, or remove
+///    `download` before calling the original implementation for HTTP(S).
 ///
-/// Both paths bridge through `_webspaceBlobDownloadStart(blobUrl,
+/// Blob paths bridge through `_webspaceBlobDownloadStart(blobUrl,
 /// filename)`. The Dart handler dispatches to the same
 /// `_handleBlobDownload` flow that iOS/macOS' `onDownloadStartRequest`
 /// uses, so the captured-Blob fast path in `window.__webspaceBlobs`
@@ -213,17 +217,26 @@ const String blobDownloadClickInterceptScript = r'''
       } catch (_) {}
       return fn;
     }
-    function isBlobDownloadAnchor(el) {
-      if (!el || el.tagName !== 'A') return false;
-      if (!el.hasAttribute || !el.hasAttribute('download')) return false;
+    function downloadHref(el) {
+      if (!el || el.tagName !== 'A') return '';
+      if (!el.hasAttribute || !el.hasAttribute('download')) return '';
       var href = '';
       try { href = el.href || el.getAttribute('href') || ''; } catch (_) {}
-      return typeof href === 'string' && href.indexOf('blob:') === 0;
+      return typeof href === 'string' ? href : '';
+    }
+    function isBlobDownloadAnchor(el) {
+      return downloadHref(el).indexOf('blob:') === 0;
+    }
+    function isHttpDownloadAnchor(el) {
+      var href = downloadHref(el);
+      return href.indexOf('http:') === 0 || href.indexOf('https:') === 0;
+    }
+    function removeDownloadAttribute(el) {
+      try { el.removeAttribute('download'); } catch (_) {}
     }
     function dispatchDownload(el) {
-      var href = '';
+      var href = downloadHref(el);
       var name = '';
-      try { href = el.href || el.getAttribute('href') || ''; } catch (_) {}
       try { name = el.getAttribute('download') || ''; } catch (_) {}
       try {
         window.flutter_inappwebview.callHandler(
@@ -234,13 +247,17 @@ const String blobDownloadClickInterceptScript = r'''
       var el = e.target;
       // Bubble up through composed path so a click on a child of the
       // anchor (e.g. an icon inside <a download>) still resolves.
-      while (el && el !== document && !isBlobDownloadAnchor(el)) {
+      while (el && el !== document && !downloadHref(el)) {
         el = el.parentNode;
       }
-      if (el && el !== document && isBlobDownloadAnchor(el)) {
-        try { e.preventDefault(); } catch (_) {}
-        try { e.stopPropagation(); } catch (_) {}
-        dispatchDownload(el);
+      if (el && el !== document) {
+        if (isBlobDownloadAnchor(el)) {
+          try { e.preventDefault(); } catch (_) {}
+          try { e.stopPropagation(); } catch (_) {}
+          dispatchDownload(el);
+        } else if (isHttpDownloadAnchor(el)) {
+          removeDownloadAttribute(el);
+        }
       }
     };
     document.addEventListener('click', listener, true);
@@ -252,6 +269,9 @@ const String blobDownloadClickInterceptScript = r'''
         if (isBlobDownloadAnchor(this)) {
           dispatchDownload(this);
           return;
+        }
+        if (isHttpDownloadAnchor(this)) {
+          removeDownloadAttribute(this);
         }
         return origClick.apply(this, arguments);
       };

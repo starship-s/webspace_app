@@ -187,7 +187,7 @@ void main() {
           contains('if (window.__webspaceBlobClickHooked) return'));
     });
 
-    test('only intercepts <a> with download attr AND blob: href', () {
+    test('blob interception requires <a> with download attr and blob: href', () {
       // A plain blob: anchor (no download attr) is a navigation, not a
       // download — the page wants to display the blob inline and we
       // must not preventDefault. The shape of the predicate is locked
@@ -197,7 +197,29 @@ void main() {
       expect(blobDownloadClickInterceptScript,
           contains("el.hasAttribute('download')"));
       expect(blobDownloadClickInterceptScript,
-          contains("href.indexOf('blob:') === 0"));
+          contains("downloadHref(el).indexOf('blob:') === 0"));
+    });
+
+    test('HTTP(S) download anchors strip the attr and fall through', () {
+      // Android WebView can ignore HTTP(S) anchors while `download` is
+      // present. Both click paths remove only that attr; the attached path
+      // returns without canceling the event, and the detached path reaches
+      // the original click implementation.
+      expect(blobDownloadClickInterceptScript,
+          contains("href.indexOf('http:') === 0"));
+      expect(blobDownloadClickInterceptScript,
+          contains("href.indexOf('https:') === 0"));
+      expect(blobDownloadClickInterceptScript,
+          contains("el.removeAttribute('download')"));
+      expect(blobDownloadClickInterceptScript,
+          contains('else if (isHttpDownloadAnchor(el)) {\n'
+              '          removeDownloadAttribute(el);\n'
+              '        }'));
+      expect(blobDownloadClickInterceptScript,
+          contains('if (isHttpDownloadAnchor(this)) {\n'
+              '          removeDownloadAttribute(this);\n'
+              '        }\n'
+              '        return origClick.apply(this, arguments);'));
     });
 
     test('catches both in-DOM clicks and detached link.click()', () {

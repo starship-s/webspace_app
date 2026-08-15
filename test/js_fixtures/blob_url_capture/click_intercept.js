@@ -11,17 +11,26 @@
       } catch (_) {}
       return fn;
     }
-    function isBlobDownloadAnchor(el) {
-      if (!el || el.tagName !== 'A') return false;
-      if (!el.hasAttribute || !el.hasAttribute('download')) return false;
+    function downloadHref(el) {
+      if (!el || el.tagName !== 'A') return '';
+      if (!el.hasAttribute || !el.hasAttribute('download')) return '';
       var href = '';
       try { href = el.href || el.getAttribute('href') || ''; } catch (_) {}
-      return typeof href === 'string' && href.indexOf('blob:') === 0;
+      return typeof href === 'string' ? href : '';
+    }
+    function isBlobDownloadAnchor(el) {
+      return downloadHref(el).indexOf('blob:') === 0;
+    }
+    function isHttpDownloadAnchor(el) {
+      var href = downloadHref(el);
+      return href.indexOf('http:') === 0 || href.indexOf('https:') === 0;
+    }
+    function removeDownloadAttribute(el) {
+      try { el.removeAttribute('download'); } catch (_) {}
     }
     function dispatchDownload(el) {
-      var href = '';
+      var href = downloadHref(el);
       var name = '';
-      try { href = el.href || el.getAttribute('href') || ''; } catch (_) {}
       try { name = el.getAttribute('download') || ''; } catch (_) {}
       try {
         window.flutter_inappwebview.callHandler(
@@ -32,13 +41,17 @@
       var el = e.target;
       // Bubble up through composed path so a click on a child of the
       // anchor (e.g. an icon inside <a download>) still resolves.
-      while (el && el !== document && !isBlobDownloadAnchor(el)) {
+      while (el && el !== document && !downloadHref(el)) {
         el = el.parentNode;
       }
-      if (el && el !== document && isBlobDownloadAnchor(el)) {
-        try { e.preventDefault(); } catch (_) {}
-        try { e.stopPropagation(); } catch (_) {}
-        dispatchDownload(el);
+      if (el && el !== document) {
+        if (isBlobDownloadAnchor(el)) {
+          try { e.preventDefault(); } catch (_) {}
+          try { e.stopPropagation(); } catch (_) {}
+          dispatchDownload(el);
+        } else if (isHttpDownloadAnchor(el)) {
+          removeDownloadAttribute(el);
+        }
       }
     };
     document.addEventListener('click', listener, true);
@@ -50,6 +63,9 @@
         if (isBlobDownloadAnchor(this)) {
           dispatchDownload(this);
           return;
+        }
+        if (isHttpDownloadAnchor(this)) {
+          removeDownloadAttribute(this);
         }
         return origClick.apply(this, arguments);
       };

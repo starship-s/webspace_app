@@ -1810,9 +1810,10 @@ class WebViewFactory {
       injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
     ));
 
-    // Android-only: bridge `<a download href="blob:">` clicks into Dart.
-    // Android's DownloadListener does not fire for blob: URLs, so without
-    // this script the click is a silent no-op. iOS/macOS WKWebView
+    // Android-only: repair `<a download>` clicks for blob and HTTP(S).
+    // Android's DownloadListener does not fire for blob: URLs, and can
+    // ignore HTTP(S) anchors while the download attribute is present.
+    // iOS/macOS WKWebView
     // surfaces blob downloads through onDownloadStartRequest natively
     // and does not need (or want) the JS path.
     if (Platform.isAndroid) {
