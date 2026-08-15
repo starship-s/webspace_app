@@ -302,7 +302,7 @@ jobs:
             test -x "$apksigner_path"
           fi
           "$apksigner_path" verify --verbose "$apk"
-          cert_output="$("$apksigner_path" verify --print-certs "$apk")"
+          cert_output="$("$apksigner_path" verify --print-certs "$apk" 2>&1)"
           actual_cert_sha256="$(
             printf '%s\n' "$cert_output" |
               awk -F': ' '/certificate SHA-256 digest:/ {print $2; exit}'
