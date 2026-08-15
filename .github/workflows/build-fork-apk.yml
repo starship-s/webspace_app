@@ -403,10 +403,10 @@ jobs:
             git push origin "$RELEASE_TAG"
           fi
 
-          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release upload "$RELEASE_TAG" "$APK_PATH" "$APK_PATH.sha256" --clobber
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$APK_PATH" "$APK_PATH.sha256" --clobber --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_TAG" "$APK_PATH" "$APK_PATH.sha256" \
+            gh release create "$RELEASE_TAG" "$APK_PATH" "$APK_PATH.sha256" --repo "$GITHUB_REPOSITORY" \
               --title "WebSpace Fork $FORK_VERSION_NAME" \
               --notes-file "$notes_file" \
               --verify-tag --latest
