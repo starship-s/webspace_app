@@ -84,14 +84,31 @@ void main() {
     });
   });
 
-  test(
-    'registers the guarded HTTP bridge and reuses the HTTP download funnel',
-    () {
-      final source = File('lib/services/webview.dart').readAsStringSync();
-      expect(source, contains("handlerName: '_webspaceHttpDownloadStart'"));
-      expect(source, contains('lastStableUrl ?? controllerUrl'));
-      expect(source, contains('isSameHttpOrigin(urlString, liveUrl)'));
-      expect(source, contains('await _handleHttpDownload('));
-    },
-  );
+  test('registers the guarded HTTP bridge and native fallback', () {
+    final source = File('lib/services/webview.dart').readAsStringSync();
+    expect(source, contains("handlerName: '_webspaceHttpDownloadStart'"));
+    expect(source, contains('lastStableUrl ?? controllerUrl'));
+    expect(source, contains('isSameHttpOrigin(urlString, liveUrl)'));
+    expect(source, contains('await _handleHttpDownload('));
+  });
+
+  test('Android HTTP downloads hand off to the system browser', () {
+    final source = File('lib/services/webview.dart').readAsStringSync();
+    final bindings = [
+      File('lib/web_view_model.dart').readAsStringSync(),
+      File('lib/screens/inappbrowser.dart').readAsStringSync(),
+    ].join().replaceAll(RegExp(r'\s+'), ' ');
+
+    expect(source, contains('await config.onHttpDownload!(urlString);'));
+    expect(source, contains('await config.onHttpDownload!(req.url.toString());'));
+    expect(source, contains("case 'data':"));
+    expect(source, contains("case 'blob':"));
+    expect(
+      RegExp(
+        'onHttpDownload: Platform.isAndroid '
+        r'\? launchUrlInSystemBrowser : null,',
+      ).allMatches(bindings),
+      hasLength(2),
+    );
+  });
 }

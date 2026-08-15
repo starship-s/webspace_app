@@ -369,6 +369,9 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
             loadInWebView: _controller,
           );
         },
+        onHttpDownload: Platform.isAndroid
+            ? launchUrlInSystemBrowser
+            : null,
       ),
       onControllerCreated: (controller) {
         _controller = controller;

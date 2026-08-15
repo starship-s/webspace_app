@@ -1036,6 +1036,9 @@ class WebViewModel {
           onConfirmScriptFetch: onConfirmScriptFetch,
           onUntrustedCertificate: onUntrustedCertificate,
           onExternalSchemeUrl: onExternalSchemeUrl,
+          onHttpDownload: Platform.isAndroid
+              ? launchUrlInSystemBrowser
+              : null,
           onProtectedMediaRequest: onProtectedMediaRequest == null
               ? null
               : (origin) async {

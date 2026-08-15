@@ -671,6 +671,9 @@ class WebViewConfig {
   /// webview always cancels such navigations; the host UI decides
   /// whether to launch the target app after confirming with the user.
   final Future<void> Function(String url, ExternalUrlInfo info)? onExternalSchemeUrl;
+  /// Optional Android handoff for ordinary HTTP(S) downloads. When unset,
+  /// the WebView keeps using the native Dart downloader below.
+  final Future<bool> Function(String url)? onHttpDownload;
   /// Prompt for an untrusted (typically self-signed) TLS certificate
   /// surfaced by the platform's `onReceivedServerTrustAuthRequest`. The
   /// host UI shows a confirmation dialog; returning `true` adds the
@@ -778,6 +781,7 @@ class WebViewConfig {
     this.userScripts = const [],
     this.onConfirmScriptFetch,
     this.onExternalSchemeUrl,
+    this.onHttpDownload,
     this.onUntrustedCertificate,
     this.pullToRefreshController,
     this.onRendererGone,
@@ -3195,11 +3199,15 @@ class WebViewFactory {
               try {
                 await controller.stopLoading();
               } catch (_) {}
-              await _handleHttpDownload(
-                req,
-                referer: liveUrl,
-                proxy: config.proxySettings,
-              );
+              if (config.onHttpDownload != null) {
+                await config.onHttpDownload!(urlString);
+              } else {
+                await _handleHttpDownload(
+                  req,
+                  referer: liveUrl,
+                  proxy: config.proxySettings,
+                );
+              }
               return null;
             },
           );
@@ -3978,6 +3986,7 @@ class WebViewFactory {
         await _handleDownloadRequest(
           controller,
           downloadStartRequest,
+          config: config,
           referer: lastStableUrl ?? config.initialUrl,
           proxy: config.proxySettings,
         );
@@ -4389,6 +4398,7 @@ class WebViewFactory {
   static Future<void> _handleDownloadRequest(
     inapp.InAppWebViewController controller,
     inapp.DownloadStartRequest req, {
+    required WebViewConfig config,
     String? referer,
     UserProxySettings? proxy,
   }) async {
@@ -4406,7 +4416,11 @@ class WebViewFactory {
     switch (scheme) {
       case 'http':
       case 'https':
-        await _handleHttpDownload(req, referer: referer, proxy: proxy);
+        if (Platform.isAndroid && config.onHttpDownload != null) {
+          await config.onHttpDownload!(req.url.toString());
+        } else {
+          await _handleHttpDownload(req, referer: referer, proxy: proxy);
+        }
         return;
       case 'data':
         _handleDataDownload(req);
