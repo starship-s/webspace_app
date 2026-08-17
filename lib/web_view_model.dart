@@ -1298,6 +1298,7 @@ class WebViewModel {
           onHtmlLoaded: onHtmlLoaded,
           shouldFetchHtml: shouldFetchHtml,
           initialHtml: initialHtml,
+          initialHtmlMayAutoRefresh: htmlCachingEnabled,
           onRendererGone: (didCrash) => handleRendererGone(didCrash: didCrash),
           onConsoleMessage: (message, level) {
             consoleLogs.add(ConsoleLogEntry(

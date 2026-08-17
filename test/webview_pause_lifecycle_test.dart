@@ -221,6 +221,28 @@ void main() {
     });
   });
 
+  group('cached initial HTML live refresh scheduling', () {
+    test('only cache-first HTML schedules the one-shot live refresh', () {
+      bool shouldSchedule({
+        bool hasInitialHtml = true,
+        bool cacheFirst = false,
+        bool isFileImport = false,
+        bool deferInitialLoad = false,
+      }) => shouldScheduleCachedHtmlLiveReload(
+            hasInitialHtml: hasInitialHtml,
+            initialHtmlMayAutoRefresh: cacheFirst,
+            isFileImport: isFileImport,
+            deferInitialLoad: deferInitialLoad,
+          );
+
+      expect(shouldSchedule(), isFalse);
+      expect(shouldSchedule(hasInitialHtml: false, cacheFirst: true), isFalse);
+      expect(shouldSchedule(cacheFirst: true), isTrue);
+      expect(shouldSchedule(cacheFirst: true, isFileImport: true), isFalse);
+      expect(shouldSchedule(cacheFirst: true, deferInitialLoad: true), isFalse);
+    });
+  });
+
   group('WebViewModel pause/resume null-safety', () {
     test('pauseWebView() with no controller is a no-op', () async {
       final m = _modelWith(null);

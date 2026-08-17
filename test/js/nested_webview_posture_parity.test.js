@@ -142,7 +142,8 @@ const POSTURE = new Set([
 ]);
 
 const PLUMBING = new Set([
-  'key', 'initialUrl', 'initialHtml', 'deferInitialLoad',
+  'key', 'initialUrl', 'initialHtml', 'initialHtmlMayAutoRefresh',
+  'deferInitialLoad',
   'backForwardGestures', // deliberate root-only: nested uses route-pop (NAV-008)
   'onUrlChanged', 'onCookiesChanged', 'cookieManager', 'containerCookieManager',
   'cookieSiteId', 'onFindResult', 'shouldOverrideUrlLoading', 'onLoadingChanged',

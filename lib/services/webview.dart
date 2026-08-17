@@ -624,9 +624,12 @@ class WebViewConfig {
   /// IPC outright is the only way to drop the renderer pressure.
   /// When unset, every `onLoadStop` fetches HTML (legacy behavior).
   final bool Function()? shouldFetchHtml;
-  /// Optional cached HTML to display when offline. Sub-resources (CSS/JS/images)
+  /// Optional cached HTML for the first paint. Sub-resources (CSS/JS/images)
   /// load from the browser's HTTP cache via LOAD_CACHE_ELSE_NETWORK mode.
   final String? initialHtml;
+  /// Whether [initialHtml] came from explicit cache-first mode and may be
+  /// followed by one live refresh. Offline fallback HTML must leave this off.
+  final bool initialHtmlMayAutoRefresh;
   /// Whether to strip tracking parameters from URLs via ClearURLs rules.
   final bool clearUrlEnabled;
   /// Whether to block navigation to domains on the Hagezi DNS blocklist.
@@ -777,6 +780,7 @@ class WebViewConfig {
     this.onHtmlLoaded,
     this.shouldFetchHtml,
     this.initialHtml,
+    this.initialHtmlMayAutoRefresh = false,
     this.onConsoleMessage,
     this.userScripts = const [],
     this.onConfirmScriptFetch,
@@ -960,6 +964,18 @@ bool deferInitialLoadForRestore({
   required bool isFileImport,
 }) =>
     hasPendingRestoreState && isAndroid && !isFileImport;
+
+/// Pure gate for the cached-HTML one-shot live refresh.
+bool shouldScheduleCachedHtmlLiveReload({
+  required bool hasInitialHtml,
+  required bool initialHtmlMayAutoRefresh,
+  required bool isFileImport,
+  required bool deferInitialLoad,
+}) =>
+    hasInitialHtml &&
+    initialHtmlMayAutoRefresh &&
+    !isFileImport &&
+    !deferInitialLoad;
 
 /// InAppWebView controller wrapper
 class _WebViewController implements WebViewController {
@@ -1680,11 +1696,9 @@ class WebViewFactory {
     // Cached-HTML render: when the call site supplies
     // `config.initialHtml`, feed it to chromium via
     // `InAppWebViewInitialData(data, baseUrl: initialUrl)` for instant
-    // first paint. Once the cached parse settles (`onLoadStop` for the
-    // initialData), fire a one-shot `controller.reload()` to fetch the
-    // live URL — which is `baseUrl`, so chromium re-loads the same
-    // origin without losing the cached visual state during the
-    // network round-trip.
+    // first paint. Explicit cache-first mode then fires a one-shot
+    // `controller.reload()` after the cached parse settles. Offline fallback
+    // HTML stays put until explicit user navigation or reload.
     //
     // file:// imports are the exception — their initialUrl is a
     // synthetic `file://<filename>` handle with no fetchable form, so
@@ -1713,12 +1727,16 @@ class WebViewFactory {
     final renderInitialData =
         (config.initialHtml != null || isFileImport) && !suppressInitialLoad;
     final usesCachedHtml = config.initialHtml != null && !suppressInitialLoad;
-    // One-shot: when the cached HTML's first onLoadStop fires, do
+    // One-shot: when opted-in cached HTML's first onLoadStop fires, do
     // exactly one controller.reload() to get a live page. Subsequent
     // onLoadStop events (post-reload, or for SPA navigations) leave
-    // it false. Skip entirely for file:// imports and for builds
-    // where we KNOW we're offline at construction (no live to fetch).
-    var pendingLiveReload = usesCachedHtml && !isFileImport;
+    // it false. Skip file:// imports, offline fallback HTML, and restores.
+    var pendingLiveReload = shouldScheduleCachedHtmlLiveReload(
+      hasInitialHtml: config.initialHtml != null,
+      initialHtmlMayAutoRefresh: config.initialHtmlMayAutoRefresh,
+      isFileImport: isFileImport,
+      deferInitialLoad: suppressInitialLoad,
+    );
 
     final textZoom = systemTextZoomPercent();
 
