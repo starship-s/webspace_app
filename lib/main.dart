@@ -4565,10 +4565,14 @@ class _WebSpacePageState extends State<WebSpacePage>
     // lifecycle hook handles the warm path.
     unawaited(_handleShareIntent());
 
-    // iOS: register the BGAppRefreshTask handler so opportunistic wakeups
-    // reload notification webviews. No-op on other platforms.
-    BackgroundTaskService.instance.onBackgroundRefresh =
-        _refreshNotificationSites;
+    // Register the native background-refresh handler. Android WorkManager can
+    // fire while the app is foregrounded, so never reload the visible site in
+    // that state; true background refreshes still reload every notification site.
+    BackgroundTaskService.instance.onBackgroundRefresh = () =>
+        _refreshNotificationSites(
+          excludeActive: WidgetsBinding.instance.lifecycleState ==
+              AppLifecycleState.resumed,
+        );
     BackgroundTaskService.instance.initialize();
     if (_anyNotificationSites()) {
       unawaited(BackgroundTaskService.instance.scheduleNextRefresh());
@@ -4816,8 +4820,8 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// pending notifications. Called by:
   ///   1. The 5-minute foreground poll tick (skips the active site so the
   ///      user's interaction isn't disrupted).
-  ///   2. The iOS BGAppRefreshTask handler (no active-site exclusion since
-  ///      the app is suspended at that point).
+  ///   2. The native background-task handler (skips the active site if Android
+  ///      WorkManager fires while the app is foregrounded).
   Future<void> _refreshNotificationSites({bool excludeActive = false}) async {
     int reloaded = 0;
     int skippedUnloaded = 0;
