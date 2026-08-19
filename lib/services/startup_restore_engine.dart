@@ -133,19 +133,19 @@ class StartupRestoreEngine {
 
   /// FS-008: whether activating a site should land in fullscreen.
   ///
-  /// Combines the global "full screen on shortcut launch" option
-  /// ([fullscreenOnShortcut]) with the site's own per-site
-  /// [WebViewModel.fullscreenMode]. A shortcut launch ([viaShortcut] true)
-  /// forces fullscreen when the global option is on; every launch still
-  /// honors the per-site flag. A normal in-app switch ([viaShortcut] false)
-  /// depends on the per-site flag alone, so the global option never changes
-  /// the behavior of tab-strip / drawer navigation.
+  /// Combines the global direct-entry option ([fullscreenOnShortcut]) with
+  /// the site's own per-site [WebViewModel.fullscreenMode]. A direct entry
+  /// ([directEntry] true), such as a shortcut or notification tap, forces
+  /// fullscreen when the global option is on; every launch still honors the
+  /// per-site flag. A normal in-app switch ([directEntry] false) depends on
+  /// the per-site flag alone, so the global option never changes tab-strip /
+  /// drawer navigation.
   static bool shouldEnterFullscreen({
-    required bool viaShortcut,
+    required bool directEntry,
     required bool fullscreenOnShortcut,
     required bool perSiteFullscreenMode,
   }) {
-    return perSiteFullscreenMode || (viaShortcut && fullscreenOnShortcut);
+    return perSiteFullscreenMode || (directEntry && fullscreenOnShortcut);
   }
 }
 

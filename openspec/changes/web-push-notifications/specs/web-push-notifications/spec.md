@@ -72,7 +72,7 @@ The system SHALL inject a JavaScript polyfill at `DOCUMENT_START` (with `forMain
 
 ### Requirement: NOTIF-003 - Notification Tap Navigation
 
-The system SHALL navigate to the originating site when the user taps a notification. This routes through `_setCurrentIndex`. In container mode, no domain conflicts occur — the target site simply becomes active.
+The system SHALL navigate to the originating site when the user taps a notification. Before activation, the app SHALL return to the root/main route so settings or nested pages do not overlay the target. This routes through `_setCurrentIndex`, which SHALL be awaited before applying the global direct-entry fullscreen policy. In container mode, no domain conflicts occur — the target site simply becomes active.
 
 #### Scenario: User taps a notification for a loaded site
 
@@ -80,15 +80,19 @@ The system SHALL navigate to the originating site when the user taps a notificat
 **And** Site A is still loaded in `_loadedIndices`
 **When** the user taps the notification
 **Then** the app opens (or comes to foreground)
+**And** the app returns to the root/main route before activating Site A
 **And** `_setCurrentIndex` is called with Site A's index
 **And** Site A becomes the active site
+**And** Site A enters full screen when the global `fullscreenOnShortcut` preference or Site A's `fullscreenMode` is enabled
 
 #### Scenario: User taps a notification for a site that was not yet loaded
 
 **Given** a native notification was created by Site A
 **And** Site A is not in `_loadedIndices` (e.g., app was restarted)
 **When** the user taps the notification
-**Then** `_setCurrentIndex` adds Site A to `_loadedIndices`
+**Then** the app returns to the root/main route before activating Site A
+**And** `_setCurrentIndex` is awaited
+**And** `_setCurrentIndex` adds Site A to `_loadedIndices`
 **And** Site A's webview is created with its profile
 **And** Site A becomes the active site
 

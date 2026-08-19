@@ -370,10 +370,10 @@ void main() {
   });
 
   group('StartupRestoreEngine.shouldEnterFullscreen (FS-008)', () {
-    test('shortcut launch with global option on enters fullscreen', () {
+    test('direct entry from shortcut or notification enters fullscreen', () {
       expect(
         StartupRestoreEngine.shouldEnterFullscreen(
-          viaShortcut: true,
+          directEntry: true,
           fullscreenOnShortcut: true,
           perSiteFullscreenMode: false,
         ),
@@ -384,7 +384,7 @@ void main() {
     test('shortcut launch with global option off does not force fullscreen', () {
       expect(
         StartupRestoreEngine.shouldEnterFullscreen(
-          viaShortcut: true,
+          directEntry: true,
           fullscreenOnShortcut: false,
           perSiteFullscreenMode: false,
         ),
@@ -395,7 +395,7 @@ void main() {
     test('per-site fullscreen still applies when global option is off', () {
       expect(
         StartupRestoreEngine.shouldEnterFullscreen(
-          viaShortcut: true,
+          directEntry: true,
           fullscreenOnShortcut: false,
           perSiteFullscreenMode: true,
         ),
@@ -404,11 +404,11 @@ void main() {
     });
 
     test('normal in-app switch is unaffected by the global option', () {
-      // viaShortcut=false models a tab-strip / drawer switch: the global
+      // directEntry=false models a tab-strip / drawer switch: the global
       // shortcut option must not pull a non-fullscreen site into fullscreen.
       expect(
         StartupRestoreEngine.shouldEnterFullscreen(
-          viaShortcut: false,
+          directEntry: false,
           fullscreenOnShortcut: true,
           perSiteFullscreenMode: false,
         ),
@@ -419,7 +419,7 @@ void main() {
     test('normal in-app switch still honors the per-site flag', () {
       expect(
         StartupRestoreEngine.shouldEnterFullscreen(
-          viaShortcut: false,
+          directEntry: false,
           fullscreenOnShortcut: false,
           perSiteFullscreenMode: true,
         ),

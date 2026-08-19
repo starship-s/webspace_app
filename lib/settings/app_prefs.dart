@@ -38,10 +38,10 @@ final Map<String, Object> kExportedAppPrefs = <String, Object>{
   // so pre-per-site backups keep restoring the user's chosen corner.
   'tabBarButtonOnRight': true,
   // Enter full screen automatically when a site is opened from a home-screen
-  // shortcut (Android pinned shortcut / iOS App Intents). On by default: a
-  // pinned shortcut is the user's "app launcher" entry point, so the immersive
-  // chrome-free view matches the expectation. Per-site `fullscreenMode` still
-  // applies independently on every activation.
+  // shortcut (Android pinned shortcut / iOS App Intents) or notification. On
+  // by default: both are direct app-entry points, so the immersive chrome-free
+  // view matches the expectation. Per-site `fullscreenMode` still applies
+  // independently on every activation.
   'fullscreenOnShortcut': true,
   // Max width (logical px) of each tab in the bottom tab strip. Long site
   // names ellipsize at this width instead of stretching the tab.

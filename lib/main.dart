@@ -1024,9 +1024,10 @@ class _WebSpacePageState extends State<WebSpacePage>
   // model.
   Alignment? _tabBarButtonDragAlignment;
   final GlobalKey _bodyStackKey = GlobalKey();
-  // Enter fullscreen when a site is opened via a home-screen shortcut. Global
-  // pref mirror of the `fullscreenOnShortcut` SharedPreferences key. On by
-  // default. Independent of per-site `WebViewModel.fullscreenMode`.
+  // Enter fullscreen when a site is opened via a home-screen shortcut or
+  // notification. Global pref mirror of the `fullscreenOnShortcut`
+  // SharedPreferences key. On by default. Independent of per-site
+  // `WebViewModel.fullscreenMode`.
   bool _fullscreenOnShortcut = true;
   int _tabMaxWidth = 140;
   // Runtime-only: whether the tab-bar button has revealed the tab strip.
@@ -1963,7 +1964,7 @@ class _WebSpacePageState extends State<WebSpacePage>
     // fullscreen for a non-fullscreen per-site target), so there's no else.
     if (_kioskLocked ||
         StartupRestoreEngine.shouldEnterFullscreen(
-          viaShortcut: true,
+          directEntry: true,
           fullscreenOnShortcut: _fullscreenOnShortcut,
           perSiteFullscreenMode: _webViewModels[index].fullscreenMode,
         )) {
@@ -4482,7 +4483,7 @@ class _WebSpacePageState extends State<WebSpacePage>
     if (indexToRestore != null &&
         (_kioskLocked ||
             StartupRestoreEngine.shouldEnterFullscreen(
-              viaShortcut: true,
+              directEntry: true,
               fullscreenOnShortcut: _fullscreenOnShortcut,
               perSiteFullscreenMode:
                   _webViewModels[indexToRestore].fullscreenMode,
@@ -4856,7 +4857,7 @@ class _WebSpacePageState extends State<WebSpacePage>
     );
   }
 
-  void _onNotificationTapped(String siteId) {
+  Future<void> _onNotificationTapped(String siteId) async {
     final index = _webViewModels.indexWhere((m) => m.siteId == siteId);
     if (index < 0) {
       LogService.instance.log(
@@ -4872,8 +4873,25 @@ class _WebSpacePageState extends State<WebSpacePage>
       'Tap routing to site $index: "${_webViewModels[index].name}"',
       sensitivity: LogSensitivity.sensitive,
     );
-    _setCurrentIndex(index);
-    if (mounted) setState(() {});
+    if (!mounted) return;
+    final activationVersion = _setCurrentIndexVersion + 1;
+    Navigator.of(context).popUntil((route) => route.isFirst);
+    await _setCurrentIndex(index);
+    if (!mounted ||
+        _setCurrentIndexVersion != activationVersion ||
+        _currentIndex != index ||
+        index >= _webViewModels.length ||
+        _webViewModels[index].siteId != siteId) {
+      return;
+    }
+    if (StartupRestoreEngine.shouldEnterFullscreen(
+      directEntry: true,
+      fullscreenOnShortcut: _fullscreenOnShortcut,
+      perSiteFullscreenMode: _webViewModels[index].fullscreenMode,
+    )) {
+      _enterFullscreen();
+    }
+    setState(() {});
   }
 
   void _startForegroundPollTimer() {

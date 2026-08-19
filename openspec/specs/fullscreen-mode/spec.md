@@ -171,34 +171,42 @@ The system SHALL support a global option to keep the site tab strip visible in f
 
 ---
 
-### Requirement: FS-008 - Full Screen on Shortcut Launch
+### Requirement: FS-008 - Full Screen on Direct Entry
 
-The system SHALL support a global option, enabled by default, to enter full screen automatically when a site is opened from a home-screen shortcut (Android pinned shortcut / iOS App Intents). The option is independent of the per-site `fullscreenMode` setting and applies to both cold and warm shortcut launches.
+The system SHALL support a global option, enabled by default, to enter full screen automatically when a site is opened from a home-screen shortcut (Android pinned shortcut / iOS App Intents) or notification tap. The option is independent of the per-site `fullscreenMode` setting and applies to cold and warm shortcut launches and notification taps.
 
 #### Scenario: Cold launch from shortcut
 
-**Given** "Full screen on shortcut launch" is enabled
+**Given** "Full screen on shortcuts and notifications" is enabled
 **And** the app is not running
 **When** the user taps a pinned home-screen shortcut for a site
 **Then** the app launches that site directly in full screen mode
 
 #### Scenario: Warm launch from shortcut
 
-**Given** "Full screen on shortcut launch" is enabled
+**Given** "Full screen on shortcuts and notifications" is enabled
 **And** the app is already running in the background
 **When** the user taps a pinned home-screen shortcut for a site
 **Then** the app switches to that site and enters full screen mode
 
+#### Scenario: Notification tap
+
+**Given** "Full screen on shortcuts and notifications" is enabled
+**When** the user taps a notification for a known site
+**Then** the app returns to the root/main route
+**And** the app switches to that site
+**And** the site is shown in full screen mode
+
 #### Scenario: Option disabled
 
-**Given** "Full screen on shortcut launch" is disabled
-**When** the user opens a site from a home-screen shortcut
-**Then** full screen is governed only by the site's per-site `fullscreenMode` (not entered just because it was opened via a shortcut)
+**Given** "Full screen on shortcuts and notifications" is disabled
+**When** the user opens a site from a home-screen shortcut or notification
+**Then** full screen is governed only by the site's per-site `fullscreenMode` (not entered just because it was opened via a shortcut or notification)
 
 #### Scenario: Normal site switch is unaffected
 
-**Given** "Full screen on shortcut launch" is enabled
-**When** the user switches sites from inside the app (tab strip, drawer) rather than via a shortcut
+**Given** "Full screen on shortcuts and notifications" is enabled
+**When** the user switches sites from inside the app (tab strip, drawer) rather than via a shortcut or notification
 **Then** full screen is governed only by the target site's `fullscreenMode`
 
 ---
@@ -337,7 +345,7 @@ The presentation is backed by two booleans, `showTabStrip` (pinned) and `tabBarB
 - `bool _isFullscreen = false` - Current fullscreen state (not persisted; runtime only)
 - `bool _tabStripInFullscreen = false` - Global pref mirror of the `tabStripInFullscreen` SharedPreferences key (registered in `kExportedAppPrefs`, round-trips through settings backup)
 - `bool _tabBarButton = false` - Global pref mirror of the `tabBarButton` SharedPreferences key (registered in `kExportedAppPrefs`). When set, a floating button reveals the tab strip (and its overflow menu) on demand, in and out of full screen (FS-009). Read falls back to the legacy `tabBarButtonInFullscreen` key (and backup field) once on upgrade. `bool _tabBarButtonOnRight` is the legacy app-wide corner default, mapped to a bottom corner via `_tabBarButtonCornerEffective` only for sites whose per-site `tabBarButtonCorner` is null (still read from prefs/backups, never written by UI anymore); `bool _tabBarOverlayVisible` is the runtime-only flag for "the button has revealed the strip" (reset on exit-fullscreen and site switch, never persisted).
-- `bool _fullscreenOnShortcut = true` - Global pref mirror of the `fullscreenOnShortcut` SharedPreferences key (registered in `kExportedAppPrefs`, on by default). Both shortcut launch paths — `_openShortcutIndex` (warm) and the cold-launch restore path (`indexToRestore != null`) — route the decision through the pure `StartupRestoreEngine.shouldEnterFullscreen(viaShortcut, fullscreenOnShortcut, perSiteFullscreenMode)` policy and call `_enterFullscreen()` when it returns true. The policy returns `perSiteFullscreenMode || (viaShortcut && fullscreenOnShortcut)`, so a normal in-app switch (`viaShortcut: false`) is never pulled into fullscreen by the global option. Covered by `test/startup_restore_engine_test.dart`.
+- `bool _fullscreenOnShortcut = true` - Global pref mirror of the `fullscreenOnShortcut` SharedPreferences key (registered in `kExportedAppPrefs`, on by default). Both shortcut launch paths — `_openShortcutIndex` (warm) and the cold-launch restore path (`indexToRestore != null`) — plus notification taps route the decision through the pure `StartupRestoreEngine.shouldEnterFullscreen(directEntry, fullscreenOnShortcut, perSiteFullscreenMode)` policy and call `_enterFullscreen()` when it returns true. The persisted key remains backward compatible even though the setting covers shortcuts and notifications. The policy returns `perSiteFullscreenMode || (directEntry && fullscreenOnShortcut)`, so a normal in-app switch (`directEntry: false`) is never pulled into fullscreen by the global option. Covered by `test/startup_restore_engine_test.dart`.
 
 ### UI Changes
 

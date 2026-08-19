@@ -847,13 +847,13 @@
   "@appSettingsSiteTabStripSubtitle": {
     "description": "Subtitle for the site tab strip toggle"
   },
-  "appSettingsFullscreenOnShortcut": "Full screen on shortcut launch",
+  "appSettingsFullscreenOnShortcut": "Full screen on shortcuts and notifications",
   "@appSettingsFullscreenOnShortcut": {
-    "description": "Toggle title for automatically entering full screen when a site is opened from a home-screen shortcut"
+    "description": "Toggle title for automatically entering full screen when a site is opened from a home-screen shortcut or notification tap"
   },
-  "appSettingsFullscreenOnShortcutSubtitle": "Open in full screen when launched from a home-screen shortcut",
+  "appSettingsFullscreenOnShortcutSubtitle": "Open sites in full screen from home-screen shortcuts or notifications",
   "@appSettingsFullscreenOnShortcutSubtitle": {
-    "description": "Subtitle for the toggle that enters full screen when a site is opened from a pinned home-screen shortcut"
+    "description": "Subtitle for the toggle that enters full screen when a site is opened from a pinned home-screen shortcut or notification"
   },
   "appSettingsFullscreenTabStrip": "In full screen, tab strip",
   "@appSettingsFullscreenTabStrip": {

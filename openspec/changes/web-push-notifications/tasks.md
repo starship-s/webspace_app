@@ -109,7 +109,7 @@
 
 ## 15. Notification tap routing
 
-- [x] 15.1 Wire `NotificationService`'s tap callback to a method on `_WebSpacePageState`: `void _onNotificationTapped(String siteId)`.
+- [x] 15.1 Wire `NotificationService`'s tap callback to a method on `_WebSpacePageState`: `Future<void> _onNotificationTapped(String siteId)`.
 - [x] 15.2 Implementation: find the index in `_webViewModels` where `model.siteId == siteId`. If found, call `await _setCurrentIndex(index)`. If not found (site deleted between notification and tap), log a warning and ignore.
 - [ ] 15.3 Manual test: send notification, switch to another site, tap notification, verify the correct site becomes active.
 
