@@ -336,8 +336,8 @@ packages:
     dependency: "direct overridden"
     description:
       path: flutter_inappwebview_android
-      ref: "643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64"
-      resolved-ref: "643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64"
+      ref: "1a8ed58fddea13cb5f2799b4bf64c120917fc5c1"
+      resolved-ref: "1a8ed58fddea13cb5f2799b4bf64c120917fc5c1"
       url: "https://github.com/starship-s/flutter_inappwebview"
     source: git
     version: "1.2.0-beta.3"

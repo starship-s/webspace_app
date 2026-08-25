@@ -2,7 +2,7 @@
 
 **Status:** open (recurring — each fix has closed one entry path; new paths keep surfacing)
 **Platform:** Android only (hybrid-composition `SurfaceView`)
-**Spec:** [openspec/specs/webview-pause-lifecycle/spec.md](../../openspec/specs/webview-pause-lifecycle/spec.md) — requirements `PAUSE-013`…`PAUSE-021`
+**Spec:** [openspec/specs/webview-pause-lifecycle/spec.md](../../openspec/specs/webview-pause-lifecycle/spec.md) — requirements `PAUSE-013`…`PAUSE-021`, `PAUSE-027`…`PAUSE-028`
 **Formal model:** [formal/kernel.tla](../../formal/kernel.tla) — `RepaintLiveness` ("every blank-surface attach is eventually repainted"). The `kernel_conflict.cfg` demonstrator is a back path that bypasses the chokepoint — i.e. this exact bug — and TLC rejects it with a counterexample.
 
 ## Symptom
@@ -239,20 +239,47 @@ must still confirm both that repeated recovery produces no horizontal/vertical
 wobble and that a blank surface after resume, attach, back navigation, memory
 pressure, or reload is actually painted by the native relayout plus invalidation.
 
+### Attempt 11 — Native repaint at Android attach/visible lifecycle chokepoints
+**Date:** 2026-08-25 · **Files:** pubspec.yaml, pubspec.lock,
+openspec/specs/webview-pause-lifecycle/spec.md
+**What it did:** Pinned `flutter_inappwebview_android` to the immutable
+`starship-s/flutter_inappwebview` commit
+`1a8ed58fddea13cb5f2799b4bf64c120917fc5c1`. At that commit,
+`InAppWebView.requestRepaint()` only calls `requestLayout()` and
+`postInvalidateOnAnimation()`. `onAttachedToWindow()` calls `super` first and
+then `requestRepaint()`; `onWindowVisibilityChanged(visibility)` preserves the
+existing background-audio semantics and calls `requestRepaint()` only when the
+actual argument is `View.VISIBLE`.
+**Why:** Attach and visible lifecycle callbacks are native WebView chokepoints,
+so the geometry-free layout/redraw request is no longer dependent only on which
+Dart navigation or lifecycle path happened to fire, or on its timing relative to
+surface re-attachment. The Dart-side coalesced repaint pulses and bounded
+warm-resume metrics coverage remain in place; the native hooks complement rather
+than replace them. `requestLayout()` requests a fresh native layout/redraw; it
+does not prove that Android composition succeeded.
+**Why partial:** A local Android fdebug APK compiled successfully against this
+exact plugin source, and focused host tests are green, but there is no connected
+emulator or physical device. The latest failure log also contains no lifecycle or
+`SurfaceDiag` events, so affected-device validation is still outstanding. This
+is a precise lifecycle invariant and a historical attempt, not a claim that the
+intermittent bug is universally fixed. Renderer-process loss remains BUG-002:
+it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
+
 ## Known open gaps (candidates for the next recurrence)
 
 1. ~~Nested `InAppWebViewScreen`~~ — **closed by Attempt 6** (now funneled + gated).
 2. **Forward navigation** (`goForward`) into a bfcached entry is the symmetric case of
    Attempts 5–6 and is currently unnudged. (There is no `goForward` call site today,
    but adding one on Android would need the same funnel.)
-3. **The class isn't closed.** Every fix is per-path. Attempt 10 removes the old
-   geometry dependency and gives every existing trigger a native relayout + invalidation
-   operation, but the trigger list is still Dart-side. The durable trigger fix is a
-   **single chokepoint** that observes every surface (re)attach — ideally a native
-   surface-changed/-redrawn callback from the fork — instead of enumerating navigation
-   paths forever. **Attempt 8 narrows this** with `didChangeMetrics`, and **Attempt 9**
-   with the load-settled proxy; both remain useful retained triggers, but neither is the
-   native attach callback.
+3. **The class isn't closed.** Attempt 11 adds native WebView attach/visible
+   chokepoints, reducing the path/timing dependence of the Dart trigger list, but
+   those callbacks do not prove that every underlying `SurfaceView` buffer
+   re-attach emits one or that composition succeeds. Attempt 10 removes the old
+   geometry dependency and gives every existing trigger a native relayout +
+   invalidation operation. A native surface-changed/-redrawn callback may still be
+   needed for reattachments outside the covered lifecycle callbacks. **Attempt 8
+   narrows this** with `didChangeMetrics`, and **Attempt 9** with the load-settled
+   proxy; both remain useful retained triggers alongside Attempt 11.
 6. **Proxies fire before the compositor.** Both attach proxies now in use are upstream of
    the actual first paint: `didChangeMetrics` (Attempt 8) tracks the main FlutterView's
    metrics, and `onLoadingChanged(false)` (Attempt 9) maps to `onLoadStop`, i.e. document
@@ -277,17 +304,20 @@ pressure, or reload is actually painted by the native relayout plus invalidation
    unmodeled path; the `surface_repaint_funnel` gate now also covers the `didChangeMetrics`
    resume path. The kernel's TLAPS proof is still over the atomic-attach `GoodNext`, so the
    two models disagree by design — `warmstart.tla` is the faithful one for this ordering.
-5. **The device link is unproven.** The native operation now requests layout and an
-   animation invalidation without a size change, but automated tests cannot prove that the
-   Android System WebView paints the surface on the affected device. Device validation must
-   confirm both the absence of horizontal/vertical wobble and recovery from a blank surface;
-   the existing `SurfaceDiag` trigger lines identify which retained funnel fired. The whole
-   fix also rests on `didChangeMetrics` actually firing when the webview `SurfaceView`
-   re-attaches on a real warm resume. Flutter can dedupe identical window metrics, and the
-   callback tracks the main FlutterView, not the webview platform view. If it does not fire on
-   the affected device, Attempt 8 is a no-op there. The new `SurfaceDiag` line
-   `trigger=metrics-resume -> nudge` exists to confirm this from a device log; until such a
-   trace exists, the causal claim (this fixes the reported warm-start white screen) is
+5. **The device link is unproven.** Attempt 11's native hooks request layout and
+   animation invalidation without a size change at WebView attach/visible
+   chokepoints, but automated tests cannot prove that the Android System WebView
+   paints the surface on the affected device. Device validation must confirm both
+   the absence of horizontal/vertical wobble and recovery from a blank surface;
+   the existing `SurfaceDiag` trigger lines identify which retained funnel fired.
+   The retained Dart-side fallback also rests on `didChangeMetrics` actually
+   firing when the webview `SurfaceView` re-attaches on a real warm resume. Flutter
+   can dedupe identical window metrics, and the callback tracks the main
+   FlutterView, not the webview platform view. If it does not fire on the affected
+   device, Attempt 8 is a no-op there. The new `SurfaceDiag` line
+   `trigger=metrics-resume -> nudge` exists to confirm this from a device log; no
+   affected-device lifecycle/`SurfaceDiag` trace is available yet, so the causal
+   claim (that this fixes the reported warm-start white screen) remains
    unverified.
 7. **First activation of a fresh site is diagnostically dark and has no commit-side nudge.**
    Reported 2026-08-13 (sanitized log export): user cold-started to the site picker, tapped a

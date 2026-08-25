@@ -7,7 +7,7 @@
 
 Defines how the app pauses and resumes webviews to save resources. The split between **per-instance** pause (used on site switch) and **process-global** pause (used on app lifecycle) is load-bearing: one of them is global on Android and would freeze unrelated webviews if used at the wrong call site.
 
-**Formal model:** the surface-repaint requirements `PAUSE-013`…`PAUSE-018` are model-checked in [formal/kernel.tla](../../../formal/kernel.tla) as the `RepaintLiveness` property ("every blank-surface attach is eventually repainted"). See [formal/README.md](../../../formal/README.md) and [docs/bugs/001-white-screen.md](../../../docs/bugs/001-white-screen.md).
+**Formal model:** the core surface-repaint liveness model covers `PAUSE-013`…`PAUSE-018` in [formal/kernel.tla](../../../formal/kernel.tla) as the `RepaintLiveness` property ("every blank-surface attach is eventually repainted"). Later trigger contracts, including the native lifecycle repaint in `PAUSE-028`, are specified here but still require affected-device validation. See [formal/README.md](../../../formal/README.md) and [docs/bugs/001-white-screen.md](../../../docs/bugs/001-white-screen.md).
 
 ## Problem Statement
 
@@ -702,7 +702,7 @@ Both nudges SHALL emit a non-sensitive `SurfaceDiag` line (`trigger=reload -> nu
 
 ---
 
-### Requirement: PAUSE-024 — Geometry-Free Native Surface Repaint (Attempt 10)
+### Requirement: PAUSE-027 — Geometry-Free Native Surface Repaint (Attempt 10)
 
 On Android, the system SHALL repaint a live blank platform-view surface without changing Flutter widget geometry. The WebSpace `WebViewController.requestRepaint()` wrapper SHALL call the fork's `InAppWebViewController.requestRepaint()`, whose native operation requests layout and posts an animation invalidation without changing the WebView dimensions. Off Android the wrapper and the repaint funnel are no-ops.
 
@@ -728,6 +728,60 @@ This removes the horizontal and vertical wobble caused by the former 1 px paddin
 **Given** the main or nested host is steady or inside a repaint loop
 **When** Flutter lays out the WebView
 **Then** the constraints are identical in both states, with no repaint-only `Padding`, `EdgeInsets`, or inset state
+
+---
+
+### Requirement: PAUSE-028 — Native Repaint At Android WebView Lifecycle Chokepoints (Attempt 11)
+
+On Android, the pinned `flutter_inappwebview_android` fork at immutable commit
+`1a8ed58fddea13cb5f2799b4bf64c120917fc5c1` SHALL invoke the existing,
+geometry-free native `requestRepaint()` operation at the platform-view lifecycle
+chokepoints: `onAttachedToWindow()` SHALL call `super.onAttachedToWindow()` first
+and then `requestRepaint()`; `onWindowVisibilityChanged(visibility)` SHALL
+preserve the existing background-audio semantics and call `requestRepaint()` only
+when the actual argument is `View.VISIBLE`. Other visibility values passed to
+`onWindowVisibilityChanged` SHALL NOT trigger this visibility-based repaint hook.
+
+The native `requestRepaint()` operation SHALL only request a fresh native layout
+and redraw (`requestLayout()` plus `postInvalidateOnAnimation()`); it SHALL NOT
+change WebView or Flutter widget geometry, mutate state to fake a change, or use
+a timer. These native hooks reduce dependence on the Dart path and timing that
+reach a blank surface, but they complement rather than replace the host's
+coalesced repaint pulses and bounded warm-resume/load-settled retries. The native
+request asks for layout/redraw; it does not prove successful Android composition.
+
+This live-surface repaint contract is distinct from BUG-002 renderer-process loss.
+When the renderer is gone, the PAUSE-013/PAUSE-014 destroy-and-rebuild recovery
+remains required; the native attach/visible repaint hook is not a substitute for
+rebuilding an unusable WebView.
+
+#### Scenario: Native attach repaints after superclass attachment
+
+**Given** an Android hybrid-composition WebView is attached to its window
+**When** `onAttachedToWindow()` fires
+**Then** the native WebView calls `super.onAttachedToWindow()` before
+`requestRepaint()`
+**And** `requestRepaint()` requests layout and posts an animation invalidation
+**And** the WebView dimensions and Flutter constraints remain unchanged
+
+#### Scenario: Only a visible-window callback requests the native repaint
+
+**Given** the Android WebView's existing background-audio visibility behavior is
+active
+**When** `onWindowVisibilityChanged(visibility)` fires
+**Then** that existing behavior is preserved
+**And** `requestRepaint()` runs when `visibility == View.VISIBLE`
+**But** it does not run for `View.INVISIBLE` or `View.GONE`
+
+#### Scenario: Native hooks complement host retries and renderer recovery
+
+**Given** a host repaint retry is already coalescing, or the renderer process has
+been lost
+**When** an Android attach or `View.VISIBLE` callback fires
+**Then** the native repaint hook may complement the host retry without changing
+its geometry or replacing its retry contract
+**And** a lost renderer still follows the destroy-and-rebuild recovery rather
+than being treated as a live unpainted surface
 
 ---
 
