@@ -120,7 +120,7 @@ void main() {
     );
     expect(
       RegExp(
-        'onHttpDownload: Platform.isAndroid '
+        'onHttpDownload: hostIsAndroid '
         r'\? launchUrlInSystemBrowser : null,',
       ).allMatches(bindings),
       hasLength(2),

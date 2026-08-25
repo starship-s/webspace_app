@@ -45,7 +45,7 @@ The only way to truly silence a site is `disposeWebView()` — which tears down 
 
 ### Requirement: PAUSE-001 — Per-Instance Pause for Site Switches
 
-The system SHALL pause the previously active webview on site switch using the per-instance API only, with no process-global side effects.
+The system SHALL pause the previously active webview on site switch using the per-instance API only, with no process-global side effects. Exempt: notification sites (`notificationsEnabled`) and background-audio sites (`effectiveBackgroundAudioEnabled`, BGAUDIO-001 in [background-audio](../background-audio/spec.md)) — `pauseWebView()` early-returns for both, since the iOS per-instance pause freezes the page's JS thread.
 
 #### Scenario: Site switch from A to B
 
@@ -80,6 +80,8 @@ calls, so the active site is never left paused.
 ### Requirement: PAUSE-002 — Process-Global Pause Only at App Lifecycle
 
 The system SHALL pause both the active webview and process-global JS timers when the app goes to background, so every loaded webview's JS halts. The per-instance and process-global calls SHALL be bound to a single captured controller so a concurrent `disposeWebView()` cannot strand the global half.
+
+Exempt: the JS pause is skipped entirely when the active site is a notification site, or when ANY loaded site has background audio enabled (BGAUDIO-002 in [background-audio](../background-audio/spec.md) — the pause is process-global on Android, so a backgrounded audio site would be starved by pausing the active one). The decision is made by `AppLifecycleEngine.backgroundPlan` and logged as a non-sensitive `App background: jsPause=<bool> capture=<bool> bgAudio=<count> loaded` line; state capture is never gated on the exemption.
 
 #### Scenario: App goes to background
 
@@ -346,6 +348,8 @@ The system SHALL capture `controller.saveState()` bytes opportunistically — wi
 3. **Navigation-debounced** (`WebViewModel.onNavigationCommitted` → `NavStateCaptureDebouncer`): each committed navigation in a loaded webview (deduped across the `onLoadStop` / `onUpdateVisitedHistory` double-fire) restarts a per-site trailing debounce window (3s); when a navigation burst settles, that site's state is captured. This covers the kill paths the first two points miss: (a) killing the app from the app switcher delivers only `inactive` — which the lifecycle handler deliberately ignores (issue #308) — so the app-background capture never runs; (b) loaded-but-not-current sites (notification pollers, sites the user switched away from) navigate without ever hitting go-home or a dispose path, leaving their on-disk state stale until an eviction happens to capture them.
 
 None of these paths mutate the model's `lifecycleState` — the field stays at `resident` because the webview is not actually disposed. Capture goes through `_captureStateBytes` (bytes-only) rather than `_captureStateForRestore` (bytes + flip-to-savedForRestore). All three gate on `WebViewModel.persistsNavState` (no capture for incognito or archive-tier sites).
+
+The go-home capture runs *after* the home state is committed, inside the bounded teardown of NAV-010 in [navigation](../navigation/spec.md): it is best-effort and never gates the return to the webspace list.
 
 #### Scenario: Go-home captures state for the previously-active site
 
@@ -648,7 +652,7 @@ On Android, the system SHALL re-fire the surface repaint when the visible webvie
 
 A surface (re)attach re-lays-out the window, which Flutter delivers to the host as `didChangeMetrics` — the closest Dart-side signal to the actual attach. The host SHALL, on `resumed`, open a bounded repaint window (`_openResumeRepaintWindow`, ~3s) and, while it is open, fire `_nudgeSurfaceRepaint` from `didChangeMetrics`. The window bound keeps steady-state metric changes (keyboard show/hide, rotation) from nudging; `_nudgeSurfaceRepaint` coalesces, so a burst of metric changes keeps a single tick loop alive rather than spawning competing loops. This is additive to PAUSE-015's tail nudge (which still covers the surface that was already attached by the time the sequence settled) and is a no-op off Android.
 
-This narrows BUG-001 open gap #3 (the fix should key on the attach, not the lifecycle event) without closing trigger coverage: `didChangeMetrics` is a proxy for the attach, not a native surface-changed callback from the fork. Attempt 10 removes the geometry dependency from the repaint operation, while the callback remains a future way to reduce the list of Dart-side triggers.
+This narrows BUG-001 open gap #3 (the fix should key on the attach, not the lifecycle event) without closing trigger coverage: `didChangeMetrics` is a proxy for the attach, not a native surface-changed callback from the fork. Attempt 11 removes the geometry dependency from the repaint operation, while the callback remains a future way to reduce the list of Dart-side triggers.
 
 The ordering is model-checked in [formal/warmstart.tla](../../../formal/warmstart.tla): with only the resume one-shot nudge (`Fix="none"`) an async `SurfaceReattach` landing after it drains leaves the surface blank forever and `RepaintLiveness` is violated (the reproduction); an attach-triggered re-nudge (`Fix="attach"`) makes it hold. This is the ordering the kernel's atomic `Resume == Attach` plus `WF_vars(Nudge)` cannot express (BUG-001 gap #4). The runnable counterpart is `test/surface_repaint_engine_test.dart` (the `SurfaceRepaintEngine` `owed`/`attach` characterization), and the wiring is held by the `surface_repaint_funnel` structural gate. The device premise (that `didChangeMetrics` fires on the webview surface reattach) is confirmed by the `SurfaceDiag` `trigger=metrics-resume` log line, not by these models.
 
@@ -675,7 +679,7 @@ Repainting only when `reload()` is issued is insufficient, and for the same orde
 
 Every reload of a webview SHALL go through a funnel that fires the latch: `WebViewModel.reloadAndRepaint` for the main page (covering the Refresh button and Clear-cookies via `userDrivenReload`, pull-to-refresh, the `restoreState` materialize reload, and the notification background refresh) and `_reloadAndRepaint` in `InAppWebViewScreen` for the nested screen (menu Refresh and pull-to-refresh). Reloads the webview factory issues on its own — the cached-HTML one-shot live refresh — SHALL report through `WebViewConfig.onReloadIssued` so they latch identically. The funnels are held by the `surface_repaint_funnel` structural gate; a new raw `controller.reload()` fails CI. All of it is a no-op off Android.
 
-This is per-path like every prior attempt and does not close BUG-001 open gap #3; a native surface-changed callback from the fork remains the durable trigger fix. Attempt 10 makes each existing repaint operation geometry-free.
+This is per-path like every prior attempt and does not close BUG-001 open gap #3; a native surface-changed callback from the fork remains the durable trigger fix. Attempt 11 makes each existing repaint operation geometry-free.
 
 The ordering is the one already model-checked in [formal/warmstart.tla](../../../formal/warmstart.tla) (a one-shot nudge draining before an async attach violates `RepaintLiveness`; an attach-triggered re-nudge restores it), with the reload's commit playing the part of `SurfaceReattach`. The runnable counterpart is the reload group in `test/surface_repaint_engine_test.dart`, including the timing-faithful case where a 2s reload is recovered only by the settled re-nudge.
 
@@ -702,7 +706,91 @@ Both nudges SHALL emit a non-sensitive `SurfaceDiag` line (`trigger=reload -> nu
 
 ---
 
-### Requirement: PAUSE-027 — Geometry-Free Native Surface Repaint (Attempt 10)
+### Requirement: PAUSE-024 — Surface Repaint On Return From A Pushed Route
+
+On Android, the system SHALL recomposite the surface when an opaque route pushed over a webview screen is popped and the webview becomes visible again. While an opaque `PageRoute` covers the screen its platform view is not composited, and the embedder detaches the hybrid-composition `SurfaceView` from the view hierarchy; the pop re-attaches it, blank, exactly as PAUSE-017's fresh controller does. The pop passes through **none** of the existing chokepoints: the site did not change (`_setCurrentIndex`, PAUSE-015), no controller was created (`onControllerReady`, PAUSE-017), nothing navigated (PAUSE-018/021), and the app never left the foreground (PAUSE-020). Every full-screen route in the app reaches this: site settings, app settings, developer tools, downloads, add-site, the QR scanner, and the nested webview screen.
+
+Each webview-hosting screen SHALL be `RouteAware`, subscribe its own `ModalRoute` to the shared `surfaceRouteObserver` in `didChangeDependencies`, unsubscribe in `dispose`, and fire `_nudgeSurfaceRepaint` from `didPopNext`. The observer SHALL be registered on the app's `MaterialApp.navigatorObservers` and SHALL be typed to `PageRoute`, so a dialog or any other `PopupRoute` — which leaves the webview composited underneath and therefore needs no repaint — cannot trigger a nudge. The main page SHALL emit the non-sensitive `SurfaceDiag` line `trigger=route-return -> nudge` (Android only, no site name or URL), the same diagnostic contract as PAUSE-019/020/021. The nudge is a no-op off Android.
+
+#### Scenario: Returning from site settings
+
+**Given** a site is visible on Android
+**When** the user opens site settings from the overflow menu and then pops back
+**Then** `didPopNext` fires `_nudgeSurfaceRepaint` against the re-attached surface
+**And** the page is visible again without the user rotating, locking, or switching tabs
+
+#### Scenario: Returning from the nested webview screen
+
+**Given** a cross-domain link opened the nested `InAppWebViewScreen` over the main page
+**When** the user pops it
+**Then** the main page repaints through its own `didPopNext`, and the nested screen — which is itself route-aware — would repaint the same way if a route were popped over *it*
+
+#### Scenario: A dialog does not nudge
+
+**Given** a site is visible on Android
+**When** a confirmation dialog or any other popup route opens and closes over it
+**Then** no repaint runs, because the observer is typed to `PageRoute` and the webview stayed composited under the barrier
+
+---
+
+### Requirement: PAUSE-025 — Repaint When The First Document Commits
+
+On Android, the system SHALL repaint the surface when a webview's **first** document commits, not only when a reload's does. PAUSE-021 established that a repaint fired at issue time drains against a surface the new document has not reached yet; the identical ordering applies to a webview that has never painted at all. A freshly created webview attaches a brand-new `SurfaceView` showing its white default fill, both the activation nudge (PAUSE-015) and the controller-attach nudge (PAUSE-017) run and drain within ~0.6s, and the initial load commits an unbounded time later — so on a slow first load nothing repaints after the commit. This is BUG-001 open gap #7, reported 2026-08-13: cold start to the site picker, tap a not-yet-loaded site, white screen.
+
+The commit latch SHALL therefore be armed by more than a reload. `SurfaceRepaintEngine.noteCommitPending` (which `reloadIssued` now delegates to) SHALL be called when a fresh controller attaches for the visible site, and when a site is activated while its main-frame load is still in flight; `consumeLoadSettled` then repaints once the document settles, exactly as it does for a reload. The latch stays one-shot, so an ordinary in-page navigation still does not nudge. The settled nudge SHALL emit the non-sensitive `SurfaceDiag` line `trigger=commit-settled -> nudge` (which subsumes the PAUSE-021 `reload-settled` line), and the attach SHALL emit `trigger=controller-attach -> nudge` — the path was previously diagnostically dark, because `_probeRendererAndRecover` early-returns without logging when a fresh model has no controller yet.
+
+This narrows, but does not close, BUG-001 gap #3: `onLoadingChanged(false)` remains a *proxy* for the commit (it maps to `onLoadStop`, i.e. document parse rather than the compositor's first frame), so a page that paints materially later than load-stop can still outrun it. The durable fix remains a native surface-changed callback.
+
+#### Scenario: First activation of a site whose page commits slowly
+
+**Given** a site that has never been loaded is activated on Android
+**And** its first document takes longer to commit than the nudge's tick budget
+**When** the controller attaches, the nudges drain, and the document finally commits
+**Then** the attach-armed latch is consumed by the settled load and `_nudgeSurfaceRepaint` runs against the committed document
+**And** the page paints instead of staying blank-white
+
+#### Scenario: Activating a site mid-load
+
+**Given** a site is loading in the background and the user switches to it
+**When** `_setCurrentIndex` nudges and its load settles afterwards
+**Then** the activation armed the latch, so the settled commit repaints
+
+#### Scenario: A background site's fresh controller does not repaint the visible one
+
+**Given** a webview is created off-screen while another site is visible
+**When** its controller attaches and its first load settles
+**Then** neither the latch nor the nudge fires, because both host hooks are gated on the model being the visible site
+
+---
+
+### Requirement: PAUSE-026 — The Nested Screen Mirrors The Repaint Lifecycle
+
+`InAppWebViewScreen` SHALL carry the same Android repaint coverage as the main page, because it owns a separate hybrid-composition `SurfaceView` that the main page's nudge cannot reach: that nudge toggles a 1px inset around the `IndexedStack`, which sits *under* the nested route. Whenever the nested screen is the visible webview, a repaint that only runs on the main page is a no-op the user sees as a white screen.
+
+Beyond the back path (PAUSE-018) and the reload funnel (PAUSE-021), which the nested screen already had, it SHALL:
+
+1. Nudge on **controller attach** and arm the commit latch (PAUSE-017 + PAUSE-025). Every mount of this screen is a fresh `SurfaceView` loading a remote entry URL, so it is the most exposed instance of both.
+2. On `AppLifecycleState.resumed`, open a bounded post-resume repaint window and nudge (PAUSE-020), and re-nudge from `didChangeMetrics` while that window is open — the warm-start attach signal. The window timer is cancelled in `dispose`.
+3. Be `RouteAware` and nudge on `didPopNext` (PAUSE-024), for routes pushed over it (developer tools, per-site settings, a further nested webview).
+
+Its webview slot SHALL carry `ValueKey(kNestedWebViewSlotKey)` so the pixel suite can sample the composited window over exactly that rect, the nested counterpart of the main page's `ValueKey(siteId)` slot.
+
+#### Scenario: Warm start with the nested screen on top
+
+**Given** the nested webview screen is the visible webview on Android
+**When** the user backgrounds the app and returns, and the nested `SurfaceView` re-attaches after the resume event
+**Then** the nested screen's own resume nudge and its `didChangeMetrics` re-nudge repaint it
+**And** it does not depend on the main page's nudge, which cannot reach a platform view under this route
+
+#### Scenario: A fresh nested webview on a slow page
+
+**Given** a cross-domain link opens the nested screen on Android
+**When** the entry document commits after the attach nudge has drained
+**Then** the latch armed at controller attach is consumed by the settled load and the surface repaints
+
+---
+
+### Requirement: PAUSE-027 — Geometry-Free Native Surface Repaint (Attempt 11)
 
 On Android, the system SHALL repaint a live blank platform-view surface without changing Flutter widget geometry. The WebSpace `WebViewController.requestRepaint()` wrapper SHALL call the fork's `InAppWebViewController.requestRepaint()`, whose native operation requests layout and posts an animation invalidation without changing the WebView dimensions. Off Android the wrapper and the repaint funnel are no-ops.
 
@@ -731,10 +819,11 @@ This removes the horizontal and vertical wobble caused by the former 1 px paddin
 
 ---
 
-### Requirement: PAUSE-028 — Native Repaint At Android WebView Lifecycle Chokepoints (Attempt 11)
+### Requirement: PAUSE-028 — Native Repaint At Android WebView Lifecycle Chokepoints (Attempt 12)
 
-On Android, the pinned `flutter_inappwebview_android` fork at immutable commit
-`1a8ed58fddea13cb5f2799b4bf64c120917fc5c1` SHALL invoke the existing,
+On Android, the system SHALL use the pinned `flutter_inappwebview_android`
+fork at immutable commit
+`1a8ed58fddea13cb5f2799b4bf64c120917fc5c1` to invoke the existing,
 geometry-free native `requestRepaint()` operation at the platform-view lifecycle
 chokepoints: `onAttachedToWindow()` SHALL call `super.onAttachedToWindow()` first
 and then `requestRepaint()`; `onWindowVisibilityChanged(visibility)` SHALL
@@ -900,7 +989,7 @@ This narrows PAUSE-001 and PAUSE-002 on Android only: the call sites and call or
 
 ### Requirement: PAUSE-005 — Site-Switch Pause Survives Race-Cancellation
 
-The site-switch pause SHALL respect the `_setCurrentIndexVersion` race guard so a rapid switch sequence does not invert pause/resume ordering.
+The site-switch pause SHALL respect the `_setCurrentIndexVersion` race guard so a rapid switch sequence does not invert pause/resume ordering. The guard is threaded into `SiteTeardownEngine.quiesceOutgoing` (NAV-010 in [navigation](../navigation/spec.md)), which re-checks it before every remaining step — including after its budget expired, so a step abandoned mid-flight cannot pause a site the newer switch has since resumed.
 
 #### Scenario: User taps two sites in quick succession
 
@@ -1061,9 +1150,9 @@ class _WebViewController implements WebViewController {
 
 - `lib/services/webview.dart` — split the `WebViewController` interface; `_WebViewController.pause()` no longer calls `pauseTimers()`.
 - `lib/services/surface_repaint_engine.dart` — six-tick native repaint model
-  without inset state (Attempt 10).
+  without inset state (Attempt 11).
 - `lib/main.dart` and `lib/screens/inappbrowser.dart` — native repaint pulses
-  with unchanged WebView geometry (Attempt 10).
+  with unchanged WebView geometry (Attempt 11).
 - `pubspec.yaml` / `pubspec.lock` — pin the existing flutter_inappwebview
   overrides to the starship-s geometry-free repaint fork commit.
 - `lib/web_view_model.dart` — added `pauseForAppLifecycle()` / `resumeFromAppLifecycle()`; updated docs on `pauseWebView()` / `resumeWebView()`.
@@ -1078,6 +1167,7 @@ class _WebViewController implements WebViewController {
 
 ## Related Specs
 
+- [`background-audio`](../background-audio/spec.md) — per-site exemption from PAUSE-001/PAUSE-002 so audio keeps playing on site switch and app background.
 - [`per-site-cookie-isolation`](../per-site-cookie-isolation/spec.md) — relies on `disposeWebView()` (not pause) to safely mutate the cookie jar across domain conflicts. The "pause is not a security boundary" caveat above is why.
 - [`lazy-webview-loading`](../lazy-webview-loading/spec.md) — defines `_loadedIndices`, the set across which the app-lifecycle global pause takes effect.
 - [`navigation`](../navigation/spec.md) — defines the `_setCurrentIndexVersion` race guard referenced by PAUSE-005.

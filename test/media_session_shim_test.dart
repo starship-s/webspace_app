@@ -1,0 +1,61 @@
+import 'package:flutter_test/flutter_test.dart';
+import 'package:webspace/services/media_session_shim.dart';
+
+/// BGAUDIO-006: cheap structural guard on the media-session bridge shim. The
+/// string is what webview.dart injects at DOCUMENT_START on background-audio
+/// sites; these asserts pin the page->Dart handler name and the Dart->page
+/// control entry point so a rename can't silently break the notification.
+void main() {
+  final shim = buildMediaSessionShim();
+
+  test('reports playback state to the wsMediaSession handler', () {
+    expect(shim, contains("callHandler('wsMediaSession'"));
+    // The payload the Dart handler destructures.
+    for (final key in [
+      'frame',
+      'playing',
+      'title',
+      'artist',
+      'album',
+      'artwork'
+    ]) {
+      expect(shim, contains(key), reason: 'payload key "$key" missing');
+    }
+  });
+
+  test('mints a per-frame token and silences media-less frames', () {
+    // BGAUDIO-008: injected with forMainFrameOnly:false, so every ad /
+    // analytics iframe of the site runs a copy against the same handler.
+    expect(shim, contains('frameId'));
+    expect(shim, contains('everHadMedia'));
+    expect(shim, contains('if (!everHadMedia) return;'));
+  });
+
+  test('exposes the Dart->page transport entry point', () {
+    expect(shim, contains('window.__wsMediaControl'));
+    // BGAUDIO-012: the app-background signal and the visibility mask it drives.
+    expect(shim, contains('window.__wsMediaBackground'));
+    expect(shim, contains('visibilitychange'));
+    expect(shim, contains('stopImmediatePropagation'));
+    expect(shim, contains(".play()"));
+    expect(shim, contains(".pause()"));
+  });
+
+  test('watches dynamically added media elements', () {
+    expect(shim, contains('MutationObserver'));
+    expect(shim, contains('HTMLMediaElement.prototype.play'));
+    expect(shim, contains("querySelectorAll('audio,video')"));
+  });
+
+  test('is idempotent (guards against double injection across frames)', () {
+    expect(shim, contains('__wsMediaShim'));
+  });
+
+  test('tracks elements that play without entering the DOM', () {
+    // `new Audio(src).play()` never lands in the document, so a scan built
+    // only on querySelectorAll misses it entirely. Behaviour is proven in
+    // test/browser/media_session_real_engine.test.js; this pins the structure.
+    expect(shim, contains('detached'));
+    expect(shim, contains('isConnected'));
+  });
+}

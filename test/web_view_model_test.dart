@@ -3,6 +3,7 @@ import 'package:webspace/web_view_model.dart';
 import 'package:webspace/services/domain_claim.dart';
 import 'package:webspace/services/tab_bar_corner.dart';
 import 'package:webspace/services/webview.dart';
+import 'package:webspace/settings/camera.dart';
 import 'package:webspace/settings/proxy.dart';
 
 void main() {
@@ -170,6 +171,53 @@ void main() {
       final json = m.toJson();
       expect(json['externalLinksInBrowser'], isTrue);
       expect(WebViewModel.fromJson(json, null).externalLinksInBrowser, isTrue);
+    });
+
+    test('backgroundAudioEnabled defaults off; toJson omits the default '
+        '(BGAUDIO-001)', () {
+      final m = WebViewModel(initUrl: 'https://example.org/');
+      expect(m.backgroundAudioEnabled, isFalse);
+      expect(m.toJson().containsKey('backgroundAudioEnabled'), isFalse,
+          reason: 'omitting the default keeps on-disk JSON byte-stable');
+      final back = WebViewModel.fromJson(m.toJson(), null);
+      expect(back.backgroundAudioEnabled, isFalse);
+    });
+
+    test('backgroundAudioEnabled=true survives the settings-save round-trip '
+        '(BGAUDIO-001)', () {
+      // Mirrors what SettingsScreen._saveSettings does: flip the field on the
+      // model, persist via toJson, rehydrate. If this regressed, a user who
+      // enabled the toggle would still see App-lifecycle pause the site
+      // (jsPause=true) after a restart.
+      final m = WebViewModel(initUrl: 'https://example.org/');
+      m.backgroundAudioEnabled = true;
+      final json = m.toJson();
+      expect(json['backgroundAudioEnabled'], isTrue);
+      final back = WebViewModel.fromJson(json, null);
+      expect(back.backgroundAudioEnabled, isTrue);
+      expect(back.effectiveBackgroundAudioEnabled, isTrue,
+          reason: 'the lifecycle engine reads effectiveBackgroundAudioEnabled');
+    });
+
+    test('backgroundAudioEnabled absent in legacy JSON defaults off', () {
+      final legacy = WebViewModel(initUrl: 'https://example.org/').toJson()
+        ..remove('backgroundAudioEnabled');
+      expect(legacy.containsKey('backgroundAudioEnabled'), isFalse);
+      expect(
+          WebViewModel.fromJson(legacy, null).backgroundAudioEnabled, isFalse);
+    });
+
+    test('backgroundAudioEnabled forced off for archive-tier sites '
+        '(ARCH-006)', () {
+      final m = WebViewModel(
+        initUrl: 'https://example.org/',
+        backgroundAudioEnabled: true,
+        isArchiveTier: true,
+      );
+      expect(m.backgroundAudioEnabled, isTrue,
+          reason: 'the stored value is preserved');
+      expect(m.effectiveBackgroundAudioEnabled, isFalse,
+          reason: 'archive-tier sites never opt out of lifecycle pausing');
     });
 
     test('kioskMode defaults off (KIOSK-004)', () {
@@ -394,6 +442,25 @@ void main() {
 
       final restored = WebViewModel.fromJson(json, null);
       expect(restored.trackingProtectionEnabled, isFalse);
+    });
+
+    test('tracking protection forces third-party cookies off (ETP-024)', () {
+      final model = WebViewModel(
+        initUrl: 'https://example.com',
+        thirdPartyCookiesEnabled: true,
+        trackingProtectionEnabled: false,
+      );
+      expect(model.effectiveThirdPartyCookiesEnabled, isTrue);
+
+      model.trackingProtectionEnabled = true;
+      expect(model.effectiveThirdPartyCookiesEnabled, isFalse);
+      // Stored, not erased: the user's own choice comes back when the
+      // umbrella goes off again, and survives a backup round-trip.
+      expect(model.thirdPartyCookiesEnabled, isTrue);
+      expect(model.toJson()['thirdPartyCookiesEnabled'], isTrue);
+
+      model.trackingProtectionEnabled = false;
+      expect(model.effectiveThirdPartyCookiesEnabled, isTrue);
     });
 
     test('letterboxEnabled defaults to false; omitted from JSON; round-trips',
@@ -630,6 +697,99 @@ void main() {
         // Turning the umbrella off restores the stored decision.
         model.trackingProtectionEnabled = false;
         expect(model.effectiveProtectedContentAllowed, equals(stored));
+      }
+    });
+
+    test('cameraMode defaults to ask and toJson omits it', () {
+      final model = WebViewModel(initUrl: 'https://example.com');
+      expect(model.cameraMode, CameraAccessMode.ask);
+      expect(model.toJson().containsKey('cameraMode'), isFalse);
+      expect(model.toJson().containsKey('virtualCameraSource'), isFalse);
+
+      final restored = WebViewModel.fromJson(model.toJson(), null);
+      expect(restored.cameraMode, CameraAccessMode.ask);
+    });
+
+    test('cameraMode round-trips through JSON', () {
+      for (final mode in CameraAccessMode.values) {
+        final model = WebViewModel(
+          initUrl: 'https://example.com',
+          cameraMode: mode,
+        );
+        final json = model.toJson();
+        expect(json.containsKey('cameraMode'), mode != CameraAccessMode.ask);
+        final restored = WebViewModel.fromJson(json, null);
+        expect(restored.cameraMode, mode);
+      }
+    });
+
+    test('virtualCameraSource round-trips through JSON', () {
+      final model = WebViewModel(
+        initUrl: 'https://example.com',
+        cameraMode: CameraAccessMode.virtual,
+        virtualCameraSource: const VirtualCameraSource(
+          kind: 'image',
+          dataUrl: 'data:image/png;base64,AAAA',
+          fileName: 'qr.png',
+        ),
+      );
+      final restored = WebViewModel.fromJson(model.toJson(), null);
+      expect(restored.cameraMode, CameraAccessMode.virtual);
+      expect(restored.virtualCameraSource?.kind, 'image');
+      expect(restored.virtualCameraSource?.dataUrl,
+          'data:image/png;base64,AAAA');
+      expect(restored.virtualCameraSource?.fileName, 'qr.png');
+    });
+
+    test('legacy bool cameraAllowed migrates to a mode', () {
+      // true -> real, false -> block, absent -> ask. Start from a real
+      // model's JSON so every other required field is present, then splice
+      // in the legacy boolean the way an older build would have written it.
+      Map<String, dynamic> legacyJson(bool? legacy) {
+        final json = WebViewModel(initUrl: 'https://e.com').toJson();
+        json.remove('cameraMode');
+        json.remove('virtualCameraSource');
+        if (legacy != null) json['cameraAllowed'] = legacy;
+        return json;
+      }
+
+      expect(WebViewModel.fromJson(legacyJson(true), null).cameraMode,
+          CameraAccessMode.real);
+      expect(WebViewModel.fromJson(legacyJson(false), null).cameraMode,
+          CameraAccessMode.block);
+      expect(WebViewModel.fromJson(legacyJson(null), null).cameraMode,
+          CameraAccessMode.ask);
+    });
+
+    test('effectiveCameraMode forces block for archive-tier (CAM-006)', () {
+      final allowed = WebViewModel(
+        initUrl: 'https://example.com',
+        cameraMode: CameraAccessMode.real,
+        isArchiveTier: true,
+      );
+      // Stored value is preserved, but the effective value never grants
+      // the camera for archive sites.
+      expect(allowed.cameraMode, CameraAccessMode.real);
+      expect(allowed.effectiveCameraMode, CameraAccessMode.block);
+
+      final appTier = WebViewModel(
+        initUrl: 'https://example.com',
+        cameraMode: CameraAccessMode.virtual,
+      );
+      expect(appTier.effectiveCameraMode, CameraAccessMode.virtual);
+    });
+
+    test('effectiveCameraMode is not forced by Tracking Protection', () {
+      // Unlike protected content (ETP-023), camera capture starts only
+      // after an explicit per-site Allow / picked file, so the umbrella
+      // leaves the stored mode in effect.
+      for (final mode in CameraAccessMode.values) {
+        final model = WebViewModel(
+          initUrl: 'https://example.com',
+          cameraMode: mode,
+          trackingProtectionEnabled: true,
+        );
+        expect(model.effectiveCameraMode, mode);
       }
     });
 

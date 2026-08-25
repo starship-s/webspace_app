@@ -15,9 +15,17 @@ const path = require('node:path');
 const repoRoot = path.resolve(__dirname, '..', '..');
 
 const migrated = new Set([
+  // Platform-split favicon rendering: no user-facing strings at all.
+  'lib/screens/favicon_image.dart',
+  'lib/screens/favicon_image_io.dart',
+  'lib/screens/favicon_image_web.dart',
+  'lib/screens/site_permissions.dart',
+  'lib/screens/site_privacy.dart',
+  'lib/widgets/site_permission_chip.dart',
   'lib/main.dart',
   'lib/screens/add_site.dart',
   'lib/screens/app_settings.dart',
+  'lib/screens/block_stats.dart',
   'lib/screens/dev_tools.dart',
   'lib/screens/inappbrowser.dart',
   'lib/screens/link_handling_settings.dart',
@@ -32,12 +40,15 @@ const migrated = new Set([
   'lib/widgets/download_button.dart',
   'lib/widgets/external_url_prompt.dart',
   'lib/widgets/find_toolbar.dart',
+  'lib/widgets/firefox_version_tile.dart',
   'lib/widgets/hint_button.dart',
   'lib/widgets/root_messenger.dart',
+  'lib/widgets/site_permission_badges.dart',
   'lib/widgets/stats_banner.dart',
   'lib/widgets/tab_bar_corner_button.dart',
   'lib/widgets/untrusted_cert_prompt.dart',
   'lib/widgets/url_bar.dart',
+  'lib/widgets/virtual_camera_preview.dart',
 ]);
 
 // Known not-yet-migrated. Shrinks as files move to `migrated`; goal is empty.

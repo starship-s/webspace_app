@@ -80,6 +80,26 @@ Android flavors: `fdroid` (CI), `fmain` (Play), `fdebug`.
 
 Dart in `test/`, integration in `integration_test/` (screenshots).
 
+## Design (`tool/design_gallery/`)
+
+`web/` exists only so a designer can drive the real UI in a browser and so it
+can be screenshotted for review; the app is not shipped for web and the WebView
+does not run there. Two targets, both via `scripts/design_web.sh`:
+`app` ([lib/design_app/main.dart](lib/design_app/main.dart), the real
+`WebSpaceApp` on demo data) into `build/web`, and `gallery`
+([lib/design_gallery/main.dart](lib/design_gallery/main.dart), one card per
+widget) into `build/design_gallery`. `npm run design:serve` serves either.
+The Claude Design project cannot build Flutter, so it asks for a rebuild
+through the dated `_requests/refresh.md` mailbox (design-side state, gitignored
+here). Design artifacts that come out of that pipeline live in `assets/design/`
+under the `assets/` artwork licence, which names the designer; artwork by
+anyone else is case by case and gets its own licence file. Full workflow and constraints
+(canvas output, local fonts, web-clean check, refresh protocol):
+[tool/design_gallery/CLAUDE.md](tool/design_gallery/CLAUDE.md). Spec:
+[openspec/specs/design-gallery/spec.md](openspec/specs/design-gallery/spec.md);
+DESIGN-001 (every UI file compiles for web) is enforced by `npm run design:check`
+in CI's `validate` job, and the two web builds by the `design-web` job.
+
 ## Recurring bugs (`docs/bugs/`)
 
 A **recurring bug** is one whose symptom was fixed before and resurfaced through a
@@ -137,7 +157,7 @@ missing-transition classes, and cross-spec interference — bugs in the gaps *be
 
 ## OpenSpec features
 
-Specs live under `openspec/specs/<slug>/spec.md` (Given/When/Then). **Read the relevant spec before modifying a feature.** Slugs:
+Specs live under `openspec/specs/<slug>/spec.md` (Given/When/Then). **Read the relevant spec before modifying a feature.** A slug marked *(change)* is implemented but not archived yet, so its requirements are still at `openspec/changes/<slug>/specs/<slug>/spec.md`. Slugs:
 
 | Slug | One-liner (when not obvious) |
 |------|------|
@@ -146,6 +166,7 @@ Specs live under `openspec/specs/<slug>/spec.md` (Given/When/Then). **Read the r
 | configurable-suggested-sites | empty default for fdroid |
 | content-blocker | ABP filter lists via adblock-rust (network, cosmetic, procedural, $redirect/$csp/$removeparam) |
 | cookie-secure-storage | encrypted cookie persistence |
+| design-gallery | designer works in Dart on web; web-clean, token-validity, render-matrix and card gates |
 | desktop-mode | per-site UA → JS shim (userAgentData, maxTouchPoints, viewport rewrite) |
 | developer-tools | JS console, cookie inspector, HTML export, app logs |
 | dns-blocklist | Hagezi list, severity levels, per-site toggle |
@@ -166,6 +187,7 @@ Specs live under `openspec/specs/<slug>/spec.md` (Given/When/Then). **Read the r
 | localcdn | cache CDN resources locally (Android) |
 | navigation | back gesture, drawer swipe, refresh, race guards |
 | nested-url-blocking | nested InAppBrowser, gesture auto-redirect block |
+| page-zoom | per-site zoom; viewport meta on mobile (Android pins the layout width), CSS `zoom` on desktop |
 | per-site-cookie-isolation | legacy engine (fallback) |
 | per-site-containers | native containers (preferred when supported) |
 | per-site-location | geo + IANA tz override + WebRTC lockdown |
@@ -174,12 +196,18 @@ Specs live under `openspec/specs/<slug>/spec.md` (Given/When/Then). **Read the r
 | proxy-password-secure-storage | secrets in flutter_secure_storage; never in JSON |
 | screenshots | integration-test driven |
 | settings-backup | JSON import/export |
+| settings-hints *(change)* | where a settings row's text goes: state in the subtitle, explanation behind the hint button; fixed-string subtitles capped across all locales |
 | site-editing | URL + custom name |
+| site-permission-badges | drawer badges for location/camera/mic/background-audio grants; real device access vs simulated |
 | tracking-protection | umbrella per-site ETP: forces ClearURLs/DNS/content blocker/LocalCDN + injects anti-fingerprinting shim (Canvas/WebGL/audio/fonts/screen/hardware/timing/clientrects) seeded by siteId |
 | user-agent-identity | engine-consistent navigator identity for the per-site UA (vendor/productSub/oscpu/buildID/platform/userAgentData); complements desktop-mode |
 | user-scripts | per-site JS injection w/ timing control |
-| web-push-notifications | per-site `notificationsEnabled` toggle: JS Notification polyfill → flutter_local_notifications, auto-loads + skips per-instance pause for notif sites, iOS `beginBackgroundTask` grace + `BGAppRefreshTask` reload, Android mirrors via `WorkManager` periodic refresh (no foreground service) |
+| web-camera-access | per-site camera for camera-only getUserMedia (banking QR flows); `cameraMode` ask/real/virtual/block. Virtual serves a user-picked image/looped video via a canvas `captureStream` shim (no real camera, no OS prompt); real grant ensures Android CAMERA perm |
+| web-microphone-access | per-site audio capture with **no real-mic mode**; `microphoneMode` ask/virtual/block. Virtual loops a user-picked clip through WebAudio into a `MediaStreamAudioDestinationNode`. No OS recording permission on any platform (native layer DENYs MICROPHONE outright); audio+video requests are split, video re-issued to the camera shim |
+| web-push-notifications *(change)* | per-site `notificationsEnabled` toggle: JS Notification polyfill → flutter_local_notifications, auto-loads + skips per-instance pause for notif sites, iOS `beginBackgroundTask` grace + `BGAppRefreshTask` reload, Android mirrors via `WorkManager` periodic refresh (no foreground service) |
 | archive | passphrase-gated archived webspaces in a fixed slot pool; active state stays byte-identical when no archive is open |
+| background-audio | per-site toggle: skips per-instance pause + app-background global JS pause (any-loaded veto), iOS `.playback` AVAudioSession + `audio` background mode; Android `mediaPlayback` foreground service + MediaStyle notification (BGAUDIO-006) driven by a page-JS media-session bridge; CI-tested via lifecycle injection + beaconing HTML fixture, plus a 3-tier notification gate (BGAUDIO-007: real-Chromium shim, channel contract, emulator assert on `getActiveNotifications()`) |
+| block-statistics | persistent app-wide protection report: per-category daily buckets, 7/30-day ranges, all-time total; archive-tier sites excluded |
 | webspaces | named site collections |
 | webview-hints | color-scheme, matchMedia, theme prelude cache |
 | webview-pause-lifecycle | per-instance vs process-global pause; "paused != frozen" |
@@ -198,7 +226,7 @@ New shim: register in `buildAllFixtures()` in [tool/dump_shim_js.dart](tool/dump
 
 **Shims that also run in workers** (anything in `workerScopeShims` in [webview.dart](lib/services/webview.dart) — see [worker-shim-propagation](openspec/specs/worker-shim-propagation/spec.md)) must be scope-agnostic: `globalThis` never `window`, navigator prototype via `Object.getPrototypeOf(navigator)` never `Navigator.prototype`, window-only sections (`Screen`, `document`, `matchMedia`, `RTCPeerConnection`, `plugins`/`getBattery`) guarded, and never *add* a property a real `WorkerNavigator` lacks. The payload is one script of concatenated IIFEs, so an uncaught `ReferenceError` in one silences every shim after it; `test/worker_shim_test.dart` gates this structurally.
 
-jsdom has no canvas/WebGL/audio fingerprinting. Tests assert override **shape**, not engine behavior. Real-engine proofing (CreepJS, fingerprintjs) wants a Playwright tier — not built.
+jsdom has no canvas/WebGL/audio fingerprinting. Tests assert override **shape**, not engine behavior. Effects that need a real engine (canvas `captureStream`, Intl timezone math, real CSP, RTCPeerConnection semantics) go in the **browser tier** under `test/browser/` (Puppeteer + headless Chromium, `npm run test:browser`, run in CI's `validate` job). Use the `setupBrowser`/`requireBrowser`/`readFixture` helpers in [test/browser/helpers/launch.js](test/browser/helpers/launch.js) — the tier hard-fails when `CI=true` and no Chromium is found, and skips locally. Example: `camera_stream_real_engine.test.js` serves a page from `127.0.0.1` (getUserMedia needs a secure context), feeds the dumped camera shim a QR image, and asserts jsQR decodes it off the synthetic stream.
 
 ## Fastlane changelogs
 
@@ -214,6 +242,34 @@ User-facing global pref persisted to SharedPreferences MUST round-trip through t
 - Don't register: migration flags, download timestamps, cache indices, machine state from downloaded data (DNS blocklist, content blocker, localcdn).
 - Per-site settings ride `WebViewModel.toJson` automatically — keep them on the model.
 - Touched export/import? Re-run `flutter test test/settings_backup_test.dart`.
+
+## Settings rows: state in the subtitle, explanation in the hint
+
+Spec: [openspec/changes/settings-hints/specs/settings-hints/spec.md](openspec/changes/settings-hints/specs/settings-hints/spec.md).
+A settings row has three places text can go and they are not interchangeable.
+
+- **Title** — what the setting is.
+- **Subtitle** — what it is set to, or a status that moves: a value, a count,
+  `Not configured`, `System`, `Forced off by Tracking Protection`. Often absent.
+- **`HintButton`** ([lib/widgets/hint_button.dart](lib/widgets/hint_button.dart)) —
+  what it does, what it costs, when to want it. Sits next to the title, opens a
+  dialog, and costs one icon of layout however long the text is.
+
+Explanation goes in the hint, never the subtitle. A sentence that is one tidy
+line of English is four wrapped lines of Malay under a switch, and nothing
+overflows, so no render test sees it — the list just goes ragged.
+
+- A fixed-string `subtitle:` (one uninvoked `loc.<key>`, no branch) MUST stay
+  under 90 chars **in every locale**, checked by
+  [test/js/settings_hint_placement.test.js](test/js/settings_hint_placement.test.js).
+  Over budget, move it into the hint — do not shorten the translation.
+- State-derived subtitles (`cond ? loc.a : loc.b`, `loc.count(n)`) are exempt.
+- Moving a description into a hint **renames** its ARB key
+  (`<setting>Subtitle` → `<setting>Hint`) across all `lib/l10n/app_*.arb`,
+  keeping every translation. Delete it instead only when an existing hint on
+  the same row already says it.
+- The `HintButton`'s `title` is the row's own title, and the label beside it is
+  `Flexible` (gated by `test/js/settings_title_row_overflow.test.js`).
 
 ## Adding user-facing strings (localization)
 

@@ -29,15 +29,21 @@ fastlane-driven Android/iOS screenshot pipeline (see
 [`screenshots`](../screenshots/spec.md) — `build-android`'s
 `reactivecircus/android-emulator-runner` and `build-apple`'s
 `simctl boot`). The Android-emulator scenarios are wired in:
-`white_screen_test.dart` (INTEG-010) runs inside the `build-android`
-job on every push/PR, on the same AVD profile and snapshot cache the
-screenshots lane uses (the emulator prerequisite steps are ungated;
-only the screenshot generation itself stays `workflow_dispatch`),
-followed in the same emulator step by the adb-driven lifecycle tier
-(INTEG-011), which drives warm start, bfcache back navigation, and
-activity recreation from outside the app process. INTEG-010 is
-Android-only (window-level `PixelCopy`), so both desktop loops skip
-it by basename exactly as they skip `screenshot_test.dart`; the
+`white_screen_test.dart` (INTEG-010), `shortcut_behavior_test.dart`
+(INTEG-013) and `page_zoom_test.dart` (ZOOM-006 — the wide-viewport quirk
+behind BUG-008 exists in no other engine, and the same file also runs on
+both desktop loops) run inside the `build-android` job on every push/PR, on the
+same AVD profile and snapshot cache the screenshots lane uses (the
+emulator prerequisite steps are ungated; only the screenshot generation
+itself stays `workflow_dispatch`), followed in the same emulator step by
+the adb-driven lifecycle tier (INTEG-011), which drives warm start,
+bfcache back navigation, activity recreation, and the warm
+home-shortcut taps from outside the app process. The white-screen and
+shortcut suites are Android-only (window-level `PixelCopy`;
+`Platform.isAndroid`-gated shortcut paths), so both desktop loops skip
+them by basename exactly as they skip `screenshot_test.dart`; the
+page-zoom suite is the exception that stays in the desktop loops, because
+its whole point is that three engines must agree; the
 lifecycle tier is a shell harness, not an `integration_test` target,
 so the desktop loops never see it. A broader mobile tier (iOS
 Simulator) remains future scope and would extend the same boot setup
@@ -467,11 +473,45 @@ came from the webview.
 The suite SHALL cover at least: fresh first activation (BUG-001 gap
 #7), loaded-site switch (`_setCurrentIndex` reuse), the reload funnel
 (`PAUSE-021`), memory pressure against the visible site
-(`PAUSE-019`), and fresh activation with other sites live
-(`PAUSE-017`). Warm start, activity recreation, and bfcache back
-navigation need real activity lifecycle transitions an in-process
-test cannot produce; those belong to the adb-driven lifecycle tier
-(INTEG-011).
+(`PAUSE-019`), fresh activation with other sites live
+(`PAUSE-017`), the return from a pushed opaque route (`PAUSE-024`),
+and the nested `InAppWebViewScreen` — both its own fresh surface and
+the return to the main page behind it (`PAUSE-026`). Warm start,
+activity recreation, and bfcache back navigation need real activity
+lifecycle transitions an in-process test cannot produce; those belong
+to the adb-driven lifecycle tier (INTEG-011).
+
+At least one scenario per commit-side repaint (`PAUSE-021`,
+`PAUSE-025`) SHALL be driven by a page that **withholds its first byte
+longer than the nudge's tick budget** (~0.6s). A page that commits
+instantly is repainted by the issue-time nudge whether or not the
+settled-side re-nudge exists, so an all-instant suite cannot fail on
+the ordering defect that every BUG-001 recurrence since Attempt 8 has
+actually been — it asserts only that the app renders at all. The
+delay SHALL come from the in-process server holding the response, not
+from a slow network, so the scenario stays deterministic.
+
+The nested-screen scenario SHALL reach the nested route through a
+**script-initiated cross-domain navigation** from a seeded site with
+`blockAutoRedirects` off, and the cross-domain target SHALL be the
+same in-process server reached under a second loopback address
+(`127.0.0.2` alongside `127.0.0.1`, hence a server bound to
+`anyIPv4`). Two hosts on one server keep the navigation genuinely
+cross-domain — `getBaseDomain` compares IP literals — while keeping a
+network failure impossible, and a scripted navigation keeps the
+scenario off any synthetic touch reaching the platform view.
+
+#### Scenario: A late-committing document is repainted promptly
+
+- **Given** a seeded site whose page withholds its first byte for
+  longer than the repaint nudge's tick budget
+- **When** the suite activates it, so the surface attaches and every
+  issue-time nudge drains before the document commits
+- **Then** the composited webview region shows the page's color within
+  a bounded settle window, which only the settled-side re-nudge
+  (`PAUSE-025`) can produce
+- **And** the deadline is tight on purpose: a blank that clears much
+  later, on some unrelated relayout, is still the bug
 
 #### Scenario: White control page proves the detector is not vacuous
 
@@ -496,7 +536,7 @@ test cannot produce; those belong to the adb-driven lifecycle tier
 - **Given** the `build-android` job has built the APKs and its
   emulator prerequisites (KVM, Android SDK, API 34 google_apis x86_64
   `pixel_5` AVD snapshot cache) are ungated
-- **When** the `Run white-screen pixel scenarios` step runs
+- **When** the `Run emulator integration scenarios` step runs
   `fvm flutter test integration_test/white_screen_test.dart -d <device> --flavor fdebug`
   inside the booted emulator with a 25-minute wall-clock cap
 - **Then** the suite executes on every push to master, every PR, and
@@ -587,9 +627,10 @@ sample (observed as exact per-channel halving of the page colors).
 
 #### Scenario: Runs in build-android after the in-process suite
 
-- **Given** the `Run white-screen pixel scenarios` emulator step ran
-  `run_android_integration_tests.sh`, whose `flutter test` installs an
-  APK with the *test* Dart entrypoint
+- **Given** the `Run emulator integration scenarios` emulator step ran
+  the in-process wrapper scripts (`run_android_integration_tests.sh`,
+  `run_android_shortcut_tests.sh`, `run_android_background_audio_tests.sh`),
+  whose `flutter test` installs an APK with the *test* Dart entrypoint
 - **When** `run_android_lifecycle_tests.sh` runs next in the same step,
   rebuilds the default-entrypoint fdebug debug APK, reinstalls it, and
   clears package data for a pristine cold start
@@ -626,7 +667,9 @@ sample (observed as exact per-channel halving of the page colors).
 ### Requirement: INTEG-012 — Background refresh drives an observable notification
 
 The lifecycle harness SHALL verify the Android background-refresh
-contract (`NOTIF-005-A`, [web-push-notifications](../web-push-notifications/spec.md))
+contract (`NOTIF-005-A`,
+[web-push-notifications](../../changes/web-push-notifications/specs/web-push-notifications/spec.md)
+— still an unarchived change, so its requirements live under `openspec/changes/`)
 end to end from outside the process: a site seeded with
 `notificationsEnabled` whose page posts a JS `Notification` on every
 load, the app backgrounded, and the WorkManager periodic job
@@ -708,6 +751,214 @@ tier for the non-background scenarios remains future scope.
 
 ---
 
+### Requirement: INTEG-013 — Home-shortcut behavior scenarios
+
+`integration_test/shortcut_behavior_test.dart` SHALL drive the Android
+home-shortcut flows of [home-shortcut](../home-shortcut/spec.md)
+through the real widget tree on an Android emulator/device, covering
+the *wiring* in `lib/main.dart` that the engine unit tests in
+`test/startup_restore_engine_test.dart` cannot reach: which prompt a
+`LaunchResolution` raises, what the user's answer persists, whether the
+"Home Shortcut" menu item is offered, and what deleting a site does to
+the launcher tiles that still reach it. The suite SHALL cover at least
+HS-002/HS-006 (cold launch), HS-004/HS-005 (menu gating, including the
+rebound-site case), HS-001/HS-012 (pin + ledger record), HS-011
+(orphan confirm / reroute / create, and the remembered rebind), and
+HS-013 (delete-time Keep/Reassign/Disable prompt).
+
+The platform channel SHALL be mocked, because a launcher pin dialog and
+a real pinned set are not reachable from in-process; the mock SHALL
+drain `getLaunchSiteId` on read, mirroring MainActivity's
+`intent.removeExtra`, so a resume-cadence re-poll cannot re-navigate.
+Pages come from an in-process loopback server, and each test seeds its
+own `SharedPreferences` (site list, ledger, rebind map) before calling
+`app.main()`, so the runs share no state.
+
+A warm tap is delivered by driving the lifecycle round trip through
+`inactive` only — never `paused` or `hidden`. `SchedulerBinding` sets
+`framesEnabled = false` for those two states, which makes
+`scheduleFrame()` a no-op, so the next `tester.pump()` waits forever for
+a frame nobody schedules (observed as a full-cap CI hang). Any future
+integration test that drives app lifecycle SHALL follow the same rule.
+Each test SHALL also carry its own `timeout:` so a hang fails that test
+with its widget-tree and log dump rather than expiring the suite's
+wall-clock cap with no output.
+
+Warm taps SHALL stay in the adb tier: a tap on a pinned tile while the
+app runs is delivered as `onNewIntent` against the running activity,
+which an in-process test cannot produce. Those two scenarios live in
+`scripts/run_android_lifecycle_tests.sh` alongside the INTEG-011
+lifecycle scenarios, which already own the emulator, the page server,
+and the frame classifier.
+
+#### Scenario: Cold launch opens the pinned site at its home URL
+
+- **Given** a seeded site whose persisted `currentUrl` drifted away
+  from its `initUrl`, and a pending launch carrying its `siteId`
+- **When** the app cold-starts
+- **Then** that site is the activated one, no other site is mounted,
+  and its `currentUrl` is back at `initUrl` (HS-006)
+- **And** the startup reconcile has recorded the pinned site's url in
+  `shortcutUrlLedger` (HS-012)
+
+#### Scenario: Menu gating is asserted in both directions
+
+- **Given** sites in three pin states — pinned, unpinned, and rebound
+  to by an orphaned pinned tile
+- **When** the overflow menu is opened for each
+- **Then** "Home Shortcut" is absent for the pinned and the rebound
+  site and present for the unpinned one (HS-005), and tapping it
+  reaches `pinShortcut` on the channel with that site's id and label
+  and records its url in the ledger (HS-001 / HS-012)
+
+#### Scenario: An orphaned tile's prompt outcome is what gets persisted
+
+- **Given** a pinned tile whose site is gone but whose ledger url
+  matches a live site's base domain
+- **When** the tile is tapped and the user declines
+- **Then** no site is opened and no rebind is remembered, and the next
+  tap prompts again
+- **When** the user confirms instead
+- **Then** the matched site is activated, `shortcutSiteRemap` binds the
+  tile to it, and a subsequent tap opens it with no prompt (HS-011)
+
+#### Scenario: A tile with no domain match can be rerouted or given a new site
+
+- **Given** a pinned tile whose ledger url matches no live site
+- **When** the tile is tapped
+- **Then** the missing-site chooser offers reroute and create; choosing
+  reroute binds the tile to the picked site, and choosing create builds
+  a site rooted at the ledger url and binds the tile to it (HS-011)
+
+#### Scenario: Deleting a site prompts for every tile that reaches it
+
+- **Given** a site reachable by two pinned tiles — its own, and an
+  orphaned tile rebound to it
+- **When** the site is deleted and the user picks Disable
+- **Then** `disableShortcut` is called for both tiles and their ledger
+  and rebind entries are dropped (HS-013)
+- **And** deleting a site no pinned tile reaches raises no prompt
+
+#### Scenario: Warm taps are covered out of process
+
+- **Given** the app is running with the shortcut-seeded sites
+- **When** the adb harness issues `am start ... --es siteId <other>`
+- **Then** the other site composites (HS-002 "app already running")
+- **And** after driving a site off its `initUrl` and re-tapping its own
+  shortcut, the frame still shows the navigated page — a warm tap
+  preserves the live session (HS-006), and a reset to `initUrl` would
+  repaint the home page instead
+
+#### Scenario: Runs as its own wrapper script in build-android
+
+- **Given** the emulator step runs one wrapper script per in-process
+  suite (the runner executes each `script:` line as a separate `sh -c`,
+  so the device id has to stay in scope with `flutter test`)
+- **When** `run_android_shortcut_tests.sh` runs after
+  `run_android_integration_tests.sh` and before the lifecycle tier
+- **Then** the suite executes on every push/PR under its own 20-minute
+  wall-clock backstop, and a failure fails `build-android`
+
+#### Scenario: Desktop loops skip the Android-only suite
+
+- **Given** the Linux and macOS integration loops iterate
+  `integration_test/*_test.dart`
+- **When** they reach `shortcut_behavior_test.dart`
+- **Then** both skip it by basename (like `white_screen_test.dart`),
+  because every path it drives is `Platform.isAndroid`-gated and the
+  file's own `skip:` guard would still cost a desktop debug build
+
+---
+
+### Requirement: INTEG-014 — Offline and degraded-network scenarios
+
+`integration_test/offline_connection_test.dart` SHALL drive the offline,
+slow and shaky network postures against a real engine and an in-process
+loopback fixture server. Each posture is a negotiation between a Dart
+decision and the engine's load lifecycle, which is what puts it out of
+reach of the unit tier: `test/connectivity_service_test.dart` and
+`test/resume_reload_engine_test.dart` cover the decisions in isolation,
+but neither sees the signals a live WebView actually emits.
+
+"Offline" SHALL be simulated at the layer the app decides on
+(`ConnectivityService.onlineOverride`), not by cutting the runner's
+network — the assertion is about the gate, and a runner without network
+cannot serve the fixture that proves the online half. "Shaky" SHALL be
+produced by the fixture server refusing the connection or truncating a
+promised body, so the failure is deterministic rather than waited for.
+
+Assertions SHALL be split by who owns the behavior:
+
+- **Dart-owned** — whether the cached-then-live reload was issued,
+  whether a load failure was reported, whether a cache save was
+  attempted. Asserted strictly on every platform.
+- **Engine-owned** — whether the engine reloads an
+  `InAppWebViewInitialData` page back to its `baseUrl`, and whether it
+  reports a network failure to the Dart layer at all. Asserted only once
+  observed; otherwise the test SHALL log a `SKIP` line naming what the
+  engine did not do, rather than assert a vacuous truth (the
+  `privacy_settings_test.dart` posture).
+
+The engine-owned split is not hypothetical: Linux WPE maps
+`WEBKIT_NETWORK_ERROR_FAILED` (299) to no `WebResourceErrorType`, and
+`WebResourceError.fromMap` force-unwraps that lookup, so a plain
+connection failure never reaches `onReceivedError` on that target. The
+macOS runner exercises the failure assertions for real.
+
+#### Scenario: Offline construction renders the snapshot and touches no network
+
+- **Given** a site with a cached snapshot and `ConnectivityService`
+  reporting offline
+- **When** the webview is constructed
+- **Then** the snapshot is painted, `onReloadIssued` never fires, the
+  fixture server records zero requests for the site's path, and no
+  main-frame failure is reported
+
+#### Scenario: Online construction swaps the snapshot for the live page once
+
+- **Given** the same construction with `ConnectivityService` reporting
+  online
+- **When** the cached parse settles
+- **Then** exactly one live reload is issued — not a loop — and the live
+  bytes replace the snapshot in the DOM
+
+#### Scenario: A slow response is never reported as a failure
+
+- **Given** a route that sits on the request for several seconds
+- **When** the load is in flight
+- **Then** no main-frame failure is reported mid-flight, the load
+  eventually settles, and the live bytes commit — a slow link must not
+  reach `ResumeReloadEngine` as a stranded load and get re-issued out
+  from under a response that was about to arrive
+
+#### Scenario: A dropped connection is a retryable failure type
+
+- **Given** a refused connection, and separately a response truncated
+  mid-body
+- **When** the engine reports the main-frame failure
+- **Then** every reported error type is in
+  `ResumeReloadEngine.retryableErrorTypes` — a type outside that set
+  means PAUSE-022 recovery silently never fires for the exact case it
+  exists for, which no unit test can catch because the unit tier feeds
+  the engine the strings this test discovers
+
+#### Scenario: A failed load never overwrites the offline snapshot
+
+- **Given** a site whose main-frame navigation fails for a network
+  reason
+- **When** the engine commits its own error page and fires `onLoadStop`
+  for it
+- **Then** `onHtmlLoaded` is not invoked, so the site's last-good
+  snapshot survives the flake that makes the snapshot matter — caching
+  the error page is what the next offline cold start would render
+- **And** because neither desktop target can positively verify this
+  (Linux never delivers the failure, WKWebView never settles it), the
+  guard SHALL additionally be pinned structurally by
+  `test/js/offline_cache_failure_gate.test.js`, which fails if the
+  `onLoadStop` cache save stops being gated on the failure record
+
+---
+
 ## Known Limitations
 
 - **Build time per test**: each `flutter test integration_test/<file>.dart`
@@ -762,14 +1013,36 @@ tier for the non-background scenarios remains future scope.
   + [`lib/services/surface_diag_native.dart`](../../../lib/services/surface_diag_native.dart)
   (classification unit-tested in
   [`test/surface_diag_classification_test.dart`](../../../test/surface_diag_classification_test.dart))
+- [`integration_test/shortcut_behavior_test.dart`](../../../integration_test/shortcut_behavior_test.dart)
+  — INTEG-013: [home-shortcut](../home-shortcut/spec.md) launch, menu
+  gating, orphan routing and delete-time tile prompt through the widget
+  tree (Android emulator tier), run by
+  [`scripts/run_android_shortcut_tests.sh`](../../../scripts/run_android_shortcut_tests.sh);
+  the resolution rules themselves stay in
+  [`test/startup_restore_engine_test.dart`](../../../test/startup_restore_engine_test.dart)
 - [`scripts/run_android_lifecycle_tests.sh`](../../../scripts/run_android_lifecycle_tests.sh)
   — INTEG-011: adb-driven lifecycle tier (warm start, bfcache back,
   activity recreation, white control); INTEG-012: background-refresh
-  scenario (NOTIF-005-A). Frame classifier:
+  scenario (NOTIF-005-A); INTEG-013: warm home-shortcut taps. Frame
+  classifier:
   [`scripts/classify_window_pixels.py`](../../../scripts/classify_window_pixels.py);
   launch seeding: [`lib/services/diag_seed.dart`](../../../lib/services/diag_seed.dart)
   (`getDiagSeed` in MainActivity, debuggable builds only; parsing
   unit-tested in [`test/diag_seed_test.dart`](../../../test/diag_seed_test.dart))
+- [`integration_test/camera_test.dart`](../../../integration_test/camera_test.dart)
+  — CAM-010: per-site camera modes against a real Android WebView
+  (virtual serves the picked image, block denies, real hands over the
+  device camera). Runner:
+  [`scripts/run_android_camera_tests.sh`](../../../scripts/run_android_camera_tests.sh)
+  (pre-grants the CAMERA runtime permission so the OS dialog cannot
+  block the run). See [web-camera-access](../web-camera-access/spec.md)
+- [`integration_test/offline_connection_test.dart`](../../../integration_test/offline_connection_test.dart)
+  — INTEG-014: offline / slow / shaky network postures against a
+  loopback fixture server (both desktop targets). The decisions it
+  drives are unit-tested in
+  [`test/connectivity_service_test.dart`](../../../test/connectivity_service_test.dart)
+  and [`test/resume_reload_engine_test.dart`](../../../test/resume_reload_engine_test.dart);
+  this suite supplies the live-engine signals those tests stub
 - [`integration_test/settings_smoke_test.dart`](../../../integration_test/settings_smoke_test.dart)
   — harness pin
 - [`integration_test/settings_backup_roundtrip_test.dart`](../../../integration_test/settings_backup_roundtrip_test.dart)

@@ -21,6 +21,8 @@ import 'dart:io';
 import 'package:webspace/services/anti_fingerprinting_shim.dart';
 import 'package:webspace/services/android_page_zoom.dart';
 import 'package:webspace/services/blob_url_capture.dart';
+import 'package:webspace/services/camera_stream_shim.dart';
+import 'package:webspace/services/microphone_stream_shim.dart';
 import 'package:webspace/services/content_blocker_shim.dart';
 import 'package:webspace/services/procedural_cosmetic_shim.dart';
 import 'package:webspace/services/generic_cosmetic_shim.dart';
@@ -29,6 +31,8 @@ import 'package:webspace/services/do_not_track_shim.dart';
 import 'package:webspace/services/language_shim.dart';
 import 'package:webspace/services/target_blank_rewrite.dart';
 import 'package:webspace/services/location_spoof_service.dart';
+import 'package:webspace/services/media_session_shim.dart';
+import 'package:webspace/services/page_zoom_shim.dart';
 import 'package:webspace/services/theme_color_scheme_shim.dart';
 import 'package:webspace/services/user_agent_classifier.dart';
 import 'package:webspace/services/user_agent_identity_shim.dart';
@@ -70,7 +74,7 @@ Map<String, String> buildAllFixtures() {
     spoofAccuracy: 25.0,
     spoofTimezone: null,
     webRtcPolicy: WebRtcPolicy.defaultPolicy,
-  )!;
+  );
   fixtures['location_spoof/live_gps.js'] =
       LocationSpoofService.buildScript(
     locationMode: LocationMode.live,
@@ -79,7 +83,7 @@ Map<String, String> buildAllFixtures() {
     spoofAccuracy: 50.0,
     spoofTimezone: null,
     webRtcPolicy: WebRtcPolicy.defaultPolicy,
-  )!;
+  );
   fixtures['location_spoof/live_approximate.js'] =
       LocationSpoofService.buildScript(
     locationMode: LocationMode.live,
@@ -89,7 +93,7 @@ Map<String, String> buildAllFixtures() {
     spoofTimezone: null,
     liveLocationGranularity: LocationGranularity.approximate,
     webRtcPolicy: WebRtcPolicy.defaultPolicy,
-  )!;
+  );
   fixtures['location_spoof/live_gsm.js'] =
       LocationSpoofService.buildScript(
     locationMode: LocationMode.live,
@@ -99,7 +103,26 @@ Map<String, String> buildAllFixtures() {
     spoofTimezone: null,
     liveLocationGranularity: LocationGranularity.gsm,
     webRtcPolicy: WebRtcPolicy.defaultPolicy,
-  )!;
+  );
+  fixtures['location_spoof/blocked.js'] = LocationSpoofService.buildScript(
+    locationMode: LocationMode.off,
+    spoofLatitude: null,
+    spoofLongitude: null,
+    spoofAccuracy: 50.0,
+    spoofTimezone: null,
+    webRtcPolicy: WebRtcPolicy.defaultPolicy,
+  );
+  // A spoof site whose coordinates went missing must fail closed, not fall
+  // back to the platform fix.
+  fixtures['location_spoof/spoof_without_coords.js'] =
+      LocationSpoofService.buildScript(
+    locationMode: LocationMode.spoof,
+    spoofLatitude: null,
+    spoofLongitude: null,
+    spoofAccuracy: 50.0,
+    spoofTimezone: null,
+    webRtcPolicy: WebRtcPolicy.defaultPolicy,
+  );
   fixtures['location_spoof/timezone_only_tokyo.js'] =
       LocationSpoofService.buildScript(
     locationMode: LocationMode.off,
@@ -108,7 +131,7 @@ Map<String, String> buildAllFixtures() {
     spoofAccuracy: 50.0,
     spoofTimezone: 'Asia/Tokyo',
     webRtcPolicy: WebRtcPolicy.defaultPolicy,
-  )!;
+  );
   fixtures['location_spoof/webrtc_relay.js'] =
       LocationSpoofService.buildScript(
     locationMode: LocationMode.off,
@@ -117,7 +140,7 @@ Map<String, String> buildAllFixtures() {
     spoofAccuracy: 50.0,
     spoofTimezone: null,
     webRtcPolicy: WebRtcPolicy.relayOnly,
-  )!;
+  );
   fixtures['location_spoof/webrtc_disabled.js'] =
       LocationSpoofService.buildScript(
     locationMode: LocationMode.off,
@@ -126,7 +149,7 @@ Map<String, String> buildAllFixtures() {
     spoofAccuracy: 50.0,
     spoofTimezone: null,
     webRtcPolicy: WebRtcPolicy.disabled,
-  )!;
+  );
   fixtures['location_spoof/full_combo.js'] = LocationSpoofService.buildScript(
     locationMode: LocationMode.spoof,
     spoofLatitude: 48.8566,
@@ -134,7 +157,7 @@ Map<String, String> buildAllFixtures() {
     spoofAccuracy: 30.0,
     spoofTimezone: 'Europe/Paris',
     webRtcPolicy: WebRtcPolicy.relayOnly,
-  )!;
+  );
 
   fixtures['do_not_track/shim.js'] = buildDoNotTrackShim();
 
@@ -177,6 +200,36 @@ Map<String, String> buildAllFixtures() {
   fixtures['language/fr_FR.js'] = buildLanguageShim('fr-FR');
   fixtures['language/ja.js'] = buildLanguageShim('ja');
 
+  // Mobile page zoom, one fixture per layout-width regime: Android pins an
+  // explicit width (dodging Chromium's 980px wide-viewport quirk), WebKit
+  // leaves the engine to resolve extend-to-zoom. Pixel-5-shaped view
+  // extents, the emulator profile the integration tier runs on.
+  fixtures['page_zoom/android_80.js'] = buildPageZoomViewportShim(
+      zoomPercent: 80,
+      pinLayoutWidth: true,
+      portraitWidth: 393,
+      landscapeWidth: 851);
+  fixtures['page_zoom/android_150.js'] = buildPageZoomViewportShim(
+      zoomPercent: 150,
+      pinLayoutWidth: true,
+      portraitWidth: 393,
+      landscapeWidth: 851);
+  // No view extents: the fallback path where only the one-shot innerWidth
+  // sample is available.
+  fixtures['page_zoom/android_80_no_extents.js'] =
+      buildPageZoomViewportShim(zoomPercent: 80, pinLayoutWidth: true);
+  fixtures['page_zoom/webkit_80.js'] = buildPageZoomViewportShim(
+      zoomPercent: 80,
+      pinLayoutWidth: false,
+      portraitWidth: 393,
+      landscapeWidth: 851);
+
+  fixtures['camera_stream/shim.js'] = buildCameraStreamShim();
+  fixtures['microphone_stream/shim.js'] = buildMicrophoneStreamShim();
+
+  fixtures['media_session/shim.js'] = buildMediaSessionShim();
+  fixtures['media_session/pause_media.js'] = buildMediaPauseJs();
+
   // Engine-consistent navigator identity, one fixture per engine × form
   // factor: Gecko mobile (Firefox-Android — vendor "", oscpu/buildID set,
   // platform "Linux armv8l"), Gecko desktop (no platform override), WebKit
@@ -209,7 +262,7 @@ Map<String, String> buildAllFixtures() {
       spoofAccuracy: 50.0,
       spoofTimezone: 'UTC',
       webRtcPolicy: WebRtcPolicy.disabled,
-    )!,
+    ),
     buildLanguageShim('en'),
   ])!;
 

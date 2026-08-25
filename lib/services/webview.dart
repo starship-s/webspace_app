@@ -1,6 +1,7 @@
 import 'dart:collection';
 import 'dart:convert';
-import 'dart:io';
+import 'dart:math' as math;
+import 'package:webspace/platform/host_platform.dart';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -14,6 +15,7 @@ import 'package:webspace/services/do_not_track_shim.dart';
 import 'package:webspace/services/language_shim.dart';
 import 'package:webspace/services/launch_nonce.dart';
 import 'package:webspace/services/letterbox.dart';
+import 'package:webspace/services/page_zoom_shim.dart';
 import 'package:webspace/services/proxy_relay.dart';
 import 'package:webspace/services/resume_reload_engine.dart';
 import 'package:webspace/services/target_blank_rewrite.dart';
@@ -22,12 +24,17 @@ import 'package:webspace/services/connectivity_service.dart';
 import 'package:webspace/services/content_blocker_service.dart';
 import 'package:webspace/services/generic_cosmetic_shim.dart';
 import 'package:webspace/services/procedural_cosmetic_shim.dart';
+import 'package:webspace/services/camera_permission_service.dart';
+import 'package:webspace/services/camera_stream_shim.dart';
+import 'package:webspace/services/microphone_stream_shim.dart';
 import 'package:webspace/services/current_location_service.dart';
 import 'package:webspace/services/desktop_mode_shim.dart';
 import 'package:webspace/services/user_agent_classifier.dart';
 import 'package:webspace/services/user_agent_identity_shim.dart';
 import 'package:webspace/services/worker_shim.dart';
 import 'package:webspace/services/user_agent_metadata_builder.dart';
+import 'package:webspace/services/block_stats_engine.dart';
+import 'package:webspace/services/block_stats_service.dart';
 import 'package:webspace/services/dns_block_service.dart';
 import 'package:webspace/services/trusted_hosts_service.dart';
 import 'package:webspace/services/download_engine.dart';
@@ -41,9 +48,13 @@ import 'package:webspace/services/web_intercept_native.dart';
 import 'package:webspace/settings/proxy.dart';
 import 'package:webspace/services/location_spoof_service.dart';
 import 'package:webspace/services/log_service.dart';
+import 'package:webspace/services/media_session_shim.dart';
+import 'package:webspace/services/media_session_service.dart';
 import 'package:webspace/services/outbound_http.dart';
 import 'package:webspace/services/notification_service.dart';
 import 'package:webspace/services/user_script_service.dart';
+import 'package:webspace/settings/camera.dart';
+import 'package:webspace/settings/microphone.dart';
 import 'package:webspace/settings/location.dart';
 import 'package:webspace/settings/user_script.dart';
 import 'package:webspace/widgets/root_messenger.dart';
@@ -81,7 +92,7 @@ inapp.ProxySettings? _userProxyToInappProxy(UserProxySettings settings) {
   };
   final auth = settings.hasCredentials
       ? '${Uri.encodeComponent(settings.username!)}:'
-          '${Uri.encodeComponent(settings.password!)}@'
+            '${Uri.encodeComponent(settings.password!)}@'
       : '';
   return inapp.ProxySettings(
     proxyRules: [inapp.ProxyRule(url: '$scheme://$auth$host:$port')],
@@ -166,7 +177,7 @@ class CookieManager {
   /// aren't reachable from it (e.g. `accounts.google.com` when only
   /// `mail.google.com` has been visited) cannot be discovered on Android.
   Future<List<Cookie>> getAllCookies({List<Uri>? candidateUrls}) async {
-    if (Platform.isIOS || Platform.isMacOS) {
+    if (hostIsIOS || hostIsMacOS) {
       return _manager.getAllCookies();
     }
     if (candidateUrls == null || candidateUrls.isEmpty) return [];
@@ -246,7 +257,7 @@ class CookieManager {
   /// platform costs no channel round-trip. Failures are swallowed: a flush is
   /// an optimization over the platform's own lazy commit, never a correctness
   /// requirement.
-  static bool get flushSupported => Platform.isAndroid;
+  static bool get flushSupported => hostIsAndroid;
 
   Future<void> flush() async {
     if (!flushSupported) return;
@@ -310,7 +321,7 @@ class ProxyManager {
     // `inapp.ProxyController` is Android-only. Runtime updates of the
     // per-site proxy require the WebView to be rebuilt by the caller (see
     // [WebViewModel.updateProxySettings]).
-    if (Platform.isIOS || Platform.isMacOS) {
+    if (hostIsIOS || hostIsMacOS) {
       LogService.instance.log(
         'Proxy',
         'setProxySettings: iOS/macOS bind proxy at WebView construction; no-op here',
@@ -326,11 +337,12 @@ class ProxyManager {
     // honoring the same proxy precedence: explicit per-site override wins,
     // otherwise the global applies, otherwise system/direct.
     final effective = resolveEffectiveProxy(settings);
-    final fellThrough = settings.type == ProxyType.DEFAULT &&
+    final fellThrough =
+        settings.type == ProxyType.DEFAULT &&
         effective.type != ProxyType.DEFAULT;
 
     if (effective.type == ProxyType.DEFAULT) {
-      if (Platform.isAndroid) await ProxyRelay.instance.stop();
+      if (hostIsAndroid) await ProxyRelay.instance.stop();
       LogService.instance.log(
         'Proxy',
         'Clearing proxy override (per-site=DEFAULT, no global proxy set)',
@@ -397,7 +409,7 @@ class ProxyManager {
     // WebView at it with NO credentials; the relay injects them upstream.
     // iOS/macOS never reach here; Linux/WebKit accepts a credentialed
     // proxy URI directly, so it keeps the inline-credential path below.
-    if (Platform.isAndroid && effective.hasCredentials) {
+    if (hostIsAndroid && effective.hasCredentials) {
       final localPort = await ProxyRelay.instance.start(effective);
       if (localPort == null) {
         LogService.instance.log(
@@ -437,7 +449,7 @@ class ProxyManager {
     // No credentials (or Linux): point ProxyController straight at the
     // upstream. Stop any relay left over from a previous credentialed
     // config so its loopback port isn't left listening.
-    if (Platform.isAndroid) await ProxyRelay.instance.stop();
+    if (hostIsAndroid) await ProxyRelay.instance.stop();
 
     final proxyUrl = effective.hasCredentials
         ? '$scheme://${Uri.encodeComponent(effective.username!)}:${Uri.encodeComponent(effective.password!)}@$host:$port'
@@ -469,8 +481,8 @@ class ProxyManager {
 
   Future<void> clearProxy() async {
     if (!PlatformInfo.isProxySupported) return;
-    if (Platform.isIOS || Platform.isMacOS) return;
-    if (Platform.isAndroid) await ProxyRelay.instance.stop();
+    if (hostIsIOS || hostIsMacOS) return;
+    if (hostIsAndroid) await ProxyRelay.instance.stop();
     final sw = Stopwatch()..start();
     await inapp.ProxyController.instance().clearProxyOverride();
     LogService.instance.log(
@@ -499,7 +511,7 @@ class PlatformInfo {
   static bool? _isProxySupportedCached;
 
   static Future<void> initialize() async {
-    if (Platform.isIOS || Platform.isMacOS || Platform.isLinux) {
+    if (hostIsIOS || hostIsMacOS || hostIsLinux) {
       // iOS / macOS: native side gates per-version
       // (`#available(iOS 17.0, macOS 14.0, *)`); surface the toggle
       // unconditionally and let the per-site proxy block silently
@@ -527,8 +539,10 @@ class WebViewConfig {
   /// Unique key to force widget recreation when settings change.
   /// When this key changes, Flutter will create a new widget state.
   final Key? key;
+
   /// Site ID for per-site DNS statistics tracking.
   final String? siteId;
+
   /// Archive-tier opaque container identifier (ARCH-007). When set,
   /// substitutes for [siteId] in the on-disk container name so a
   /// directory listing under
@@ -542,6 +556,7 @@ class WebViewConfig {
   final String? userAgent;
   final bool thirdPartyCookiesEnabled;
   final bool incognito;
+
   /// iOS/macOS only: enable WKWebView's native back/forward swipe gesture
   /// (`allowsBackForwardNavigationGestures`). Set only for the root site
   /// webview, which lives at the `MaterialApp` root route where no Flutter
@@ -552,6 +567,7 @@ class WebViewConfig {
   /// the route at history start (NAV-008), which the native gesture would
   /// otherwise hijack. No effect on Android.
   final bool backForwardGestures;
+
   /// Android only: build the webview with no initial load (neither
   /// `initialUrlRequest` nor cached-HTML `initialData`) so the
   /// controller-created handler can apply `restoreState` to a pristine
@@ -563,15 +579,18 @@ class WebViewConfig {
   /// data. iOS/macOS replace state in place via `WKWebView.interactionState`,
   /// so they keep the initial load and leave this false.
   final bool deferInitialLoad;
+
   /// Language code for Accept-Language header (e.g., 'en', 'es', 'fr').
   /// If null, uses system default.
   final String? language;
+
   /// Browser-style page zoom (percent, 100 = unscaled). Android combines a
   /// DOCUMENT_START viewport contract with native page zoom; other platforms
   /// use a CSS `zoom` shim. Distinct from the OS font-scale `textZoom`.
   final int zoomPercent;
   final Function(String url)? onUrlChanged;
   final Function(List<Cookie> cookies)? onCookiesChanged;
+
   /// Cookie reader used inside [_onLoadStop] before invoking
   /// [onCookiesChanged]. Exactly one of these is non-null per
   /// `_WebSpacePageState`'s `_useContainers` decision: legacy mode
@@ -580,17 +599,20 @@ class WebViewConfig {
   /// the bound container via `webViewController:`).
   final CookieManager? cookieManager;
   final ContainerCookieManager? containerCookieManager;
+
   /// siteId of the owning [WebViewModel]. Required when
   /// [containerCookieManager] is set so per-site reads route through
   /// the bound WebView's container.
   final String? cookieSiteId;
   final Function(int activeMatch, int totalMatches)? onFindResult;
   final Function(String url, bool hasGesture)? shouldOverrideUrlLoading;
+
   /// Fires when the page enters or exits a loading state. Driven by
   /// `onLoadStart` (true) and `onLoadStop` (false). The call site can
   /// use this to swap a Refresh button with a Stop button while a
   /// navigation is in flight.
   final Function(bool isLoading)? onLoadingChanged;
+
   /// Fires when this webview reloads itself (the cached-HTML one-shot live
   /// refresh below). A reload discards the painted frame and recommits it
   /// later, so on Android the hybrid-composition surface sits blank in
@@ -598,23 +620,28 @@ class WebViewConfig {
   /// reloads funnel through `WebViewModel.reloadAndRepaint`; this is the
   /// same signal for the ones the factory issues on its own.
   final VoidCallback? onReloadIssued;
+
   /// Fires on every main-frame load lifecycle transition (start / settle /
   /// failure). Feeds `ResumeReloadEngine`, which decides whether a load the
   /// OS stranded while the app was backgrounded has to be re-issued on the
   /// next resume (PAUSE-022). Distinct from [onLoadingChanged], which is
   /// UI state and carries neither the URL nor the failure.
   final void Function(MainFrameLoadSignal signal)? onMainFrameLoad;
+
   /// Fires as the main-frame load advances, with progress in 0-100.
   /// Driven by the platform's `onProgressChanged`. The call site can
   /// use this to render a determinate loading bar while a navigation
   /// is in flight ([onLoadingChanged] gates visibility).
   final Function(int progress)? onProgressChanged;
+
   /// Callback for when a popup window is requested (e.g., Cloudflare challenges).
   /// Returns a widget (typically a WebView) to display in the popup.
   /// The callback receives the windowId for the popup and the requested URL.
   final Future<void> Function(int windowId, String url)? onWindowRequested;
+
   /// Callback when page HTML should be cached. Called on page load with (url, html).
   final Function(String url, String html)? onHtmlLoaded;
+
   /// Optional pre-gate for the [onHtmlLoaded] path. Returning `false`
   /// makes `onLoadStop` skip the `controller.getHtml()` IPC entirely
   /// (not just the encrypt+write that follows). The IPC is the
@@ -624,18 +651,24 @@ class WebViewConfig {
   /// IPC outright is the only way to drop the renderer pressure.
   /// When unset, every `onLoadStop` fetches HTML (legacy behavior).
   final bool Function()? shouldFetchHtml;
+
   /// Optional cached HTML for the first paint. Sub-resources (CSS/JS/images)
   /// load from the browser's HTTP cache via LOAD_CACHE_ELSE_NETWORK mode.
   final String? initialHtml;
+
   /// Whether [initialHtml] came from explicit cache-first mode and may be
   /// followed by one live refresh. Offline fallback HTML must leave this off.
   final bool initialHtmlMayAutoRefresh;
+
   /// Whether to strip tracking parameters from URLs via ClearURLs rules.
   final bool clearUrlEnabled;
+
   /// Whether to block navigation to domains on the Hagezi DNS blocklist.
   final bool dnsBlockEnabled;
+
   /// Whether to apply ABP content blocker rules (ads, trackers, cosmetic).
   final bool contentBlockEnabled;
+
   /// Umbrella per-site Enhanced Tracking Protection: when true, the
   /// anti-fingerprinting JS shim (Canvas/WebGL/audio/fonts/screen/
   /// hardware/timing) is injected at DOCUMENT_START. The owning
@@ -643,6 +676,7 @@ class WebViewConfig {
   /// [clearUrlEnabled], [dnsBlockEnabled], and [contentBlockEnabled]
   /// effectively-on whenever this flag is true.
   final bool trackingProtectionEnabled;
+
   /// Optional user-set window content size spoofed by the anti-fingerprinting
   /// shim (ETP-021). Both must be set and positive to take effect; otherwise
   /// the shim picks a stable per-site size. Only applied when
@@ -652,31 +686,50 @@ class WebViewConfig {
   /// the available area. Only meaningful when [letterboxEnabled] is true.
   final int? spoofWindowWidth;
   final int? spoofWindowHeight;
+
   /// When true, the WebView is rendered in a centered, grid-snapped box with
   /// margin bars (Tor-style letterboxing) so the reported viewport is
   /// bucketed and `screen.*` mirrors the real `window.inner*` (ETP-020).
   final bool letterboxEnabled;
+
   /// Per-site nonce regenerated when the user clears the site's data; folded
   /// into the anti-fingerprinting seed so a data wipe rerolls the fingerprint
   /// (ETP-022). Null/empty leaves the seed as the bare siteId.
   final String? fingerprintResetNonce;
+
   /// Whether to serve CDN resources from local cache (Android only).
   final bool localCdnEnabled;
+
+  /// Whether this site's block events roll into the app-wide protection
+  /// report (STATS-001). False for archive-tier sites, whose activity must
+  /// not move a counter persisted in plaintext SharedPreferences
+  /// (ARCH-001/ARCH-006). Declared to `BlockStatsService` when the webview
+  /// is built, keyed by [siteId], so nested webviews for the same site
+  /// inherit the same answer.
+  final bool contributesBlockStats;
+
   /// Callback for JS console messages.
-  final Function(String message, inapp.ConsoleMessageLevel level)? onConsoleMessage;
+  final Function(String message, inapp.ConsoleMessageLevel level)?
+  onConsoleMessage;
+
   /// Per-site user scripts to inject into the webview.
   final List<UserScriptConfig> userScripts;
+
   /// Callback to confirm fetching a script from a non-whitelisted URL.
   /// Returns true if the user approves, false to block.
   final Future<bool> Function(String url)? onConfirmScriptFetch;
+
   /// Callback fired when the webview tries to navigate to a non-webview
   /// URL (`intent://`, `tel:`, `mailto:`, custom app schemes). The
   /// webview always cancels such navigations; the host UI decides
   /// whether to launch the target app after confirming with the user.
-  final Future<void> Function(String url, ExternalUrlInfo info)? onExternalSchemeUrl;
+  final Future<void> Function(String url, ExternalUrlInfo info)?
+  onExternalSchemeUrl;
+
   /// Optional Android fallback for ordinary HTTP(S) downloads when the
   /// internal downloader cannot complete the request.
   final Future<bool> Function(String url)? onHttpDownload;
+
   /// Prompt for an untrusted (typically self-signed) TLS certificate
   /// surfaced by the platform's `onReceivedServerTrustAuthRequest`. The
   /// host UI shows a confirmation dialog; returning `true` adds the
@@ -687,9 +740,12 @@ class WebViewConfig {
     String host,
     int port,
     inapp.SslCertificate? certificate,
-  )? onUntrustedCertificate;
+  )?
+  onUntrustedCertificate;
+
   /// Optional pull-to-refresh controller for enabling pull-to-refresh gesture.
   final inapp.PullToRefreshController? pullToRefreshController;
+
   /// Fires when the underlying renderer terminates unexpectedly. On Android
   /// this maps to `WebView.onRenderProcessGone` — the OS sometimes kills the
   /// renderer to reclaim memory after the app has been backgrounded for a
@@ -698,30 +754,36 @@ class WebViewConfig {
   /// the controller and rebuild the widget. If unset, the WebView is left
   /// in its post-crash state (visible to the user as a black rectangle).
   final void Function(bool didCrash)? onRendererGone;
+
   /// Per-site geolocation mode. [LocationMode.spoof] injects a shim that
   /// overrides `navigator.geolocation` with [spoofLatitude]/[spoofLongitude].
   final LocationMode locationMode;
   final double? spoofLatitude;
   final double? spoofLongitude;
   final double spoofAccuracy;
+
   /// IANA timezone name reported via [Intl.DateTimeFormat] and
   /// [Date.prototype.getTimezoneOffset]. Null leaves the real zone. Holds the
   /// effective zone even for "From picked location" sites: the coords are
   /// resolved to a tzid and baked in at settings-save time, so the runtime
   /// never loads the polygon dataset.
   final String? spoofTimezone;
+
   /// UI mode marker: the user picked "From picked location" rather than an
   /// explicit zone. The resolved zone lives in [spoofTimezone] (baked at save);
   /// this flag is informational at runtime.
   final bool spoofTimezoneFromLocation;
+
   /// Granularity of the fix reported to the page in [LocationMode.live].
   /// GPS (default) reveals the real device coordinates; Approximate uses
   /// the GPS provider but snaps to a ~110 m grid; GSM uses the network
   /// provider only and snaps to a ~1.1 km grid. Ignored when
   /// [locationMode] is not [LocationMode.live].
   final LocationGranularity liveLocationGranularity;
+
   /// WebRTC policy — prevents real-IP leak that bypasses HTTP(S)/SOCKS proxies.
   final WebRtcPolicy webRtcPolicy;
+
   /// Per-site proxy. Carried into:
   ///
   /// - The native webview proxy: on iOS 17+ / macOS 14+ via
@@ -736,12 +798,58 @@ class WebViewConfig {
   ///   the app-global outbound proxy.
   final UserProxySettings? proxySettings;
   final bool notificationsEnabled;
+
+  /// BGAUDIO-006: inject the media-session bridge shim + register the
+  /// `wsMediaSession` handler so this site's playback drives the Android
+  /// foreground media notification. Android-only effect.
+  final bool backgroundAudioEnabled;
+
   /// Prompt fired when the page requests protected-media (Widevine/EME)
   /// permission (`PROTECTED_MEDIA_ID`). Returns true to grant, false to
   /// deny. When null, the handler is not installed and the platform's
   /// default applies (Android denies). Only meaningful on Android — iOS/
   /// macOS WKWebView has no EME/Widevine and never issues the request.
   final Future<bool> Function(String origin)? onProtectedMediaRequest;
+
+  /// Resolves the site's decision when the page requests camera-only capture
+  /// (getUserMedia video, e.g. a banking site's QR scanner). Called with the
+  /// origin and the site's current [CameraAccessMode]; returns a settled
+  /// [CameraDecision] (real / virtual / block, plus a [VirtualCameraSource]
+  /// for virtual) after any Allow/Use-file/Block popup or file-pick. When
+  /// null, camera requests keep the platform default (deny). The
+  /// `webCameraRequest` JS handler drives the virtual path; the native
+  /// permission request grants the real camera only when this resolves to
+  /// `real` (and, on Android, after [CameraPermissionService] ensures the
+  /// app-level CAMERA runtime permission). Requests that bundle the
+  /// microphone never route here. The model computes the current mode
+  /// internally, so this takes only the origin.
+  final Future<CameraDecision> Function(String origin)? onCameraDecision;
+
+  /// Reads the site's current camera mode WITHOUT prompting. Backs the
+  /// `webCameraMode` JS handler, which the shim uses to decide whether
+  /// `enumerateDevices` should mask real cameras (virtual mode) — enumeration
+  /// must never pop a permission dialog, so it cannot go through
+  /// [onCameraDecision].
+  final CameraAccessMode Function()? currentCameraMode;
+
+  /// Resolves the site's decision when the page asks for audio capture.
+  /// Called with the origin and the site's current [MicrophoneAccessMode];
+  /// returns a settled [MicrophoneDecision] (virtual / block, plus a
+  /// [VirtualMicrophoneSource] for virtual) after any Block/Use-audio-file
+  /// popup or file-pick. When null, audio capture keeps the platform default
+  /// (deny on Android/Linux, WebKit's own prompt on iOS/macOS). When
+  /// non-null, the `webMicrophoneRequest` JS handler serves the whole flow in
+  /// JS and the native layer denies every MICROPHONE request outright, so no
+  /// OS recording permission is ever requested.
+  final Future<MicrophoneDecision> Function(String origin)?
+  onMicrophoneDecision;
+
+  /// Reads the site's current microphone mode WITHOUT prompting. Backs the
+  /// `webMicrophoneMode` JS handler, which the shim uses to decide whether
+  /// `enumerateDevices` should mask real microphones (virtual mode) —
+  /// enumeration must never pop a permission dialog, so it cannot go through
+  /// [onMicrophoneDecision].
+  final MicrophoneAccessMode Function()? currentMicrophoneMode;
 
   WebViewConfig({
     this.key,
@@ -756,6 +864,7 @@ class WebViewConfig {
     this.deferInitialLoad = false,
     this.language,
     this.zoomPercent = 100,
+    this.contributesBlockStats = true,
     this.clearUrlEnabled = true,
     this.dnsBlockEnabled = true,
     this.contentBlockEnabled = true,
@@ -799,7 +908,12 @@ class WebViewConfig {
     this.webRtcPolicy = WebRtcPolicy.defaultPolicy,
     this.proxySettings,
     this.notificationsEnabled = false,
+    this.backgroundAudioEnabled = false,
     this.onProtectedMediaRequest,
+    this.onCameraDecision,
+    this.currentCameraMode,
+    this.onMicrophoneDecision,
+    this.currentMicrophoneMode,
   });
 }
 
@@ -815,6 +929,7 @@ abstract class WebViewController {
   Future<void> loadUrl(String url, {String? language});
   Future<void> loadHtmlString(String html, {String? baseUrl});
   Future<void> reload();
+
   /// Request a native platform-view repaint without changing its geometry.
   /// This is a no-op off Android.
   Future<void> requestRepaint();
@@ -822,6 +937,7 @@ abstract class WebViewController {
   Future<String?> getTitle();
   Future<String?> getHtml();
   Future<void> evaluateJavascript(String source);
+
   /// Evaluate [source] and return whatever the JS expression produced,
   /// JSON-decoded by the platform plugin into a Dart `dynamic`.
   /// Distinct from
@@ -840,11 +956,13 @@ abstract class WebViewController {
     bool? incognito,
   });
   Future<void> setThemePreference(WebViewTheme theme);
+
   /// Update the page-text zoom (percent, 100 = unscaled). Used to track
   /// system "font size" accessibility changes after the webview is created.
   Future<void> setTextZoom(int zoomPercent);
   Future<void> goBack();
   Future<bool> canGoBack();
+
   /// Per-instance pause to reduce resource usage.
   ///
   /// On Android: **no-op.** `WebView.onPause()` only does a best-effort pause
@@ -962,8 +1080,7 @@ bool deferInitialLoadForRestore({
   required bool hasPendingRestoreState,
   required bool isAndroid,
   required bool isFileImport,
-}) =>
-    hasPendingRestoreState && isAndroid && !isFileImport;
+}) => hasPendingRestoreState && isAndroid && !isFileImport;
 
 /// Pure gate for the cached-HTML one-shot live refresh.
 bool shouldScheduleCachedHtmlLiveReload({
@@ -1023,7 +1140,7 @@ class _WebViewController implements WebViewController {
 
   @override
   Future<void> requestRepaint() async {
-    if (!Platform.isAndroid) return;
+    if (!hostIsAndroid) return;
     await _c.requestRepaint();
   }
 
@@ -1053,10 +1170,12 @@ class _WebViewController implements WebViewController {
   }
 
   @override
-  Future<void> findAllAsync({required String find}) => _c.findAllAsync(find: find);
+  Future<void> findAllAsync({required String find}) =>
+      _c.findAllAsync(find: find);
 
   @override
-  Future<void> findNext({required bool forward}) => _c.findNext(forward: forward);
+  Future<void> findNext({required bool forward}) =>
+      _c.findNext(forward: forward);
 
   @override
   Future<void> clearMatches() => _c.clearMatches();
@@ -1105,7 +1224,9 @@ class _WebViewController implements WebViewController {
 
   @override
   Future<void> setThemePreference(WebViewTheme theme) async {
-    final themeValue = theme == WebViewTheme.system ? 'system' : (theme == WebViewTheme.dark ? 'dark' : 'light');
+    final themeValue = theme == WebViewTheme.system
+        ? 'system'
+        : (theme == WebViewTheme.dark ? 'dark' : 'light');
     // Rotate the DOCUMENT_START user script so future page loads
     // (including controller.reload()) re-run the shim. Without this,
     // a refresh drops the matchMedia override and `<meta name=
@@ -1114,36 +1235,39 @@ class _WebViewController implements WebViewController {
     // and skips its own evaluateJavascript reapplication.
     final source = '${buildThemeColorSchemeShim(themeValue)}\n;null;';
     await _c.removeUserScriptsByGroupName(groupName: 'theme_color_scheme_shim');
-    await _c.addUserScript(userScript: inapp.UserScript(
-      groupName: 'theme_color_scheme_shim',
-      source: source,
-      injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      forMainFrameOnly: false,
-    ));
+    await _c.addUserScript(
+      userScript: inapp.UserScript(
+        groupName: 'theme_color_scheme_shim',
+        source: source,
+        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        forMainFrameOnly: false,
+      ),
+    );
     await evaluateJavascript(buildThemeColorSchemeShim(themeValue));
   }
 
   @override
   Future<void> setTextZoom(int zoomPercent) async {
-    if (Platform.isAndroid) {
+    if (hostIsAndroid) {
       await _c.setSettings(
-        settings: inapp.InAppWebViewSettings(
-          textZoom: zoomPercent,
-        ),
+        settings: inapp.InAppWebViewSettings(textZoom: zoomPercent),
       );
       return;
     }
     // iOS/macOS: WKWebView has no textZoom setting. Rotate the
     // DOCUMENT_START user script so future page loads pick up the new
     // value, then update the style element on the current page.
-    final source = '${WebViewFactory._textSizeAdjustScript(zoomPercent)}\n;null;';
+    final source =
+        '${WebViewFactory._textSizeAdjustScript(zoomPercent)}\n;null;';
     await _c.removeUserScriptsByGroupName(groupName: 'system_text_zoom');
-    await _c.addUserScript(userScript: inapp.UserScript(
-      groupName: 'system_text_zoom',
-      source: source,
-      injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      forMainFrameOnly: false,
-    ));
+    await _c.addUserScript(
+      userScript: inapp.UserScript(
+        groupName: 'system_text_zoom',
+        source: source,
+        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        forMainFrameOnly: false,
+      ),
+    );
     await evaluateJavascript(WebViewFactory._textSizeAdjustScript(zoomPercent));
   }
 
@@ -1165,7 +1289,9 @@ class _WebViewController implements WebViewController {
     // Must NOT throw: callers run `pause()` then `pauseAllJsTimers()` inside one
     // try block, so an exception here would skip the global JS freeze.
     switch (perInstanceLifecycleCallFor(
-        isAndroid: Platform.isAndroid, isIOS: Platform.isIOS)) {
+      isAndroid: hostIsAndroid,
+      isIOS: hostIsIOS,
+    )) {
       case PerInstanceLifecycleCall.none:
         return;
       case PerInstanceLifecycleCall.timers:
@@ -1177,7 +1303,9 @@ class _WebViewController implements WebViewController {
   Future<void> resume() async {
     // Mirror of [pause] (PAUSE-016): no-op on Android.
     switch (perInstanceLifecycleCallFor(
-        isAndroid: Platform.isAndroid, isIOS: Platform.isIOS)) {
+      isAndroid: hostIsAndroid,
+      isIOS: hostIsIOS,
+    )) {
       case PerInstanceLifecycleCall.none:
         return;
       case PerInstanceLifecycleCall.timers:
@@ -1225,7 +1353,6 @@ class _WebViewController implements WebViewController {
     }
   }
 }
-
 
 /// JavaScript that disables every entry-point JS has into WebGL context
 /// creation, so chromium never enters its WebGL-blocklist code path —
@@ -1444,7 +1571,6 @@ persist, and the cache is cleared on app upgrade).</p>
 ''';
 }
 
-
 /// Factory for creating webviews
 class WebViewFactory {
   /// Global back/forward-cache preference, mirrored from the
@@ -1467,7 +1593,8 @@ class WebViewFactory {
   static String _textSizeAdjustCss(int zoomPercent) =>
       'html{-webkit-text-size-adjust:$zoomPercent% !important;}';
 
-  static String _textSizeAdjustScript(int zoomPercent) => '''
+  static String _textSizeAdjustScript(int zoomPercent) =>
+      '''
 (function(){
   var id='__webspace_text_zoom__';
   var css='${_textSizeAdjustCss(zoomPercent)}';
@@ -1484,15 +1611,20 @@ class WebViewFactory {
   else{document.addEventListener('DOMContentLoaded',apply);}
 })();''';
 
-  /// Per-site browser-style page zoom for non-Android platforms. CSS `zoom`
-  /// scales the whole page (text and images) and is honoured by Chromium and
-  /// modern WebKit (Safari 17+/WPE 2.40+). Android uses the native WebView
-  /// initial scale instead. Injected at DOCUMENT_START via a re-applied style
-  /// element so it survives same-document navigations and reaches iframes.
+  /// Per-site browser-style page zoom — desktop fallback path. CSS `zoom`
+  /// scales the whole page (text and images) and is honoured by Chromium
+  /// and modern WebKit (Safari 17+/WPE 2.40+), reflowing the layout to fill
+  /// the window. Used on desktop engines (which ignore the viewport meta)
+  /// and on mobile under desktop-mode (which owns the viewport). Mobile
+  /// non-desktop sites take the [buildPageZoomViewportShim] path instead, so
+  /// the *layout* viewport reflows rather than the page shrinking into a
+  /// gutter. Injected at DOCUMENT_START via a re-applied style element so it
+  /// survives same-document navigations and reaches iframes.
   static String _pageZoomCss(int zoomPercent) =>
       'html{zoom:$zoomPercent% !important;}';
 
-  static String _pageZoomScript(int zoomPercent) => '''
+  static String _pageZoomScript(int zoomPercent) =>
+      '''
 (function(){
   var id='__webspace_page_zoom__';
   var css='${_pageZoomCss(zoomPercent)}';
@@ -1505,8 +1637,19 @@ class WebViewFactory {
     }
     el.textContent=css;
   }
+  function relayout(){
+    apply();
+    // Root `zoom` applied at document start can leave Blink showing a
+    // blank frame until a layout invalidation lands (it needs a manual
+    // reload to recover otherwise); force a reflow and resize to nudge
+    // the compositor into painting the zoomed page.
+    try{void document.documentElement.offsetHeight;}catch(e){}
+    try{window.dispatchEvent(new Event('resize'));}catch(e){}
+  }
   if(document.documentElement){apply();}
   else{document.addEventListener('DOMContentLoaded',apply);}
+  window.addEventListener('DOMContentLoaded',relayout);
+  window.addEventListener('load',relayout);
 })();''';
 
   /// Pin WebKit's initial scale to 1 on load.
@@ -1578,31 +1721,52 @@ class WebViewFactory {
   if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',ensure,{once:true});}
 })();''';
 
+  /// The view's CSS-pixel width in each orientation, `(portrait,
+  /// landscape)`. The page-zoom shim pins the layout viewport against
+  /// these because everything reachable from the page is either spoofed
+  /// (`screen.*`, by the anti-fingerprinting shim) or already moved by the
+  /// zoom itself (`innerWidth`). Zero when no view is attached.
+  static (double, double) _viewExtents() {
+    final view =
+        WidgetsBinding.instance.platformDispatcher.implicitView ??
+        (WidgetsBinding.instance.platformDispatcher.views.isEmpty
+            ? null
+            : WidgetsBinding.instance.platformDispatcher.views.first);
+    if (view == null || view.devicePixelRatio <= 0) return (0, 0);
+    final w = view.physicalSize.width / view.devicePixelRatio;
+    final h = view.physicalSize.height / view.devicePixelRatio;
+    if (w <= 0 || h <= 0) return (0, 0);
+    return (math.min(w, h), math.max(w, h));
+  }
+
   /// Determine if a navigation was triggered by a user gesture.
   /// Android: uses hasGesture property.
   /// iOS/macOS: uses navigationType (LINK_ACTIVATED = user tap, FORM_SUBMITTED = user form).
   static bool _hasUserGesture(inapp.NavigationAction action) {
-    if (Platform.isAndroid) {
+    if (hostIsAndroid) {
       return action.hasGesture ?? true;
     }
-    if (Platform.isIOS || Platform.isMacOS) {
+    if (hostIsIOS || hostIsMacOS) {
       return action.navigationType == inapp.NavigationType.LINK_ACTIVATED ||
-             action.navigationType == inapp.NavigationType.FORM_SUBMITTED;
+          action.navigationType == inapp.NavigationType.FORM_SUBMITTED;
     }
     return true; // Default allow on unknown platforms
   }
 
   static bool _shouldBlockUrl(String url) {
     // Allow about:blank and about:srcdoc - required for Cloudflare Turnstile
-    if (url.startsWith('about:') && url != 'about:blank' && url != 'about:srcdoc') return true;
-    if (url.contains('/sw_iframe.html') || url.contains('/blank.html') || url.contains('/service_worker/')) return true;
+    if (url.startsWith('about:') &&
+        url != 'about:blank' &&
+        url != 'about:srcdoc')
+      return true;
+    if (url.contains('/sw_iframe.html') ||
+        url.contains('/blank.html') ||
+        url.contains('/service_worker/'))
+      return true;
     return false;
   }
 
-  static const _captchaDomains = [
-    'challenges.cloudflare.com',
-    'hcaptcha.com',
-  ];
+  static const _captchaDomains = ['challenges.cloudflare.com', 'hcaptcha.com'];
 
   /// Domains that legitimately serve reCAPTCHA at /recaptcha/ paths.
   static const _recaptchaDomains = [
@@ -1657,14 +1821,16 @@ class WebViewFactory {
         // Enable DevTools inspection in debug mode (chrome://inspect on Android)
         isInspectable: kDebugMode,
       ),
-      initialUserScripts: Platform.isAndroid ? null : UnmodifiableListView([
-        inapp.UserScript(
-          groupName: 'system_text_zoom',
-          source: '${_textSizeAdjustScript(textZoom)}\n;null;',
-          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-          forMainFrameOnly: false,
-        ),
-      ]),
+      initialUserScripts: hostIsAndroid
+          ? null
+          : UnmodifiableListView([
+              inapp.UserScript(
+                groupName: 'system_text_zoom',
+                source: '${_textSizeAdjustScript(textZoom)}\n;null;',
+                injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+                forMainFrameOnly: false,
+              ),
+            ]),
       onCloseWindow: (controller) {
         onCloseWindow?.call();
       },
@@ -1685,10 +1851,17 @@ class WebViewFactory {
     // Build initial URL request headers. DNT/Sec-GPC are always-on per
     // the privacy posture of this app — every outbound nav advertises
     // the user's no-tracking preference.
-    final headers = <String, String>{
-      'DNT': '1',
-      'Sec-GPC': '1',
-    };
+    final headers = <String, String>{'DNT': '1', 'Sec-GPC': '1'};
+
+    // Declare this site's protection-report scope before any block event can
+    // be recorded for it. Keyed by siteId, so a nested webview built for the
+    // same site re-asserts the same answer rather than flipping it.
+    if (config.siteId != null) {
+      BlockStatsService.instance.setSiteContributes(
+        config.siteId!,
+        config.contributesBlockStats,
+      );
+    }
     if (config.language != null) {
       headers['Accept-Language'] = '${config.language}, *;q=0.5';
     }
@@ -1742,7 +1915,7 @@ class WebViewFactory {
 
     final userScripts = <inapp.UserScript>[];
 
-    if (Platform.isAndroid && config.zoomPercent != 100) {
+    if (hostIsAndroid && config.zoomPercent != 100) {
       userScripts.add(
         inapp.UserScript(
           groupName: 'android_page_zoom',
@@ -1774,38 +1947,81 @@ class WebViewFactory {
     // null for WebGL types means JS never asks for the context and
     // chromium never enters the blocklist cleanup path.
     if (config.trackingProtectionEnabled) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'webgl_kill_switch',
-        source: '$_webGlKillSwitchScript\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        // Inject into every frame — third-party fingerprint scripts
-        // routinely run inside iframes.
-        forMainFrameOnly: false,
-      ));
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'webgl_kill_switch',
+          source: '$_webGlKillSwitchScript\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          // Inject into every frame — third-party fingerprint scripts
+          // routinely run inside iframes.
+          forMainFrameOnly: false,
+        ),
+      );
     }
 
     // Always-on Do Not Track / Global Privacy Control. Installs the
     // navigator.doNotTrack / navigator.globalPrivacyControl getters before
     // any site script can read them — also covers iframes (fingerprinters
     // routinely run inside one).
-    userScripts.add(inapp.UserScript(
-      groupName: 'do_not_track',
-      source: '${buildDoNotTrackShim()}\n;null;',
-      injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      forMainFrameOnly: false,
-    ));
+    userScripts.add(
+      inapp.UserScript(
+        groupName: 'do_not_track',
+        source: '${buildDoNotTrackShim()}\n;null;',
+        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        forMainFrameOnly: false,
+      ),
+    );
+
+    // Virtual camera shim. Intercepts video-only getUserMedia and, per the
+    // site's decision (fetched via the webCameraRequest handler), serves a
+    // user-picked image / looped video as the camera instead of the device
+    // lens. Injected whenever the host wired a camera resolver — the shim
+    // itself asks Dart for the mode, so gating here on the callback keeps
+    // the "no handler -> not injected" invariant. forMainFrameOnly:false so
+    // a QR scanner embedded in a cross-origin iframe is covered too.
+    if (config.onCameraDecision != null) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'camera_stream',
+          source: '${buildCameraStreamShim()}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: false,
+        ),
+      );
+    }
+
+    // Virtual microphone shim. Intercepts any getUserMedia that asks for
+    // audio and, per the site's decision (fetched via the
+    // webMicrophoneRequest handler), serves a user-picked clip on loop
+    // instead of the device microphone — which is never opened, on any
+    // platform. Gated on the resolver for the same reason as the camera shim.
+    // A combined audio+video request is split here and its video half
+    // re-issued through the live navigator.mediaDevices.getUserMedia, so the
+    // two shims compose whichever order they were injected in.
+    if (config.onMicrophoneDecision != null) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'microphone_stream',
+          source: '${buildMicrophoneStreamShim()}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: false,
+        ),
+      );
+    }
 
     // Always-on: rewrite `target="_blank"` anchors to `_self` so cross-domain
     // link taps route through shouldOverrideUrlLoading (reliable gesture)
     // instead of onCreateWindow (unreliable gesture / empty URL on Android),
     // where the nested-url-blocking engine would otherwise silently drop the
     // navigation. See target_blank_rewrite.dart and issue #405.
-    userScripts.add(inapp.UserScript(
-      groupName: 'target_blank_rewrite',
-      source: '$targetBlankRewriteScript\n;null;',
-      injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      forMainFrameOnly: false,
-    ));
+    userScripts.add(
+      inapp.UserScript(
+        groupName: 'target_blank_rewrite',
+        source: '$targetBlankRewriteScript\n;null;',
+        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        forMainFrameOnly: false,
+      ),
+    );
 
     // Per-site anti-fingerprinting shim. Patches Canvas/WebGL/audio/fonts/
     // screen/hardware/timing surfaces, seeded by siteId so the same site
@@ -1834,23 +2050,27 @@ class WebViewFactory {
       letterbox: config.letterboxEnabled,
     );
     if (antiFpSource != null) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'anti_fingerprinting',
-        source: antiFpSource,
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        forMainFrameOnly: false,
-      ));
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'anti_fingerprinting',
+          source: antiFpSource,
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: false,
+        ),
+      );
       workerScopeShims.add(antiFpSource);
     }
 
     // Blob URL capture: bridge sites whose CSP `connect-src` rejects
     // fetch(blob:) — the IIFE in `_handleBlobDownload` looks the Blob
     // up directly and never opens a network handle.
-    userScripts.add(inapp.UserScript(
-      groupName: 'blob_url_capture',
-      source: '$blobUrlCaptureScript\n;null;',
-      injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-    ));
+    userScripts.add(
+      inapp.UserScript(
+        groupName: 'blob_url_capture',
+        source: '$blobUrlCaptureScript\n;null;',
+        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+      ),
+    );
 
     // Android-only: repair `<a download>` clicks for blob and HTTP(S).
     // Android's DownloadListener does not fire for blob: URLs, and can
@@ -1858,12 +2078,14 @@ class WebViewFactory {
     // iOS/macOS WKWebView
     // surfaces blob downloads through onDownloadStartRequest natively
     // and does not need (or want) the JS path.
-    if (Platform.isAndroid) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'blob_download_click_intercept',
-        source: '$blobDownloadClickInterceptScript\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      ));
+    if (hostIsAndroid) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'blob_download_click_intercept',
+          source: '$blobDownloadClickInterceptScript\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      );
     }
 
     // Desktop-mode inference: a per-site UA without mobile markers
@@ -1875,15 +2097,17 @@ class WebViewFactory {
     // shim's properties are in place before any site script reads them.
     final desktopMode = isDesktopUserAgent(config.userAgent);
     if (desktopMode) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'desktop_mode_shim',
-        source: '${buildDesktopModeShim(config.userAgent ?? '')}\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        // Inject into iframes too. Without this, a site can embed
-        // browserleaks.com or similar in an iframe and bypass the shim
-        // (iOS WKUserScript defaults to main-frame-only).
-        forMainFrameOnly: false,
-      ));
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'desktop_mode_shim',
+          source: '${buildDesktopModeShim(config.userAgent ?? '')}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          // Inject into iframes too. Without this, a site can embed
+          // browserleaks.com or similar in an iframe and bypass the shim
+          // (iOS WKUserScript defaults to main-frame-only).
+          forMainFrameOnly: false,
+        ),
+      );
     }
 
     // Engine-consistent navigator identity: a per-site UA changes the UA
@@ -1896,14 +2120,16 @@ class WebViewFactory {
     if (uaValue != null && uaValue.isNotEmpty) {
       final identityShim = buildUserAgentIdentityShim(uaValue);
       if (identityShim != null) {
-        userScripts.add(inapp.UserScript(
-          groupName: 'ua_identity_shim',
-          source: '$identityShim\n;null;',
-          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-          // Reach cross-origin iframes so a subframe can't report the real
-          // engine's identity and contradict the top frame.
-          forMainFrameOnly: false,
-        ));
+        userScripts.add(
+          inapp.UserScript(
+            groupName: 'ua_identity_shim',
+            source: '$identityShim\n;null;',
+            injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+            // Reach cross-origin iframes so a subframe can't report the real
+            // engine's identity and contradict the top frame.
+            forMainFrameOnly: false,
+          ),
+        );
         workerScopeShims.add(identityShim);
       }
     }
@@ -1912,47 +2138,87 @@ class WebViewFactory {
     // when a page reaches first layout without an `initial-scale`; force
     // one onto every viewport meta. Desktop mode owns the viewport via its
     // own shim, so skip there.
-    if ((Platform.isIOS || Platform.isMacOS) && !desktopMode) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'default_viewport',
-        source: '$_defaultViewportScript\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      ));
+    if ((hostIsIOS || hostIsMacOS) && !desktopMode) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'default_viewport',
+          source: '$_defaultViewportScript\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      );
     }
 
     // System text zoom for non-Android: WKWebView has no `textZoom`
     // setting, so inject CSS that pushes -webkit-text-size-adjust.
-    if (!Platform.isAndroid) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'system_text_zoom',
-        source: '${_textSizeAdjustScript(textZoom)}\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        forMainFrameOnly: false,
-      ));
+    if (!hostIsAndroid) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'system_text_zoom',
+          source: '${_textSizeAdjustScript(textZoom)}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: false,
+        ),
+      );
     }
 
-    // Per-site browser-style page zoom for non-Android. Android uses the
-    // viewport contract and native zoom below. Skipped at 100% so the default
-    // site carries no zoom shim.
-    if (!Platform.isAndroid && config.zoomPercent != 100) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'page_zoom',
-        source: '${_pageZoomScript(config.zoomPercent)}\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        forMainFrameOnly: false,
-      ));
+    // Per-site browser-style page zoom. Skipped at 100% so the default site
+    // carries no zoom shim. On Android/iOS (outside desktop-mode, which owns
+    // the viewport meta) drive the layout viewport via `initial-scale` so
+    // the page reflows to fill the screen instead of shrinking into a gutter
+    // or overflowing horizontally; desktop engines ignore the viewport meta
+    // and keep the CSS `zoom` path. Android additionally needs the layout
+    // width spelled out — see [buildPageZoomViewportShim].
+    final zoomPlan = planPageZoom(
+      zoomPercent: config.zoomPercent,
+      isAndroid: hostIsAndroid,
+      isIOS: hostIsIOS,
+      desktopMode: desktopMode,
+    );
+    if (zoomPlan.channel != PageZoomChannel.none) {
+      final viewExtents = _viewExtents();
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'page_zoom',
+          source: zoomPlan.channel == PageZoomChannel.viewportMeta
+              ? '${buildPageZoomViewportShim(zoomPercent: config.zoomPercent, pinLayoutWidth: zoomPlan.pinLayoutWidth, portraitWidth: viewExtents.$1, landscapeWidth: viewExtents.$2)}\n;null;'
+              : '${_pageZoomScript(config.zoomPercent)}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: false,
+        ),
+      );
     }
 
     if (config.siteId != null) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'notification_polyfill',
-        source: _notificationPolyfillScript(
-          siteId: config.siteId!,
-          notificationsEnabled: config.notificationsEnabled,
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'notification_polyfill',
+          source: _notificationPolyfillScript(
+            siteId: config.siteId!,
+            notificationsEnabled: config.notificationsEnabled,
+          ),
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: false,
         ),
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        forMainFrameOnly: false,
-      ));
+      );
+    }
+
+    // BGAUDIO-006: media-session bridge shim on background-audio sites only.
+    if (config.siteId != null &&
+        config.backgroundAudioEnabled &&
+        MediaSessionService.instance.isSupported) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'media_session_shim',
+          source: '${buildMediaSessionShim()}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          forMainFrameOnly: false,
+        ),
+      );
+      // BGAUDIO-007: the first link in the chain. Its absence in an App Logs
+      // export says the site's Background audio toggle is off — the one
+      // failure the downstream MediaSession lines cannot distinguish from a
+      // broken bridge. Non-sensitive: no site name or URL.
+      LogService.instance.log('MediaSession', 'Bridge armed for this site');
     }
 
     // The effective IANA timezone (including the "From picked location"
@@ -1973,8 +2239,8 @@ class WebViewFactory {
       liveLocationGranularity: config.liveLocationGranularity,
       webRtcPolicy: config.webRtcPolicy,
     );
-    if (locationShim != null) {
-      userScripts.add(inapp.UserScript(
+    userScripts.add(
+      inapp.UserScript(
         groupName: 'location_spoof',
         source: '$locationShim\n;null;',
         injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
@@ -1982,21 +2248,25 @@ class WebViewFactory {
         // only). Without this a site could embed browserleaks.com in an
         // iframe and bypass the spoof.
         forMainFrameOnly: false,
-      ));
-      // Carries the timezone override, which workers re-read. The geolocation
-      // and WebRTC halves self-disable outside window scope.
-      workerScopeShims.add(locationShim);
-    }
+      ),
+    );
+    // Carries the timezone override, which workers re-read. The geolocation
+    // and WebRTC halves self-disable outside window scope.
+    workerScopeShims.add(locationShim);
 
     // Inject content blocker CSS at DOCUMENT_START so elements are hidden
     // before they ever render, eliminating the flash of unstyled content.
     if (config.contentBlockEnabled) {
-      final earlyScript = ContentBlockerService.instance.getEarlyCssScript(config.initialUrl);
+      final earlyScript = ContentBlockerService.instance.getEarlyCssScript(
+        config.initialUrl,
+      );
       if (earlyScript != null) {
-        userScripts.add(inapp.UserScript(
-          source: '$earlyScript\n;null;',
-          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        ));
+        userScripts.add(
+          inapp.UserScript(
+            source: '$earlyScript\n;null;',
+            injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          ),
+        );
       }
       // ABP $csp= rules. Engine-only — the Dart parser doesn't handle
       // them. <meta http-equiv> is the most portable path: works on
@@ -2004,13 +2274,17 @@ class WebViewFactory {
       // WKWebView doesn't expose). Browsers honour <meta> CSP as
       // equivalent to the header when injected before the first
       // resource fetch, which DOCUMENT_START is.
-      final cspDirectives =
-          ContentBlockerService.instance.cspFor(config.initialUrl);
+      final cspDirectives = ContentBlockerService.instance.cspFor(
+        config.initialUrl,
+      );
       if (cspDirectives != null && cspDirectives.isNotEmpty) {
-        final escaped =
-            cspDirectives.replaceAll('\\', '\\\\').replaceAll("'", "\\'");
-        userScripts.add(inapp.UserScript(
-          source: '''
+        final escaped = cspDirectives
+            .replaceAll('\\', '\\\\')
+            .replaceAll("'", "\\'");
+        userScripts.add(
+          inapp.UserScript(
+            source:
+                '''
 (function() {
   if (document.documentElement) {
     var m = document.createElement('meta');
@@ -2020,8 +2294,9 @@ class WebViewFactory {
   }
 })();
 ;null;''',
-          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        ));
+            injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          ),
+        );
       }
       // Phase 5: generic class/id cosmetic shim runs at DOCUMENT_END
       // (after the body is parseable but before late mutations land)
@@ -2029,25 +2304,29 @@ class WebViewFactory {
       // Only useful when the engine is active — otherwise the bridge
       // handler returns [] and the shim is a no-op.
       if (ContentBlockerService.instance.usingRustEngine) {
-        userScripts.add(inapp.UserScript(
-          source:
-              '${buildGenericCosmeticScannerShim()}\n;null;',
-          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_END,
-        ));
+        userScripts.add(
+          inapp.UserScript(
+            source: '${buildGenericCosmeticScannerShim()}\n;null;',
+            injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_END,
+          ),
+        );
         // Procedural actions: ##selector:has-text(...), :remove(),
         // :upward(N), :style(...), etc. Their selectors can't be
         // expressed in pure CSS, so they need an in-page runner.
         // The shim builder returns null when there are no procedural
         // rules for this URL (most pages — most rules are plain hides).
-        final procedural = ContentBlockerService.instance
-            .proceduralActionsFor(config.initialUrl);
+        final procedural = ContentBlockerService.instance.proceduralActionsFor(
+          config.initialUrl,
+        );
         if (procedural.isNotEmpty) {
           final shim = buildProceduralCosmeticShim(procedural);
           if (shim != null) {
-            userScripts.add(inapp.UserScript(
-              source: '$shim\n;null;',
-              injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_END,
-            ));
+            userScripts.add(
+              inapp.UserScript(
+                source: '$shim\n;null;',
+                injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_END,
+              ),
+            );
           }
         }
       }
@@ -2056,11 +2335,13 @@ class WebViewFactory {
     // ClearURLs: intercept clipboard writes and Web Share API to clean tracking
     // parameters from shared URLs before they leave the webview.
     if (config.clearUrlEnabled) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'clearurl_share',
-        source: '$_clearUrlShareScript\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      ));
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'clearurl_share',
+          source: '$_clearUrlShareScript\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      );
     }
 
     // Override navigator.language / navigator.languages so client-rendered
@@ -2068,14 +2349,16 @@ class WebViewFactory {
     // locale. The Accept-Language header alone doesn't reach JS-side locale
     // resolvers. Must run at DOCUMENT_START before the page's JS reads it.
     if (config.language != null) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'language_override',
-        source: '${buildLanguageShim(config.language!)}\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        // Must reach cross-origin iframes; otherwise a subframe reports the
-        // real OS locale, contradicting the spoofed top frame (fingerprint).
-        forMainFrameOnly: false,
-      ));
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'language_override',
+          source: '${buildLanguageShim(config.language!)}\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          // Must reach cross-origin iframes; otherwise a subframe reports the
+          // real OS locale, contradicting the spoofed top frame (fingerprint).
+          forMainFrameOnly: false,
+        ),
+      );
       workerScopeShims.add(buildLanguageShim(config.language!));
     }
 
@@ -2085,14 +2368,16 @@ class WebViewFactory {
     // gain nothing from it.
     final workerShim = buildWorkerShimScript(workerScopeShims);
     if (workerShim != null) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'worker_shim',
-        source: '$workerShim\n;null;',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-        // An iframe can create its own workers, so the patch must reach every
-        // frame the shims themselves reach.
-        forMainFrameOnly: false,
-      ));
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'worker_shim',
+          source: '$workerShim\n;null;',
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+          // An iframe can create its own workers, so the patch must reach every
+          // frame the shims themselves reach.
+          forMainFrameOnly: false,
+        ),
+      );
     }
 
     // Block stats: inject PerformanceObserver to report loaded resource
@@ -2103,10 +2388,11 @@ class WebViewFactory {
     // intent to visit the site, not on whether blocklists are populated.
     final hasDnsRules = DnsBlockService.instance.hasBlocklist;
     final hasAbpRules = ContentBlockerService.instance.hasRules;
-    if (!Platform.isAndroid && config.siteId != null) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'block_resource_observer',
-        source: '''
+    if (!hostIsAndroid && config.siteId != null) {
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'block_resource_observer',
+          source: '''
 (function() {
   // Per-host dedup. PerformanceObserver fires once per loaded resource;
   // a typical news page is hundreds of entries across ~30 hosts. We
@@ -2153,8 +2439,9 @@ class WebViewFactory {
   po.observe({type: 'navigation', buffered: true});
 })();
 ;null;''',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      ));
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      );
     }
 
     // iOS sub-resource blocking: JS interceptor with merged DNS+ABP
@@ -2172,13 +2459,14 @@ class WebViewFactory {
     // unique hosts and reports them via `blockResourceLoadedBatch` —
     // having both fire was double-counting hundreds of entries per
     // page.
-    if (!Platform.isAndroid
-        && config.siteId != null
-        && ((config.dnsBlockEnabled && hasDnsRules) ||
+    if (!hostIsAndroid &&
+        config.siteId != null &&
+        ((config.dnsBlockEnabled && hasDnsRules) ||
             (config.contentBlockEnabled && hasAbpRules))) {
-      userScripts.add(inapp.UserScript(
-        groupName: 'block_js_interceptor',
-        source: '''
+      userScripts.add(
+        inapp.UserScript(
+          groupName: 'block_js_interceptor',
+          source: '''
 (function() {
   var bloomReady = false;
   var bloomBits = null;
@@ -2538,8 +2826,9 @@ class WebViewFactory {
   startObserving();
 })();
 ;null;''',
-        injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
-      ));
+          injectionTime: inapp.UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      );
     }
 
     // User script injection: shim for external dependency resolution + scripts
@@ -2560,6 +2849,21 @@ class WebViewFactory {
     // URL bar and persisted currentUrl roll back to the referring page.
     // Initial-load fallback is handled inside the engine.
     String? lastStableUrl;
+
+    // URL of the main-frame navigation that just failed for a network
+    // reason; cleared when the next navigation starts. A failed load still
+    // commits the engine's own error page and still fires `onLoadStop`, so
+    // without this the HtmlCache save below serialises "connection
+    // refused" over the site's last-good snapshot — which is precisely
+    // what the offline path renders on the next cold start. Only the
+    // ordinary-failure branch of `onReceivedError` sets it; the external
+    // scheme paths there leave whatever the page managed to render intact
+    // and cacheable. Compared for null rather than against `onLoadStop`'s
+    // URL: platforms disagree on whether the settle reports the failing
+    // URL or the error-page URL, and skipping one save costs nothing (the
+    // next successful load writes the snapshot) while a missed match costs
+    // the snapshot itself.
+    String? failedNavUrl;
 
     // Monotonic counter bumped on every `shouldOverrideUrlLoading`
     // entry — i.e. every time chromium asks us about a new navigation,
@@ -2608,7 +2912,8 @@ class WebViewFactory {
     // same-base incognito sites then share it for the session, the correct
     // tradeoff for honoring ephemerality (the fork exposes no per-site
     // ephemeral profile).
-    final containerId = (ContainerNative.instance.cachedSupported &&
+    final containerId =
+        (ContainerNative.instance.cachedSupported &&
             containerSiteIdentifier != null &&
             !config.incognito)
         ? 'ws-$containerSiteIdentifier'
@@ -2626,151 +2931,267 @@ class WebViewFactory {
     // through to the app-global outbound proxy, so a site the user
     // hasn't customized still inherits a global Tor / corporate proxy.
     // Explicit per-site values win.
-    final effectiveProxy = (Platform.isIOS || Platform.isMacOS) &&
-            config.proxySettings != null
+    final effectiveProxy =
+        (hostIsIOS || hostIsMacOS) && config.proxySettings != null
         ? resolveEffectiveProxy(config.proxySettings!)
         : null;
-    final inappProxy =
-        effectiveProxy != null ? _userProxyToInappProxy(effectiveProxy) : null;
+    final inappProxy = effectiveProxy != null
+        ? _userProxyToInappProxy(effectiveProxy)
+        : null;
     // Fail closed: on iOS/macOS the per-site proxy is bound here via
     // `proxySettings`. If the site expects a non-DEFAULT proxy but the
     // address is malformed (e.g. a hand-edited backup that bypassed UI
     // validation), `_userProxyToInappProxy` returns null and the webview
     // would otherwise load over the device IP. Blank the initial load
     // instead of leaking.
-    final proxyUnavailable = effectiveProxy != null &&
+    final proxyUnavailable =
+        effectiveProxy != null &&
         effectiveProxy.type != ProxyType.DEFAULT &&
         inappProxy == null;
 
     LogService.instance.log(
       'DnsBlock',
-      'Creating webview: siteId=${config.siteId} dnsBlock=${config.dnsBlockEnabled} hasBlocklist=${DnsBlockService.instance.hasBlocklist} isAndroid=${Platform.isAndroid} url=${config.initialUrl} containerId=$containerId proxySettings=${inappProxy != null}',
+      'Creating webview: siteId=${config.siteId} dnsBlock=${config.dnsBlockEnabled} hasBlocklist=${DnsBlockService.instance.hasBlocklist} isAndroid=${hostIsAndroid} url=${config.initialUrl} containerId=$containerId proxySettings=${inappProxy != null}',
       sensitivity: LogSensitivity.sensitive,
     );
 
-    final settings = inapp.InAppWebViewSettings(
-      containerId: containerId,
-      proxySettings: inappProxy,
-    )
-      ..javaScriptEnabled = config.javascriptEnabled
-      ..userAgent = config.userAgent
-      // Sec-CH-UA*/navigator.userAgentData on Android come from a separate
-      // metadata object — not the UA string. Without this override the
-      // wire-level UA-CH headers contradict the spoofed UA. Silently
-      // ignored on iOS/macOS/Linux (no equivalent native API).
-      ..userAgentMetadata = buildUserAgentMetadata(config.userAgent)
-      // Folded under the Tracking Protection umbrella (Android only; the
-      // fork ignores both on iOS/macOS/Linux). When ETP is on: an empty
-      // allow-list suppresses the `X-Requested-With: <package>` header for
-      // every origin, and Attribution Reporting registration is disabled.
-      // When ETP is off, leave the native defaults untouched (null). For the
-      // Media Integrity API we keep it enabled-without-app-identity rather than
-      // fully disabling it: that preserves legitimate anti-fraud attestation
-      // while stripping the app package/signing identity that any origin
-      // (including non-DRM trackers) could otherwise read.
-      ..requestedWithHeaderOriginAllowList =
-          config.trackingProtectionEnabled ? const <String>{} : null
-      ..attributionRegistrationBehavior = config.trackingProtectionEnabled
-          ? inapp.AttributionBehavior.DISABLED
-          : null
-      ..webViewMediaIntegrityApiStatus = config.trackingProtectionEnabled
-          ? inapp.WebViewMediaIntegrityApiStatus.ENABLED_WITHOUT_APP_IDENTITY
-          : null
-      // Global perf pref; same value on every WebView, nested included.
-      ..backForwardCacheEnabled = WebViewFactory.backForwardCacheEnabled
-      ..thirdPartyCookiesEnabled = config.thirdPartyCookiesEnabled
-      ..incognito = config.incognito
-      ..textZoom = textZoom
-      ..supportZoom = true
-      ..useShouldOverrideUrlLoading = true
-      // Keep the Dart shouldInterceptRequest callback disabled on Android:
-      // the native FastSubresourceInterceptor handles DNS blocking and
-      // LocalCDN replacement for every sub-resource, whereas the Dart
-      // callback only fires for main-document navigations on modern
-      // Chromium WebView.
-      ..useShouldInterceptRequest = false
-      ..useShouldInterceptAjaxRequest = false
-      ..useShouldInterceptFetchRequest = false
-      ..useOnLoadResource = false
-      ..supportMultipleWindows = true
-      // Required for Cloudflare Turnstile and other challenge systems
-      ..domStorageEnabled = true
-      ..databaseEnabled = true
-      ..javaScriptCanOpenWindowsAutomatically = true
-      // Android: allow file and content access for Cloudflare Turnstile
-      ..allowFileAccess = true
-      ..allowContentAccess = true
-      // Enable browser-level resource caching for offline sub-resource loading
-      ..cacheEnabled = true
-      // When cached HTML is used, set cache-first mode from the start so
-      // sub-resources (CSS/JS/images) resolve from browser cache immediately
-      ..cacheMode = usesCachedHtml ? inapp.CacheMode.LOAD_CACHE_ELSE_NETWORK : null
-      // iOS: play videos inline instead of auto-fullscreen
-      ..allowsInlineMediaPlayback = true
-      // iOS/macOS: native Safari-style horizontal swipe for back/forward.
-      // Only the root site webview opts in (see WebViewConfig.backForwardGestures).
-      ..allowsBackForwardNavigationGestures = config.backForwardGestures
-      // Required for onDownloadStartRequest to fire when the webview
-      // navigates to a downloadable response (Content-Disposition:
-      // attachment, or an unrecognized MIME type). Without this, the
-      // webview silently drops the navigation and the user sees nothing.
-      ..useOnDownloadStart = true
-      // Desktop content mode mirrors the per-site UA: a desktop-shaped UA
-      // turns on the plugin's `setDesktopMode(true)` path, which flips
-      // useWideViewPort + loadWithOverviewMode + zoom on Android and
-      // WKWebpagePreferences.preferredContentMode = .desktop on iOS. The
-      // shim above handles the JS-side touch / userAgentData patches.
-      ..preferredContentMode = desktopMode
-          ? inapp.UserPreferredContentMode.DESKTOP
-          : inapp.UserPreferredContentMode.RECOMMENDED
-      // Enable DevTools inspection in debug mode (chrome://inspect on Android)
-      ..isInspectable = kDebugMode;
+    final settings =
+        inapp.InAppWebViewSettings(
+            containerId: containerId,
+            proxySettings: inappProxy,
+          )
+          ..javaScriptEnabled = config.javascriptEnabled
+          ..userAgent = config.userAgent
+          // Sec-CH-UA*/navigator.userAgentData on Android come from a separate
+          // metadata object — not the UA string. Without this override the
+          // wire-level UA-CH headers contradict the spoofed UA. Silently
+          // ignored on iOS/macOS/Linux (no equivalent native API).
+          ..userAgentMetadata = buildUserAgentMetadata(config.userAgent)
+          // Folded under the Tracking Protection umbrella (Android only; the
+          // fork ignores both on iOS/macOS/Linux). When ETP is on: an empty
+          // allow-list suppresses the `X-Requested-With: <package>` header for
+          // every origin, and Attribution Reporting registration is disabled.
+          // When ETP is off, leave the native defaults untouched (null). For the
+          // Media Integrity API we keep it enabled-without-app-identity rather than
+          // fully disabling it: that preserves legitimate anti-fraud attestation
+          // while stripping the app package/signing identity that any origin
+          // (including non-DRM trackers) could otherwise read.
+          ..requestedWithHeaderOriginAllowList =
+              config.trackingProtectionEnabled ? const <String>{} : null
+          ..attributionRegistrationBehavior = config.trackingProtectionEnabled
+              ? inapp.AttributionBehavior.DISABLED
+              : null
+          ..webViewMediaIntegrityApiStatus = config.trackingProtectionEnabled
+              ? inapp
+                    .WebViewMediaIntegrityApiStatus
+                    .ENABLED_WITHOUT_APP_IDENTITY
+              : null
+          // Global perf pref; same value on every WebView, nested included.
+          ..backForwardCacheEnabled = WebViewFactory.backForwardCacheEnabled
+          ..thirdPartyCookiesEnabled = config.thirdPartyCookiesEnabled
+          ..incognito = config.incognito
+          ..textZoom = textZoom
+          ..supportZoom = true
+          ..useShouldOverrideUrlLoading = true
+          // Keep the Dart shouldInterceptRequest callback disabled on Android:
+          // the native FastSubresourceInterceptor handles DNS blocking and
+          // LocalCDN replacement for every sub-resource, whereas the Dart
+          // callback only fires for main-document navigations on modern
+          // Chromium WebView.
+          ..useShouldInterceptRequest = false
+          ..useShouldInterceptAjaxRequest = false
+          ..useShouldInterceptFetchRequest = false
+          ..useOnLoadResource = false
+          ..supportMultipleWindows = true
+          // Required for Cloudflare Turnstile and other challenge systems
+          ..domStorageEnabled = true
+          ..databaseEnabled = true
+          ..javaScriptCanOpenWindowsAutomatically = true
+          // Android: allow file and content access for Cloudflare Turnstile
+          ..allowFileAccess = true
+          ..allowContentAccess = true
+          // Enable browser-level resource caching for offline sub-resource loading
+          ..cacheEnabled = true
+          // When cached HTML is used, set cache-first mode from the start so
+          // sub-resources (CSS/JS/images) resolve from browser cache immediately
+          ..cacheMode = usesCachedHtml
+              ? inapp.CacheMode.LOAD_CACHE_ELSE_NETWORK
+              : null
+          // iOS: play videos inline instead of auto-fullscreen
+          ..allowsInlineMediaPlayback = true
+          // Allow media to start without a direct tap. Android WebView defaults
+          // this to true, which blocks ALL autoplay — including a getUserMedia
+          // MediaStream assigned to a `<video autoplay>` (real OR the virtual
+          // camera), so a QR-scan page just shows a grey frame. Every real
+          // browser plays a camera stream without a gesture; match that. This is
+          // Android-WebView-specific: the setting doesn't exist in the Chromium
+          // that the desktop test tier drives, which is why the browser test
+          // couldn't catch it.
+          ..mediaPlaybackRequiresUserGesture = false
+          // iOS/macOS: native Safari-style horizontal swipe for back/forward.
+          // Only the root site webview opts in (see WebViewConfig.backForwardGestures).
+          ..allowsBackForwardNavigationGestures = config.backForwardGestures
+          // Required for onDownloadStartRequest to fire when the webview
+          // navigates to a downloadable response (Content-Disposition:
+          // attachment, or an unrecognized MIME type). Without this, the
+          // webview silently drops the navigation and the user sees nothing.
+          ..useOnDownloadStart = true
+          // Desktop content mode mirrors the per-site UA: a desktop-shaped UA
+          // turns on the plugin's `setDesktopMode(true)` path, which flips
+          // useWideViewPort + loadWithOverviewMode + zoom on Android and
+          // WKWebpagePreferences.preferredContentMode = .desktop on iOS. The
+          // shim above handles the JS-side touch / userAgentData patches.
+          ..preferredContentMode = desktopMode
+              ? inapp.UserPreferredContentMode.DESKTOP
+              : inapp.UserPreferredContentMode.RECOMMENDED
+          // Enable DevTools inspection in debug mode (chrome://inspect on Android)
+          ..isInspectable = kDebugMode;
+
+    // Android honours the viewport meta's layout width (and thus the page
+    // zoom) only when useWideViewPort is on: with it off, Chromium's
+    // AdjustForAndroidWebViewQuirks clamps the layout back to device width
+    // and resets the scale to 1 below 100%. The shim pairs with this by
+    // spelling the width out, which keeps the same quirk's wide-viewport
+    // branch (the 980px UA fallback, i.e. every site's desktop layout) out
+    // of the path. loadWithOverviewMode must stay off so the WebView
+    // respects our `initial-scale` rather than fitting the page to width.
+    // Desktop-mode already flips these via preferredContentMode = DESKTOP.
+    if (zoomPlan.needsWideViewPort) {
+      settings.useWideViewPort = true;
+      settings.loadWithOverviewMode = false;
+    }
 
     final inapp.InAppWebView webViewWidget = inapp.InAppWebView(
       key: config.key,
-      initialUrlRequest: (renderInitialData || suppressInitialLoad) ? null : inapp.URLRequest(
-        url: inapp.WebUri(proxyUnavailable ? 'about:blank' : config.initialUrl),
-        headers: proxyUnavailable || headers.isEmpty ? null : headers,
-      ),
-      initialData: renderInitialData ? inapp.InAppWebViewInitialData(
-        data: config.initialHtml ?? buildFileImportFallbackHtml(config.initialUrl),
-        mimeType: 'text/html',
-        encoding: 'utf-8',
-        baseUrl: inapp.WebUri(config.initialUrl),
-      ) : null,
+      initialUrlRequest: (renderInitialData || suppressInitialLoad)
+          ? null
+          : inapp.URLRequest(
+              url: inapp.WebUri(
+                proxyUnavailable ? 'about:blank' : config.initialUrl,
+              ),
+              headers: proxyUnavailable || headers.isEmpty ? null : headers,
+            ),
+      initialData: renderInitialData
+          ? inapp.InAppWebViewInitialData(
+              data:
+                  config.initialHtml ??
+                  buildFileImportFallbackHtml(config.initialUrl),
+              mimeType: 'text/html',
+              encoding: 'utf-8',
+              baseUrl: inapp.WebUri(config.initialUrl),
+            )
+          : null,
       pullToRefreshController: config.pullToRefreshController,
       initialUserScripts: UnmodifiableListView(userScripts),
       initialSettings: settings,
-      // Protected-media (Widevine/EME) permission. Only installed on
-      // Android, where `PROTECTED_MEDIA_ID` exists and the no-handler
-      // default is deny; granting it lets the origin run EME license
-      // requests (e.g. the Spotify web player). The handler grants ONLY
-      // the protected-media resource and returns PROMPT for anything else
-      // (camera/mic) so it never widens permissions beyond DRM. Left null
-      // off-Android so iOS/macOS keep their native PROMPT default.
+      // Web permission requests. Two per-site flows route through here:
+      //
+      // - Protected media (Android only): granting `PROTECTED_MEDIA_ID`
+      //   lets the origin run EME license requests (e.g. the Spotify web
+      //   player).
+      // - Camera: a camera-only request (getUserMedia video, e.g. a banking
+      //   site's QR scanner). In `virtual` mode the camera-stream shim
+      //   intercepts getUserMedia in JS and this native request never fires,
+      //   so reaching here means the shim decided `real` (or is absent) and
+      //   called through to the platform. We resolve the decision and grant
+      //   only for `real`, additionally ensuring the app-level CAMERA
+      //   runtime permission on Android. Requests that bundle the microphone
+      //   (iOS/macOS report the single resource CAMERA_AND_MICROPHONE,
+      //   Android CAMERA+MICROPHONE) never reach the camera flow.
+      // - Microphone: denied outright whenever the microphone resolver is
+      //   wired. Audio capture is served entirely in JS from a user-picked
+      //   clip, so nothing downstream needs an OS recording permission, and
+      //   an explicit DENY keeps WebKit from raising its own prompt on
+      //   iOS/macOS (Android/Linux would deny anyway). This covers the
+      //   combined camera+microphone request too: the shim splits it and
+      //   re-issues the video half on its own, so what arrives here is
+      //   either camera-only or a request the page must not get.
+      //
+      // The fallback returns PROMPT for everything else: Android and Linux
+      // WPE map any non-GRANT action to deny (their no-handler default),
+      // iOS 15+/macOS 12+ show WebKit's own per-site prompt.
       onPermissionRequest:
-          (Platform.isAndroid && config.onProtectedMediaRequest != null)
-              ? (controller, request) async {
-                  final wantsProtectedMedia = request.resources.contains(
-                      inapp.PermissionResourceType.PROTECTED_MEDIA_ID);
-                  if (wantsProtectedMedia) {
-                    final granted = await config.onProtectedMediaRequest!(
-                        request.origin.toString());
-                    return inapp.PermissionResponse(
-                      resources: [
-                        inapp.PermissionResourceType.PROTECTED_MEDIA_ID
-                      ],
-                      action: granted
-                          ? inapp.PermissionResponseAction.GRANT
-                          : inapp.PermissionResponseAction.DENY,
-                    );
-                  }
-                  return inapp.PermissionResponse(
-                    resources: request.resources,
-                    action: inapp.PermissionResponseAction.PROMPT,
+          ((hostIsAndroid && config.onProtectedMediaRequest != null) ||
+              config.onCameraDecision != null ||
+              config.onMicrophoneDecision != null)
+          ? (controller, request) async {
+              final wantsProtectedMedia =
+                  hostIsAndroid &&
+                  config.onProtectedMediaRequest != null &&
+                  request.resources.contains(
+                    inapp.PermissionResourceType.PROTECTED_MEDIA_ID,
                   );
+              if (wantsProtectedMedia) {
+                final granted = await config.onProtectedMediaRequest!(
+                  request.origin.toString(),
+                );
+                return inapp.PermissionResponse(
+                  resources: [inapp.PermissionResourceType.PROTECTED_MEDIA_ID],
+                  action: granted
+                      ? inapp.PermissionResponseAction.GRANT
+                      : inapp.PermissionResponseAction.DENY,
+                );
+              }
+              // No native path ever grants audio capture: with the resolver
+              // wired, a microphone request reaching this point means the JS
+              // shim did not serve it, and falling through to PROMPT would
+              // let WebKit ask for the real device.
+              if (config.onMicrophoneDecision != null &&
+                  (request.resources.contains(
+                        inapp.PermissionResourceType.MICROPHONE,
+                      ) ||
+                      request.resources.contains(
+                        inapp.PermissionResourceType.CAMERA_AND_MICROPHONE,
+                      ))) {
+                return inapp.PermissionResponse(
+                  resources: request.resources,
+                  action: inapp.PermissionResponseAction.DENY,
+                );
+              }
+              final wantsCameraOnly =
+                  config.onCameraDecision != null &&
+                  request.resources.length == 1 &&
+                  request.resources.contains(
+                    inapp.PermissionResourceType.CAMERA,
+                  );
+              if (wantsCameraOnly) {
+                final decision = await config.onCameraDecision!(
+                  request.origin.toString(),
+                );
+                bool granted = decision.mode == CameraAccessMode.real;
+                if (granted) {
+                  granted = await CameraPermissionService.ensurePermission();
                 }
-              : null,
+                return inapp.PermissionResponse(
+                  resources: [inapp.PermissionResourceType.CAMERA],
+                  action: granted
+                      ? inapp.PermissionResponseAction.GRANT
+                      : inapp.PermissionResponseAction.DENY,
+                );
+              }
+              return inapp.PermissionResponse(
+                resources: request.resources,
+                action: inapp.PermissionResponseAction.PROMPT,
+              );
+            }
+          : null,
+      // Android's WebChromeClient asks the app before the WebView reaches the
+      // OS location service. Always deny: no mode needs this path. `off`,
+      // `spoof` and a coordinate-less site are refused by the shim, and `live`
+      // is served through the `getRealLocation` bridge, which applies the
+      // site's granularity snapping before the fix leaves Dart. Granting here
+      // would hand a live site the raw platform fix and silently bypass the
+      // approximate/GSM tiers.
+      //
+      // The plugin already denies when this is unset, but that is its default
+      // rather than our contract; wiring it makes a dependency bump unable to
+      // turn pass-through back on. Android-only, ignored elsewhere.
+      onGeolocationPermissionsShowPrompt: (controller, origin) async =>
+          inapp.GeolocationPermissionShowPromptResponse(
+            origin: origin,
+            allow: false,
+            retain: false,
+          ),
       onWebViewCreated: (controller) async {
         final wrappedController = _WebViewController(controller);
         onControllerCreated(wrappedController);
@@ -2791,8 +3212,8 @@ class WebViewFactory {
           // before the page sees it.
           final requestAccuracy =
               config.liveLocationGranularity == LocationGranularity.gsm
-                  ? LocationAccuracy.coarse
-                  : LocationAccuracy.fine;
+              ? LocationAccuracy.coarse
+              : LocationAccuracy.fine;
           controller.addJavaScriptHandler(
             handlerName: 'getRealLocation',
             callback: (args) async {
@@ -2826,14 +3247,82 @@ class WebViewFactory {
             },
           );
         }
+        // Virtual camera bridge: the camera-stream shim calls this on the
+        // first video-only getUserMedia to learn the site's decision. The
+        // model wrapper resolves it (short-circuiting a settled mode,
+        // coalescing a burst, showing the Allow/Use-file/Block popup or the
+        // file-pick only when unresolved) and returns {mode, source?}. Null
+        // callback -> the shim isn't injected either, so this is never hit.
+        if (config.onCameraDecision != null) {
+          controller.addJavaScriptHandler(
+            handlerName: 'webCameraRequest',
+            callback: (args) async {
+              final origin =
+                  (args.isNotEmpty &&
+                      args[0] is String &&
+                      (args[0] as String).isNotEmpty)
+                  ? args[0] as String
+                  : config.initialUrl;
+              final decision = await config.onCameraDecision!(origin);
+              return decision.toBridgeJson();
+            },
+          );
+          // Non-prompting mode read for the shim's enumerateDevices branch.
+          controller.addJavaScriptHandler(
+            handlerName: 'webCameraMode',
+            callback: (args) =>
+                (config.currentCameraMode?.call() ?? CameraAccessMode.ask).name,
+          );
+        }
+        // Virtual microphone bridge: the microphone-stream shim calls this on
+        // the first getUserMedia that asks for audio, to learn the site's
+        // decision. The model wrapper resolves it (short-circuiting a settled
+        // mode, coalescing a burst, showing the Block/Use-audio-file popup or
+        // the file-pick only when unresolved) and returns {mode, source?}.
+        // Null callback -> the shim isn't injected either, so this is never
+        // hit.
+        if (config.onMicrophoneDecision != null) {
+          controller.addJavaScriptHandler(
+            handlerName: 'webMicrophoneRequest',
+            callback: (args) async {
+              final origin =
+                  (args.isNotEmpty &&
+                      args[0] is String &&
+                      (args[0] as String).isNotEmpty)
+                  ? args[0] as String
+                  : config.initialUrl;
+              final decision = await config.onMicrophoneDecision!(origin);
+              return decision.toBridgeJson();
+            },
+          );
+          // Non-prompting mode read for the shim's enumerateDevices branch.
+          controller.addJavaScriptHandler(
+            handlerName: 'webMicrophoneMode',
+            callback: (args) =>
+                (config.currentMicrophoneMode?.call() ??
+                        MicrophoneAccessMode.ask)
+                    .name,
+          );
+        }
         // Register ClearURLs handler for clipboard/share URL cleaning
         if (config.clearUrlEnabled) {
-          controller.addJavaScriptHandler(handlerName: 'clearUrl', callback: (args) {
-            if (args.isNotEmpty && args[0] is String) {
-              return ClearUrlService.instance.cleanUrl(args[0] as String);
-            }
-            return args.isNotEmpty ? args[0] : '';
-          });
+          controller.addJavaScriptHandler(
+            handlerName: 'clearUrl',
+            callback: (args) {
+              if (args.isNotEmpty && args[0] is String) {
+                final original = args[0] as String;
+                final cleaned = ClearUrlService.instance.cleanUrl(original);
+                if (cleaned != original && config.siteId != null) {
+                  BlockStatsService.instance.record(
+                    config.siteId!,
+                    BlockCategory.trackingParam,
+                  );
+                }
+                return cleaned;
+              }
+              return args.isNotEmpty ? args[0] : '';
+            },
+          );
         }
         // Block stats: register handler for resource observer JS. Always
         // register when siteId is set so allowed requests are tallied
@@ -2846,123 +3335,159 @@ class WebViewFactory {
           // page lifetime and flushes batches every 250ms (or 64 hosts).
           // Each host walks the blocklists once and gets a single log
           // entry — no per-URL Dart roundtrip.
-          controller.addJavaScriptHandler(handlerName: 'blockResourceLoadedBatch', callback: (args) {
-            if (args.isEmpty || args[0] is! List) return null;
-            final hosts = args[0] as List;
-            final dnsSvc = DnsBlockService.instance;
-            final abpSvc = ContentBlockerService.instance;
-            for (final h in hosts) {
-              if (h is! String || h.isEmpty) continue;
-              final dnsBlocked =
-                  config.dnsBlockEnabled && dnsSvc.isHostBlocked(h);
-              final abpBlocked = !dnsBlocked &&
-                  config.contentBlockEnabled &&
-                  abpSvc.isHostBlocked(h);
-              final blocked = dnsBlocked || abpBlocked;
-              final source = dnsBlocked
-                  ? BlockSource.dns
-                  : (abpBlocked ? BlockSource.abp : null);
-              dnsSvc.recordHostRequest(config.siteId!, h, blocked, source: source);
-            }
-            return null;
-          });
+          controller.addJavaScriptHandler(
+            handlerName: 'blockResourceLoadedBatch',
+            callback: (args) {
+              if (args.isEmpty || args[0] is! List) return null;
+              final hosts = args[0] as List;
+              final dnsSvc = DnsBlockService.instance;
+              final abpSvc = ContentBlockerService.instance;
+              for (final h in hosts) {
+                if (h is! String || h.isEmpty) continue;
+                final dnsBlocked =
+                    config.dnsBlockEnabled && dnsSvc.isHostBlocked(h);
+                final abpBlocked =
+                    !dnsBlocked &&
+                    config.contentBlockEnabled &&
+                    abpSvc.isHostBlocked(h);
+                final blocked = dnsBlocked || abpBlocked;
+                final source = dnsBlocked
+                    ? BlockSource.dns
+                    : (abpBlocked ? BlockSource.abp : null);
+                dnsSvc.recordHostRequest(
+                  config.siteId!,
+                  h,
+                  blocked,
+                  source: source,
+                );
+              }
+              return null;
+            },
+          );
           // Backwards-compat: legacy single-URL report path. The JS
           // interceptor no longer fires this, but stale injected scripts
           // (cached service workers, in-page bookmarklets) might. Treat
           // it the same as a one-host batch.
-          controller.addJavaScriptHandler(handlerName: 'blockResourceLoaded', callback: (args) {
-            if (args.isEmpty || args[0] is! String) return null;
-            final url = args[0] as String;
-            final dnsBlocked = config.dnsBlockEnabled &&
-                DnsBlockService.instance.isBlocked(url);
-            // Pass the page URL as sourceUrl so the engine can fire
-            // `$domain=` rules. lastLoadStartUrl is the most recent
-            // URL that triggered onLoadStart — the page hosting this
-            // sub-resource. Empty fallback degrades to host-only
-            // matching which still works for plain `||domain^` rules.
-            final abpBlocked = !dnsBlocked &&
-                config.contentBlockEnabled &&
-                ContentBlockerService.instance.isBlocked(
-                  url,
-                  sourceUrl: lastLoadStartUrl ?? '',
-                );
-            final blocked = dnsBlocked || abpBlocked;
-            final source = dnsBlocked
-                ? BlockSource.dns
-                : (abpBlocked ? BlockSource.abp : null);
-            DnsBlockService.instance
-                .recordRequest(config.siteId!, url, blocked, source: source);
-            return null;
-          });
+          controller.addJavaScriptHandler(
+            handlerName: 'blockResourceLoaded',
+            callback: (args) {
+              if (args.isEmpty || args[0] is! String) return null;
+              final url = args[0] as String;
+              final dnsBlocked =
+                  config.dnsBlockEnabled &&
+                  DnsBlockService.instance.isBlocked(url);
+              // Pass the page URL as sourceUrl so the engine can fire
+              // `$domain=` rules. lastLoadStartUrl is the most recent
+              // URL that triggered onLoadStart — the page hosting this
+              // sub-resource. Empty fallback degrades to host-only
+              // matching which still works for plain `||domain^` rules.
+              final abpBlocked =
+                  !dnsBlocked &&
+                  config.contentBlockEnabled &&
+                  ContentBlockerService.instance.isBlocked(
+                    url,
+                    sourceUrl: lastLoadStartUrl ?? '',
+                  );
+              final blocked = dnsBlocked || abpBlocked;
+              final source = dnsBlocked
+                  ? BlockSource.dns
+                  : (abpBlocked ? BlockSource.abp : null);
+              DnsBlockService.instance.recordRequest(
+                config.siteId!,
+                url,
+                blocked,
+                source: source,
+              );
+              return null;
+            },
+          );
           // iOS sub-resource blocking: per-URL check from JS interceptor.
           // Only the bloom-hit minority of requests hits this path.
-          if (!Platform.isAndroid) {
-            controller.addJavaScriptHandler(handlerName: 'blockCheck', callback: (args) {
-              // Return value contract for the JS shim:
-              //   false       — allow (call origSet / origFetch as-is)
-              //   true        — block (drop the request)
-              //   String      — block + redirect; the string is a
-              //                 `data:` URL the shim should swap the
-              //                 request URL with so the page sees the
-              //                 neutered uBO stub body instead of an
-              //                 empty 200. Maintains stats parity:
-              //                 we still record the block before
-              //                 returning the redirect URL.
-              if (args.isEmpty || args[0] is! String) return false;
-              final url = args[0] as String;
-              final dnsSvc = DnsBlockService.instance;
-              final abpSvc = ContentBlockerService.instance;
-              // Consult the ABP engine up front (not after a DNS early
-              // return) so the engine decision is recorded for the ABP
-              // dev-tools stats even when the DNS list also blocks this
-              // host. Otherwise, with a DNS blocklist on, the engine is
-              // never asked about the hosts both lists share and the ABP
-              // tab reads zero blocks. sourceUrl is the hosting page so
-              // `$domain=` modifiers apply.
-              final abpBlocked = config.contentBlockEnabled &&
-                  abpSvc.isBlocked(url, sourceUrl: lastLoadStartUrl ?? '');
-              if (config.dnsBlockEnabled && dnsSvc.isBlocked(url)) {
-                dnsSvc.recordRequest(config.siteId!, url, true,
-                    source: BlockSource.dns);
-                return true;
-              }
-              if (abpBlocked) {
-                dnsSvc.recordRequest(config.siteId!, url, true,
-                    source: BlockSource.abp);
-                // Try the engine's $redirect= lookup. Only meaningful
-                // when the engine is on; returns null otherwise.
-                final redirect = abpSvc.redirectFor(
-                  url,
-                  sourceUrl: lastLoadStartUrl ?? '',
-                );
-                return redirect ?? true;
-              }
-              dnsSvc.recordRequest(config.siteId!, url, false);
-              return false;
-            });
+          if (!hostIsAndroid) {
+            controller.addJavaScriptHandler(
+              handlerName: 'blockCheck',
+              callback: (args) {
+                // Return value contract for the JS shim:
+                //   false       — allow (call origSet / origFetch as-is)
+                //   true        — block (drop the request)
+                //   String      — block + redirect; the string is a
+                //                 `data:` URL the shim should swap the
+                //                 request URL with so the page sees the
+                //                 neutered uBO stub body instead of an
+                //                 empty 200. Maintains stats parity:
+                //                 we still record the block before
+                //                 returning the redirect URL.
+                if (args.isEmpty || args[0] is! String) return false;
+                final url = args[0] as String;
+                final dnsSvc = DnsBlockService.instance;
+                final abpSvc = ContentBlockerService.instance;
+                // Consult the ABP engine up front (not after a DNS early
+                // return) so the engine decision is recorded for the ABP
+                // dev-tools stats even when the DNS list also blocks this
+                // host. Otherwise, with a DNS blocklist on, the engine is
+                // never asked about the hosts both lists share and the ABP
+                // tab reads zero blocks. sourceUrl is the hosting page so
+                // `$domain=` modifiers apply.
+                final abpBlocked =
+                    config.contentBlockEnabled &&
+                    abpSvc.isBlocked(url, sourceUrl: lastLoadStartUrl ?? '');
+                if (config.dnsBlockEnabled && dnsSvc.isBlocked(url)) {
+                  dnsSvc.recordRequest(
+                    config.siteId!,
+                    url,
+                    true,
+                    source: BlockSource.dns,
+                  );
+                  return true;
+                }
+                if (abpBlocked) {
+                  dnsSvc.recordRequest(
+                    config.siteId!,
+                    url,
+                    true,
+                    source: BlockSource.abp,
+                  );
+                  // Try the engine's $redirect= lookup. Only meaningful
+                  // when the engine is on; returns null otherwise.
+                  final redirect = abpSvc.redirectFor(
+                    url,
+                    sourceUrl: lastLoadStartUrl ?? '',
+                  );
+                  return redirect ?? true;
+                }
+                dnsSvc.recordRequest(config.siteId!, url, false);
+                return false;
+              },
+            );
             // One-shot merged Bloom filter + global domain cache delivery to JS
-            controller.addJavaScriptHandler(handlerName: 'getBlockBloom', callback: (args) {
-              final map = Map<String, dynamic>.from(
-                  DnsBlockService.instance.getMergedBlockBloom().toMap());
-              map['cache'] = DnsBlockService.instance.getDomainCache();
-              // Second bloom for hostless ABP network rules (path rules
-              // the host bloom can't prefilter). Only when the site has
-              // content blocking on — these are ABP-only.
-              final cb = ContentBlockerService.instance;
-              final tokenBloom =
-                  config.contentBlockEnabled ? cb.genericNetworkTokenBloom : null;
-              final fallback =
-                  config.contentBlockEnabled && cb.hasUntokenizableNetworkRules;
-              if (tokenBloom != null) {
-                final tm = tokenBloom.toMap();
-                map['tokenBits'] = tm['bits'];
-                map['tokenBitCount'] = tm['bitCount'];
-                map['tokenK'] = tm['k'];
-              }
-              map['genericFallback'] = fallback;
-              map['hasGeneric'] = tokenBloom != null || fallback;
-              return map;
-            });
+            controller.addJavaScriptHandler(
+              handlerName: 'getBlockBloom',
+              callback: (args) {
+                final map = Map<String, dynamic>.from(
+                  DnsBlockService.instance.getMergedBlockBloom().toMap(),
+                );
+                map['cache'] = DnsBlockService.instance.getDomainCache();
+                // Second bloom for hostless ABP network rules (path rules
+                // the host bloom can't prefilter). Only when the site has
+                // content blocking on — these are ABP-only.
+                final cb = ContentBlockerService.instance;
+                final tokenBloom = config.contentBlockEnabled
+                    ? cb.genericNetworkTokenBloom
+                    : null;
+                final fallback =
+                    config.contentBlockEnabled &&
+                    cb.hasUntokenizableNetworkRules;
+                if (tokenBloom != null) {
+                  final tm = tokenBloom.toMap();
+                  map['tokenBits'] = tm['bits'];
+                  map['tokenBitCount'] = tm['bitCount'];
+                  map['tokenK'] = tm['k'];
+                }
+                map['genericFallback'] = fallback;
+                map['hasGeneric'] = tokenBloom != null || fallback;
+                return map;
+              },
+            );
           }
           // Phase 5: generic-cosmetic class/id lookup. The page-side
           // shim from generic_cosmetic_shim.dart scans the loaded DOM
@@ -2985,12 +3510,12 @@ class WebViewFactory {
               final ids = (payload['ids'] as List? ?? const [])
                   .cast<String>()
                   .toSet();
-              final selectors =
-                  ContentBlockerService.instance.genericCosmeticSelectorsFor(
-                pageUrl: config.initialUrl,
-                classes: classes,
-                ids: ids,
-              );
+              final selectors = ContentBlockerService.instance
+                  .genericCosmeticSelectorsFor(
+                    pageUrl: config.initialUrl,
+                    classes: classes,
+                    ids: ids,
+                  );
               if (selectors.isNotEmpty) {
                 final preview = selectors.take(8).join(', ');
                 LogService.instance.log(
@@ -3027,8 +3552,10 @@ class WebViewFactory {
                   .cast<String>();
               final liveUrl =
                   (await controller.getUrl())?.toString() ?? config.initialUrl;
-              final status =
-                  svc.cosmeticDiagnostics(liveUrl, canaryClasses: canaries);
+              final status = svc.cosmeticDiagnostics(
+                liveUrl,
+                canaryClasses: canaries,
+              );
               final netVerdicts = <String, bool>{
                 for (final h in hosts) h: svc.isHostBlocked(h),
               };
@@ -3064,12 +3591,45 @@ class WebViewFactory {
             },
           );
         }
+        if (config.siteId != null &&
+            config.backgroundAudioEnabled &&
+            MediaSessionService.instance.isSupported) {
+          controller.addJavaScriptHandler(
+            handlerName: 'wsMediaSession',
+            callback: (args) async {
+              if (args.isEmpty || args[0] is! Map) return null;
+              final data = Map<String, dynamic>.from(args[0] as Map);
+              final control = data['control'] as String?;
+              if (control != null) {
+                await MediaSessionService.instance.reportControlFailure(
+                  action: control,
+                  error: data['error'] as String? ?? 'unknown',
+                );
+                return null;
+              }
+              await MediaSessionService.instance.report(
+                siteId: config.siteId!,
+                frame: data['frame'] as String? ?? '',
+                runJs: (js) => controller.evaluateJavascript(source: js),
+                playing: data['playing'] as bool? ?? false,
+                title: data['title'] as String? ?? '',
+                artist: data['artist'] as String? ?? '',
+                album: data['album'] as String? ?? '',
+                artworkUrl: data['artwork'] as String? ?? '',
+              );
+              return null;
+            },
+          );
+        }
         if (config.siteId != null) {
           controller.addJavaScriptHandler(
             handlerName: 'webNotificationRequestPermission',
             callback: (args) {
               final result = config.notificationsEnabled ? 'granted' : 'denied';
-              LogService.instance.log('Notification', 'requestPermission handler called, returning: $result');
+              LogService.instance.log(
+                'Notification',
+                'requestPermission handler called, returning: $result',
+              );
               return result;
             },
           );
@@ -3098,17 +3658,18 @@ class WebViewFactory {
                 mimeType: mimeType.isEmpty ? null : mimeType,
               );
               if (taskId.isNotEmpty) {
-                DownloadsService.instance.updateProgress(taskId,
-                    bytesDone: result.bytes.length,
-                    bytesTotal: result.bytes.length);
+                DownloadsService.instance.updateProgress(
+                  taskId,
+                  bytesDone: result.bytes.length,
+                  bytesTotal: result.bytes.length,
+                );
               }
               final saved = await _saveViaPicker(result);
               if (taskId.isNotEmpty) {
                 if (saved == null) {
                   DownloadsService.instance.cancel(taskId);
                 } else {
-                  DownloadsService.instance
-                      .complete(taskId, savedPath: saved);
+                  DownloadsService.instance.complete(taskId, savedPath: saved);
                 }
               }
             } on DownloadException catch (e) {
@@ -3184,7 +3745,7 @@ class WebViewFactory {
             return null;
           },
         );
-        if (Platform.isAndroid) {
+        if (hostIsAndroid) {
           controller.addJavaScriptHandler(
             handlerName: '_webspaceHttpDownloadStart',
             callback: (args) async {
@@ -3246,7 +3807,7 @@ class WebViewFactory {
         // handler no-ops cheaply when neither blocklist nor CDN cache are
         // populated, and the references are shared with the plugin so
         // subsequent updates are picked up without re-attaching.
-        if (Platform.isAndroid) {
+        if (hostIsAndroid) {
           // Track attach attempts so we can correlate with the
           // native-side "attachToAllWebViews" log. Phase 14: helps
           // debug the case where Android sub-resources aren't blocked
@@ -3258,7 +3819,9 @@ class WebViewFactory {
             level: LogLevel.debug,
             sensitivity: LogSensitivity.sensitive,
           );
-          Future.microtask(() => WebInterceptNative.attachToWebViews(siteId: config.siteId));
+          Future.microtask(
+            () => WebInterceptNative.attachToWebViews(siteId: config.siteId),
+          );
         }
       },
       shouldOverrideUrlLoading: (controller, navigationAction) async {
@@ -3326,7 +3889,9 @@ class WebViewFactory {
               allow = config.shouldOverrideUrlLoading!(resolved, hasGesture);
             }
             if (allow) {
-              controller.loadUrl(urlRequest: inapp.URLRequest(url: inapp.WebUri(resolved)));
+              controller.loadUrl(
+                urlRequest: inapp.URLRequest(url: inapp.WebUri(resolved)),
+              );
             }
             return inapp.NavigationActionPolicy.CANCEL;
           }
@@ -3342,10 +3907,15 @@ class WebViewFactory {
         // calls `notifyListeners()` which triggers a setState rebuild
         // on the dev tools log tab for every single navigation.
         if (config.siteId != null && url.startsWith('http')) {
-          final blocked = DnsBlockService.instance.hasBlocklist &&
+          final blocked =
+              DnsBlockService.instance.hasBlocklist &&
               DnsBlockService.instance.isBlocked(url);
-          DnsBlockService.instance.recordRequest(config.siteId!, url, blocked,
-              source: blocked ? BlockSource.dns : null);
+          DnsBlockService.instance.recordRequest(
+            config.siteId!,
+            url,
+            blocked,
+            source: blocked ? BlockSource.dns : null,
+          );
           if (blocked && config.dnsBlockEnabled) {
             return inapp.NavigationActionPolicy.CANCEL;
           }
@@ -3363,8 +3933,12 @@ class WebViewFactory {
               requestType: 'document',
             )) {
           if (config.siteId != null) {
-            DnsBlockService.instance.recordRequest(config.siteId!, url, true,
-                source: BlockSource.abp);
+            DnsBlockService.instance.recordRequest(
+              config.siteId!,
+              url,
+              true,
+              source: BlockSource.abp,
+            );
           }
           return inapp.NavigationActionPolicy.CANCEL;
         }
@@ -3373,7 +3947,15 @@ class WebViewFactory {
           final cleanedUrl = ClearUrlService.instance.cleanUrl(url);
           if (cleanedUrl.isEmpty) return inapp.NavigationActionPolicy.CANCEL;
           if (cleanedUrl != url) {
-            controller.loadUrl(urlRequest: inapp.URLRequest(url: inapp.WebUri(cleanedUrl)));
+            if (config.siteId != null) {
+              BlockStatsService.instance.record(
+                config.siteId!,
+                BlockCategory.trackingParam,
+              );
+            }
+            controller.loadUrl(
+              urlRequest: inapp.URLRequest(url: inapp.WebUri(cleanedUrl)),
+            );
             return inapp.NavigationActionPolicy.CANCEL;
           }
         }
@@ -3390,8 +3972,10 @@ class WebViewFactory {
           // and a main-frame nav IS a document fetch. Without this
           // the engine returns no rewrite even when a matching
           // filter is loaded.
-          final rewritten = ContentBlockerService.instance
-              .rewrittenUrl(url, requestType: 'document');
+          final rewritten = ContentBlockerService.instance.rewrittenUrl(
+            url,
+            requestType: 'document',
+          );
           if (rewritten != null && rewritten != url) {
             LogService.instance.log(
               'ContentBlocker',
@@ -3400,7 +3984,8 @@ class WebViewFactory {
               sensitivity: LogSensitivity.sensitive,
             );
             controller.loadUrl(
-                urlRequest: inapp.URLRequest(url: inapp.WebUri(rewritten)));
+              urlRequest: inapp.URLRequest(url: inapp.WebUri(rewritten)),
+            );
             return inapp.NavigationActionPolicy.CANCEL;
           }
         }
@@ -3422,8 +4007,10 @@ class WebViewFactory {
         // on Linux has been observed to return true for navigations
         // that originate from inside an iframe; Android API 24+
         // returns false for child-frame navigations consistently.
-        LogService.instance.log('WebView',
-            'shouldOverrideUrlLoading: isForMainFrame=${navigationAction.isForMainFrame}');
+        LogService.instance.log(
+          'WebView',
+          'shouldOverrideUrlLoading: isForMainFrame=${navigationAction.isForMainFrame}',
+        );
         if (!isMainFrame) {
           return inapp.NavigationActionPolicy.ALLOW;
         }
@@ -3461,13 +4048,15 @@ class WebViewFactory {
         // redirects without a tap origin, pushState) carry no user
         // gesture — they don't activate AASA in the first place and
         // are passed through here without interception.
-        if (Platform.isIOS &&
+        if (hostIsIOS &&
             IosUniversalLinkBypass.isEligibleNavigation(
               isMainFrame: isMainFrame,
               url: url,
-              isLinkActivated: navigationAction.navigationType ==
+              isLinkActivated:
+                  navigationAction.navigationType ==
                   inapp.NavigationType.LINK_ACTIVATED,
-              isFormSubmitted: navigationAction.navigationType ==
+              isFormSubmitted:
+                  navigationAction.navigationType ==
                   inapp.NavigationType.FORM_SUBMITTED,
               httpMethod: navigationAction.request.method,
             )) {
@@ -3479,10 +4068,12 @@ class WebViewFactory {
             );
             final originalUrl = navigationAction.request.url;
             final originalHeaders = navigationAction.request.headers;
-            controller.loadUrl(urlRequest: inapp.URLRequest(
-              url: originalUrl,
-              headers: originalHeaders,
-            ));
+            controller.loadUrl(
+              urlRequest: inapp.URLRequest(
+                url: originalUrl,
+                headers: originalHeaders,
+              ),
+            );
             return inapp.NavigationActionPolicy.CANCEL;
           }
           LogService.instance.log(
@@ -3546,7 +4137,9 @@ class WebViewFactory {
               allow = config.shouldOverrideUrlLoading!(resolved, hasGesture);
             }
             if (allow) {
-              controller.loadUrl(urlRequest: inapp.URLRequest(url: inapp.WebUri(resolved)));
+              controller.loadUrl(
+                urlRequest: inapp.URLRequest(url: inapp.WebUri(resolved)),
+              );
             }
             return false;
           }
@@ -3567,7 +4160,9 @@ class WebViewFactory {
           final allow = config.shouldOverrideUrlLoading!(url, hasGesture);
           if (allow) {
             // Same-domain target="_blank": load in current webview
-            controller.loadUrl(urlRequest: inapp.URLRequest(url: inapp.WebUri(url)));
+            controller.loadUrl(
+              urlRequest: inapp.URLRequest(url: inapp.WebUri(url)),
+            );
           }
         }
 
@@ -3600,12 +4195,14 @@ class WebViewFactory {
         // Refresh button can swap to a Stop button while loading.
         config.onLoadingChanged?.call(true);
         if (url != null) {
-          config.onMainFrameLoad
-              ?.call(MainFrameLoadSignal.started(url.toString()));
+          config.onMainFrameLoad?.call(
+            MainFrameLoadSignal.started(url.toString()),
+          );
         }
 
         // Track that this URL has a real page load (not SPA navigation)
         lastLoadStartUrl = url?.toString();
+        failedNavUrl = null;
         // Record the page navigation for the block stats banner so it
         // appears immediately. Tag the source (DNS or ABP) so the log
         // keeps the attribution even for main-doc loads. Recorded for
@@ -3620,7 +4217,8 @@ class WebViewFactory {
           // page URL — use it as both the URL under check and the
           // source. requestType 'document' since this is a top-level
           // load.
-          final abpBlocked = !dnsBlocked &&
+          final abpBlocked =
+              !dnsBlocked &&
               ContentBlockerService.instance.isBlocked(
                 urlStr,
                 sourceUrl: urlStr,
@@ -3630,8 +4228,12 @@ class WebViewFactory {
           final source = dnsBlocked
               ? BlockSource.dns
               : (abpBlocked ? BlockSource.abp : null);
-          DnsBlockService.instance
-              .recordRequest(config.siteId!, urlStr, blocked, source: source);
+          DnsBlockService.instance.recordRequest(
+            config.siteId!,
+            urlStr,
+            blocked,
+            source: source,
+          );
         }
         // Batch the early-injected helpers (content-blocker CSS,
         // ClearURLs share-API shim) into a single evaluateJavascript
@@ -3641,8 +4243,9 @@ class WebViewFactory {
         // concatenation is safe.
         final earlyScripts = <String>[];
         if (config.contentBlockEnabled && url != null) {
-          final cssScript =
-              ContentBlockerService.instance.getEarlyCssScript(url.toString());
+          final cssScript = ContentBlockerService.instance.getEarlyCssScript(
+            url.toString(),
+          );
           if (cssScript != null) earlyScripts.add(cssScript);
         }
         if (config.clearUrlEnabled) {
@@ -3651,7 +4254,8 @@ class WebViewFactory {
         if (earlyScripts.isNotEmpty && stillCurrent()) {
           try {
             await controller.evaluateJavascript(
-                source: '${earlyScripts.join('\n')}\n;null;');
+              source: '${earlyScripts.join('\n')}\n;null;',
+            );
           } catch (_) {} // WebKit "unsupported type" — JS still ran
         }
         if (stillCurrent()) {
@@ -3687,7 +4291,7 @@ class WebViewFactory {
         // revert handles URL bar restoration.
         if (!DownloadUrlRevertEngine.isRenderable(urlStr)) return;
 
-        if (Platform.isAndroid && config.zoomPercent != 100) {
+        if (hostIsAndroid && config.zoomPercent != 100) {
           final targetScale = config.zoomPercent / 100;
           final currentScale = await controller.getZoomScale() ?? 1;
           final relativeFactor = targetScale / currentScale;
@@ -3730,8 +4334,10 @@ class WebViewFactory {
           });
         }
 
-        lastStableUrl =
-            DownloadUrlRevertEngine.updateStable(lastStableUrl, urlStr);
+        lastStableUrl = DownloadUrlRevertEngine.updateStable(
+          lastStableUrl,
+          urlStr,
+        );
         config.onUrlChanged?.call(urlStr);
         if (config.onCookiesChanged != null) {
           // Read cookies from the right jar — exactly one of the two
@@ -3740,7 +4346,8 @@ class WebViewFactory {
           // the fork's `webViewController:` to the bound container's
           // cookie store; cookieManager hits the global default jar.
           final List<Cookie> cookies;
-          if (config.containerCookieManager != null && config.cookieSiteId != null) {
+          if (config.containerCookieManager != null &&
+              config.cookieSiteId != null) {
             cookies = await config.containerCookieManager!.getCookies(
               controller: _WebViewController(controller),
               siteId: config.cookieSiteId!,
@@ -3760,7 +4367,9 @@ class WebViewFactory {
         }
         // Inject full cosmetic script: MutationObserver + text-based hiding
         if (config.contentBlockEnabled) {
-          final script = ContentBlockerService.instance.getCosmeticScript(urlStr);
+          final script = ContentBlockerService.instance.getCosmeticScript(
+            urlStr,
+          );
           if (script != null) {
             try {
               await controller.evaluateJavascript(source: '$script\n;null;');
@@ -3783,9 +4392,10 @@ class WebViewFactory {
         // page. The post-reload `onLoadStop` saves the live HTML
         // instead; `_lastSaveAt` isn't bumped here, so its debounce
         // stays open.
-        if (config.onHtmlLoaded != null
-            && !firedLiveReload
-            && (config.shouldFetchHtml?.call() ?? true)) {
+        if (config.onHtmlLoaded != null &&
+            !firedLiveReload &&
+            failedNavUrl == null &&
+            (config.shouldFetchHtml?.call() ?? true)) {
           try {
             final html = await controller.getHtml();
             if (html != null && html.isNotEmpty) {
@@ -3839,11 +4449,15 @@ class WebViewFactory {
           lastLoadStartUrl = null; // Reset for next navigation
         }
       },
-      onFindResultReceived: (controller, activeMatchOrdinal, numberOfMatches, isDoneCounting) {
-        config.onFindResult?.call(activeMatchOrdinal, numberOfMatches);
-      },
+      onFindResultReceived:
+          (controller, activeMatchOrdinal, numberOfMatches, isDoneCounting) {
+            config.onFindResult?.call(activeMatchOrdinal, numberOfMatches);
+          },
       onConsoleMessage: (controller, consoleMessage) {
-        config.onConsoleMessage?.call(consoleMessage.message, consoleMessage.messageLevel);
+        config.onConsoleMessage?.call(
+          consoleMessage.message,
+          consoleMessage.messageLevel,
+        );
       },
       onReceivedError: (controller, request, error) async {
         LogService.instance.log(
@@ -3893,12 +4507,14 @@ class WebViewFactory {
           // above). Report it so the host can re-issue the load on the next
           // resume when the cause was the OS cutting the network out from
           // under a backgrounded process — PAUSE-022.
+          failedNavUrl = reqUrl;
           config.onMainFrameLoad?.call(
-              MainFrameLoadSignal.failed(reqUrl, error.type.toValue()));
+            MainFrameLoadSignal.failed(reqUrl, error.type.toValue()),
+          );
           return;
         }
         if (ExternalUrlSuppressor.isSuppressedInfo(externalInfo)) {
-          if (!Platform.isAndroid) {
+          if (!hostIsAndroid) {
             // WebKit reports a policy-cancelled external-scheme nav as
             // error 102 (frame load interrupted) but keeps the committed
             // page painted — loading about:blank here would wipe the page
@@ -3954,7 +4570,9 @@ class WebViewFactory {
                 );
               } else {
                 await controller.loadUrl(
-                  urlRequest: inapp.URLRequest(url: inapp.WebUri('about:blank')),
+                  urlRequest: inapp.URLRequest(
+                    url: inapp.WebUri('about:blank'),
+                  ),
                 );
               }
             } catch (_) {}
@@ -4011,7 +4629,11 @@ class WebViewFactory {
         }
       },
       onReceivedServerTrustAuthRequest: (controller, challenge) =>
-          _handleServerTrust(controller, challenge, config.onUntrustedCertificate),
+          _handleServerTrust(
+            controller,
+            challenge,
+            config.onUntrustedCertificate,
+          ),
       // Android `WebView.onRenderProcessGone`: the OS can kill the renderer
       // process while the app is backgrounded to reclaim memory. Coming back
       // to a renderer-gone WebView shows a black surface because the view is
@@ -4120,7 +4742,9 @@ class WebViewFactory {
         ? rawPort
         : (space.protocol?.toLowerCase() == 'https' ? 443 : 80);
     final cert = space.sslCertificate;
-    final fingerprint = TrustedHostsService.fingerprintFromInappCertificate(cert);
+    final fingerprint = TrustedHostsService.fingerprintFromInappCertificate(
+      cert,
+    );
     if (cert != null) {
       _sslCertificateCache[_certCacheKey(host, port)] = cert;
     }
@@ -4131,7 +4755,7 @@ class WebViewFactory {
     // remain useful for Android post-failure and for dart:io
     // `HttpClient.badCertificateCallback` (favicon fetch, etc.), but
     // querying them in this code path on Apple was log noise at best.
-    if (Platform.isIOS || Platform.isMacOS) {
+    if (hostIsIOS || hostIsMacOS) {
       return null;
     }
     if (TrustedHostsService.instance.isTrusted(
@@ -4145,7 +4769,8 @@ class WebViewFactory {
         sensitivity: LogSensitivity.sensitive,
       );
       return inapp.ServerTrustAuthResponse(
-          action: inapp.ServerTrustAuthResponseAction.PROCEED);
+        action: inapp.ServerTrustAuthResponseAction.PROCEED,
+      );
     }
     // Loopback sinkhole: a device-level DNS/ad blocker (VPN-based
     // blocker, hosts-file sinkhole, Private DNS, etc.) may resolve a
@@ -4166,7 +4791,8 @@ class WebViewFactory {
         sensitivity: LogSensitivity.sensitive,
       );
       return inapp.ServerTrustAuthResponse(
-          action: inapp.ServerTrustAuthResponseAction.CANCEL);
+        action: inapp.ServerTrustAuthResponseAction.CANCEL,
+      );
     }
     // Post-failure platforms (Android, Linux): the OS already rejected
     // the chain. Prompt the user now.
@@ -4177,7 +4803,8 @@ class WebViewFactory {
         sensitivity: LogSensitivity.sensitive,
       );
       return inapp.ServerTrustAuthResponse(
-          action: inapp.ServerTrustAuthResponseAction.CANCEL);
+        action: inapp.ServerTrustAuthResponseAction.CANCEL,
+      );
     }
     final approved = await prompt(host, port, cert);
     if (!approved) {
@@ -4187,7 +4814,8 @@ class WebViewFactory {
         sensitivity: LogSensitivity.sensitive,
       );
       return inapp.ServerTrustAuthResponse(
-          action: inapp.ServerTrustAuthResponseAction.CANCEL);
+        action: inapp.ServerTrustAuthResponseAction.CANCEL,
+      );
     }
     if (fingerprint != null) {
       await TrustedHostsService.instance.trust(
@@ -4220,7 +4848,8 @@ class WebViewFactory {
       } catch (_) {}
     });
     return inapp.ServerTrustAuthResponse(
-        action: inapp.ServerTrustAuthResponseAction.PROCEED);
+      action: inapp.ServerTrustAuthResponseAction.PROCEED,
+    );
   }
 
   static String _certCacheKey(String host, int port) =>
@@ -4264,7 +4893,8 @@ class WebViewFactory {
   /// Used by the iOS/macOS post-failure branch in `onReceivedError`.
   static bool _isSslError(inapp.WebResourceErrorType type) {
     return type == inapp.WebResourceErrorType.SERVER_CERTIFICATE_UNTRUSTED ||
-        type == inapp.WebResourceErrorType.SERVER_CERTIFICATE_HAS_UNKNOWN_ROOT ||
+        type ==
+            inapp.WebResourceErrorType.SERVER_CERTIFICATE_HAS_UNKNOWN_ROOT ||
         type == inapp.WebResourceErrorType.SERVER_CERTIFICATE_HAS_BAD_DATE ||
         type == inapp.WebResourceErrorType.SERVER_CERTIFICATE_NOT_YET_VALID ||
         type == inapp.WebResourceErrorType.SERVER_CERTIFICATE_REVOKED ||
@@ -4331,7 +4961,7 @@ class WebViewFactory {
     // unknown-CA sites fail closed here. Users can install the cert
     // manually (Keychain Access on macOS, Settings → General →
     // Certificate Trust Settings on iOS).
-    if (Platform.isMacOS || Platform.isIOS) {
+    if (hostIsMacOS || hostIsIOS) {
       return false;
     }
     final uri = Uri.tryParse(url);
@@ -4340,8 +4970,9 @@ class WebViewFactory {
     final port = uri.hasPort ? uri.port : (uri.scheme == 'https' ? 443 : 80);
     final key = _certCacheKey(host, port);
     final cert = _sslCertificateCache[key];
-    final fingerprint =
-        TrustedHostsService.fingerprintFromInappCertificate(cert);
+    final fingerprint = TrustedHostsService.fingerprintFromInappCertificate(
+      cert,
+    );
     if (TrustedHostsService.instance.isTrusted(
       host: host,
       port: port,
@@ -4358,7 +4989,7 @@ class WebViewFactory {
       LogService.instance.log(
         'TLS',
         'pin matches but iOS reported error for $host:$port — reloading once '
-            '(os: ${Platform.operatingSystem} ${Platform.operatingSystemVersion})',
+            '(os: $hostOperatingSystem $hostOperatingSystemVersion)',
         sensitivity: LogSensitivity.sensitive,
       );
       Future.microtask(() async {
@@ -4533,6 +5164,12 @@ class WebViewFactory {
     );
     final DownloadResult result;
     try {
+      LogService.instance.log(
+        'Download',
+        'HTTP download: url=${req.url} cookies=${cookies.length} '
+            'ua=${req.userAgent != null} referer=${referer != null}',
+        sensitivity: LogSensitivity.sensitive,
+      );
       final engine = DownloadEngine(proxy: proxy);
       result = await engine.fetch(
         url: req.url.toString(),
@@ -4541,8 +5178,11 @@ class WebViewFactory {
         referer: referer,
         suggestedFilename: req.suggestedFilename,
         mimeTypeHint: req.mimeType,
-        onProgress: (done, total) => DownloadsService.instance
-            .updateProgress(task.id, bytesDone: done, bytesTotal: total),
+        onProgress: (done, total) => DownloadsService.instance.updateProgress(
+          task.id,
+          bytesDone: done,
+          bytesTotal: total,
+        ),
       );
     } on DownloadException catch (e) {
       if (await handOffToBrowser('Internal download failed')) {
@@ -4594,8 +5234,11 @@ class WebViewFactory {
         suggestedFilename: req.suggestedFilename,
       );
       task.filename = result.filename;
-      DownloadsService.instance.updateProgress(task.id,
-          bytesDone: result.bytes.length, bytesTotal: result.bytes.length);
+      DownloadsService.instance.updateProgress(
+        task.id,
+        bytesDone: result.bytes.length,
+        bytesTotal: result.bytes.length,
+      );
       final savedPath = await _saveViaPicker(result);
       if (savedPath == null) {
         DownloadsService.instance.cancel(task.id);
@@ -4645,7 +5288,7 @@ class WebViewFactory {
   }
 
   static Future<String?> _saveViaPicker(DownloadResult result) async {
-    final isMobile = !kIsWeb && (Platform.isIOS || Platform.isAndroid);
+    final isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
     final outputPath = await FilePicker.saveFile(
       dialogTitle: 'Save download',
       fileName: result.filename,
@@ -4653,8 +5296,7 @@ class WebViewFactory {
     );
     if (outputPath == null) return null;
     if (!isMobile) {
-      final file = File(outputPath);
-      await file.writeAsBytes(result.bytes);
+      await hostWriteBytes(outputPath, result.bytes);
     }
     return outputPath;
   }

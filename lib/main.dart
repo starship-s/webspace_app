@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'dart:async';
-import 'dart:io';
 import 'dart:math' show min, max;
 import 'dart:typed_data';
 import 'dart:ui' as ui;
@@ -21,10 +20,13 @@ import 'package:html/dom.dart' as html_dom;
 
 import 'package:webspace/web_view_model.dart';
 import 'package:webspace/webspace_model.dart';
+import 'package:webspace/platform/host_platform.dart';
+import 'package:webspace/theme/accent_theme.dart';
 import 'package:webspace/services/webview.dart';
 import 'package:webspace/screens/add_site.dart' show AddSiteScreen, UnifiedFaviconImage, FaviconUrlCache, SiteSuggestion;
 import 'package:webspace/screens/settings.dart';
 import 'package:webspace/screens/app_settings.dart';
+import 'package:webspace/screens/block_stats.dart';
 import 'package:webspace/services/icon_service.dart';
 import 'package:webspace/services/icon_png_export.dart';
 import 'package:webspace/services/custom_icon.dart';
@@ -48,6 +50,7 @@ import 'package:webspace/services/settings_backup.dart';
 import 'package:webspace/services/cookie_isolation.dart';
 import 'package:webspace/services/resume_reload_engine.dart';
 import 'package:webspace/services/surface_repaint_engine.dart';
+import 'package:webspace/services/surface_route_observer.dart';
 import 'package:webspace/services/diag_seed.dart';
 import 'package:webspace/services/cookie_secure_storage.dart';
 import 'package:webspace/services/proxy_password_secure_storage.dart';
@@ -58,7 +61,9 @@ import 'package:webspace/services/container_native.dart';
 import 'package:webspace/services/container_cookie_manager.dart';
 import 'package:webspace/services/site_settings_qr_codec.dart';
 import 'package:webspace/services/site_activation_engine.dart';
+import 'package:webspace/services/site_teardown_engine.dart';
 import 'package:webspace/services/app_lifecycle_engine.dart';
+import 'package:webspace/services/back_gesture_engine.dart';
 import 'package:webspace/services/site_data_clear_engine.dart';
 import 'package:webspace/services/site_lifecycle_engine.dart';
 import 'package:webspace/services/site_lifecycle_promotion_engine.dart';
@@ -73,6 +78,7 @@ import 'package:webspace/services/webspace_selection_engine.dart';
 import 'package:webspace/services/clearurl_service.dart';
 import 'package:webspace/services/adblock_engine.dart';
 import 'package:webspace/services/content_blocker_service.dart';
+import 'package:webspace/services/block_stats_service.dart';
 import 'package:webspace/services/dns_block_service.dart';
 import 'package:webspace/services/firefox_user_agent_service.dart';
 import 'package:webspace/services/timezone_location_service.dart';
@@ -81,6 +87,7 @@ import 'package:webspace/services/localcdn_service.dart';
 import 'package:webspace/services/connectivity_service.dart';
 import 'package:webspace/services/shortcut_service.dart';
 import 'package:webspace/services/background_task_service.dart';
+import 'package:webspace/services/media_session_service.dart';
 import 'package:webspace/services/share_intent_service.dart';
 import 'package:webspace/services/link_routing_service.dart';
 import 'package:webspace/services/link_intent_dispatch_engine.dart';
@@ -93,6 +100,11 @@ import 'package:webspace/services/suggested_sites_service.dart' as suggested_sit
 import 'package:webspace/screens/dev_tools.dart';
 import 'package:webspace/settings/app_prefs.dart';
 import 'package:webspace/settings/app_locale.dart';
+import 'package:webspace/settings/camera.dart';
+import 'package:webspace/settings/microphone.dart';
+import 'package:webspace/services/virtual_camera_service.dart';
+import 'package:webspace/services/virtual_media_picker.dart';
+import 'package:webspace/services/virtual_microphone_service.dart';
 import 'package:webspace/settings/global_outbound_proxy.dart';
 import 'package:webspace/settings/proxy.dart';
 import 'package:webspace/settings/user_script.dart';
@@ -101,6 +113,7 @@ import 'package:share_plus/share_plus.dart';
 import 'package:webspace/widgets/download_button.dart';
 import 'package:webspace/widgets/external_url_prompt.dart';
 import 'package:webspace/widgets/root_messenger.dart';
+import 'package:webspace/widgets/site_permission_badges.dart';
 import 'package:webspace/widgets/untrusted_cert_prompt.dart';
 
 // Accent color enum
@@ -233,66 +246,25 @@ AppThemeSettings _legacyAppThemeToSettings(AppTheme appTheme) {
   }
 }
 
-// Accent colors
-const Color _accentBlue = Color(0xFF6B8DD6);
-const Color _accentGreen = Color(0xFF7be592);
-const Color _accentPurple = Color(0xFF9B7BD6);
-const Color _accentOrange = Color(0xFFE59B5B);
-const Color _accentRed = Color(0xFFD66B6B);
-const Color _accentPink = Color(0xFFD66BA8);
-const Color _accentTeal = Color(0xFF5BC4C4);
-const Color _accentYellow = Color(0xFFD6C86B);
-
 // Get accent color from AccentColor enum
-/// Build a ColorScheme that preserves the full saturation of [accent].
-/// Uses fromSeed only for neutral surface/background colors, then overrides
-/// all accent-derived roles so nothing gets desaturated by Material 3's HCT.
-ColorScheme _buildAccentColorScheme(Color accent, Brightness brightness) {
-  final bool isLight = brightness == Brightness.light;
-  final hsl = HSLColor.fromColor(accent);
-
-  // Container: a tinted but lighter/darker version of the accent
-  final primaryContainer = isLight
-      ? hsl.withLightness((hsl.lightness * 0.3 + 0.7).clamp(0.80, 0.92)).withSaturation((hsl.saturation * 0.8).clamp(0.0, 1.0)).toColor()
-      : hsl.withLightness((hsl.lightness * 0.35).clamp(0.12, 0.25)).withSaturation((hsl.saturation * 0.8).clamp(0.0, 1.0)).toColor();
-
-  final onPrimaryContainer = isLight
-      ? hsl.withLightness(0.15).toColor()
-      : hsl.withLightness(0.90).toColor();
-
-  // Use fromSeed as base for surface/neutral colors only
-  final base = ColorScheme.fromSeed(seedColor: accent, brightness: brightness);
-
-  return base.copyWith(
-    primary: accent,
-    onPrimary: isLight ? Colors.white : Colors.black,
-    primaryContainer: primaryContainer,
-    onPrimaryContainer: onPrimaryContainer,
-    secondary: accent,
-    onSecondary: isLight ? Colors.white : Colors.black,
-    secondaryContainer: primaryContainer,
-    onSecondaryContainer: onPrimaryContainer,
-  );
-}
-
 Color _accentColorToColor(AccentColor accentColor) {
   switch (accentColor) {
     case AccentColor.blue:
-      return _accentBlue;
+      return accentBlue;
     case AccentColor.green:
-      return _accentGreen;
+      return accentGreen;
     case AccentColor.purple:
-      return _accentPurple;
+      return accentPurple;
     case AccentColor.orange:
-      return _accentOrange;
+      return accentOrange;
     case AccentColor.red:
-      return _accentRed;
+      return accentRed;
     case AccentColor.pink:
-      return _accentPink;
+      return accentPink;
     case AccentColor.teal:
-      return _accentTeal;
+      return accentTeal;
     case AccentColor.yellow:
-      return _accentYellow;
+      return accentYellow;
   }
 }
 
@@ -660,7 +632,8 @@ void main() async {
       () => _runTimed('firefoxUa', FirefoxUserAgentService.instance.initialize),
       () => _runTimed('adblock', ContentBlockerService.instance.initialize),
       () => _runTimed('localCdn', LocalCdnService.instance.initialize),
-      if (Platform.isAndroid)
+      () => _runTimed('blockStats', BlockStatsService.instance.initialize),
+      if (hostIsAndroid)
         () => _runTimed('swBlock', blockServiceWorkerNetwork),
     ],
     bridgeSetup: WebInterceptNative.initialize,
@@ -879,6 +852,9 @@ class _WebSpaceAppState extends State<WebSpaceApp> {
     final Color accentColor = _accentColorToColor(_themeSettings.accentColor);
     return MaterialApp(
       onGenerateTitle: (context) => AppLocalizations.of(context).appTitle,
+      // Lets every webview-hosting screen learn when an opaque route above it
+      // pops, which re-attaches its platform view blank (PAUSE-024/BUG-001).
+      navigatorObservers: [surfaceRouteObserver],
       localizationsDelegates: AppLocalizations.localizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
       locale: _localeOverride,
@@ -887,11 +863,11 @@ class _WebSpaceAppState extends State<WebSpaceApp> {
       localeListResolutionCallback: resolveSupportedLocale,
       scaffoldMessengerKey: rootScaffoldMessengerKey,
       theme: ThemeData(
-        colorScheme: _buildAccentColorScheme(accentColor, Brightness.light),
+        colorScheme: buildAccentColorScheme(accentColor, Brightness.light),
         scaffoldBackgroundColor: Color(0xFFFFFFFF),
       ),
       darkTheme: ThemeData(
-        colorScheme: _buildAccentColorScheme(accentColor, Brightness.dark),
+        colorScheme: buildAccentColorScheme(accentColor, Brightness.dark),
         scaffoldBackgroundColor: Color(0xFF000000),
       ),
       themeMode: _themeSettings.themeMode,
@@ -935,7 +911,7 @@ class _ArchiveSlice {
 }
 
 class _WebSpacePageState extends State<WebSpacePage>
-    with WidgetsBindingObserver
+    with WidgetsBindingObserver, RouteAware
     implements DeferredStartupHost {
   int? _currentIndex;
   final List<WebViewModel> _webViewModels = [];
@@ -1029,6 +1005,13 @@ class _WebSpacePageState extends State<WebSpacePage>
   // SharedPreferences key. On by default. Independent of per-site
   // `WebViewModel.fullscreenMode`.
   bool _fullscreenOnShortcut = true;
+  // NAV-009: what the back gesture does at the start of a site's history.
+  // Off by default — the gesture only walks webview history (issue #369);
+  // turning it on opens the drawer there, and again to leave the app (#431).
+  BackAtHistoryStart _backAtHistoryStart = BackAtHistoryStart.ignore;
+  // True while the drawer showing is the one the back gesture itself opened.
+  // Only that drawer escalates to leaving the app on the next gesture.
+  bool _drawerOpenedByBackGesture = false;
   int _tabMaxWidth = 140;
   // Runtime-only: whether the tab-bar button has revealed the tab strip.
   // Reset on exiting fullscreen and on site switch; never persisted.
@@ -1309,7 +1292,7 @@ class _WebSpacePageState extends State<WebSpacePage>
     // ARCH-006: archive-tier sites must not get OS-level pinned
     // shortcuts (visible in the launcher / Shortcuts.app indefinitely).
     if (_webViewModels[index].isArchiveTier) return false;
-    if (Platform.isAndroid) {
+    if (hostIsAndroid) {
       // Treat a site an orphaned tile was rebound to (HS-011) as already
       // pinned — it's reachable via that tile, so don't offer a second one.
       final effective = ShortcutPinState.effectivePinnedSiteIds(
@@ -1318,7 +1301,7 @@ class _WebSpacePageState extends State<WebSpacePage>
       );
       return !effective.contains(_webViewModels[index].siteId);
     }
-    if (Platform.isIOS || Platform.isMacOS) {
+    if (hostIsIOS || hostIsMacOS) {
       return _appIntentsSupported;
     }
     return false;
@@ -1327,7 +1310,7 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// Routes the "Home Shortcut" menu tap. Android pins directly; iOS shows
   /// the HS-008 instructional dialog then deep-links to Shortcuts.app.
   Future<void> _handleAddToHome(WebViewModel model) async {
-    if (Platform.isAndroid) {
+    if (hostIsAndroid) {
       final faviconUrl = FaviconUrlCache.get(model.initUrl);
       // Rasterize the favicon to PNG here (HS-003): Android's BitmapFactory
       // can't decode SVG, so an SVG favicon would otherwise fall back to the
@@ -1352,13 +1335,13 @@ class _WebSpacePageState extends State<WebSpacePage>
       await _recordShortcutLedger(model.siteId, model.initUrl);
       return;
     }
-    if ((Platform.isIOS || Platform.isMacOS) && _appIntentsSupported) {
+    if ((hostIsIOS || hostIsMacOS) && _appIntentsSupported) {
       final loc = AppLocalizations.of(context);
       // iOS embeds the AppIntents ShortcutsUIButton, which lands on
       // WebSpace's own App Shortcuts page; the bare shortcuts:// scheme
       // (still used on macOS, where that button doesn't exist) can only
       // open the Shortcuts app's main view.
-      if (Platform.isIOS) {
+      if (hostIsIOS) {
         await showDialog<void>(
           context: context,
           builder: (ctx) => AlertDialog(
@@ -1428,11 +1411,34 @@ class _WebSpacePageState extends State<WebSpacePage>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is PageRoute) surfaceRouteObserver.subscribe(this, route);
+  }
+
+  /// An opaque route pushed over this page has popped and the webview is
+  /// visible again. While it was covered the platform view was not composited,
+  /// so Android detached its SurfaceView and re-attaches it here — blank, and
+  /// through none of the other chokepoints: the site did not change
+  /// (`_setCurrentIndex`), the controller was not recreated
+  /// (`onControllerReady`), nothing navigated, and the app never left the
+  /// foreground. See PAUSE-024 / BUG-001.
+  @override
+  void didPopNext() {
+    if (hostIsAndroid) {
+      LogService.instance.log('SurfaceDiag', 'trigger=route-return -> nudge');
+    }
+    _nudgeSurfaceRepaint();
+  }
+
+  @override
   void dispose() {
     _foregroundPollTimer?.cancel();
     _resumeRepaintWindowTimer?.cancel();
     _navStateDebouncer.dispose();
     _untrustSub?.cancel();
+    surfaceRouteObserver.unsubscribe(this);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -1451,7 +1457,7 @@ class _WebSpacePageState extends State<WebSpacePage>
     // on-device that a warm-start surface reattach actually surfaces here as a
     // metrics change, the premise Attempt 8 depends on. Bounded to the window,
     // so it is not emitted for steady-state metric changes. See PAUSE-020.
-    if (Platform.isAndroid) {
+    if (hostIsAndroid) {
       LogService.instance.log('SurfaceDiag', 'trigger=metrics-resume -> nudge');
     }
     _nudgeSurfaceRepaint();
@@ -1589,6 +1595,10 @@ class _WebSpacePageState extends State<WebSpacePage>
     if (state == AppLifecycleState.paused) {
       _foregroundPollTimer?.cancel();
       _foregroundPollTimer = null;
+      // Persist the protection-report counters before the OS can reclaim
+      // the process: the in-memory debounce would otherwise lose up to
+      // BlockStatsService.flushDelay of counts on a kill.
+      unawaited(BlockStatsService.instance.flush());
       // URL-ephemeral sites (alwaysOpenHome / incognito) revert to their
       // initUrl only on a genuine app restart (fromJson strips currentUrl on
       // cold start, AOH-002) and on home-shortcut tap (AOH-004) — never on a
@@ -1601,7 +1611,27 @@ class _WebSpacePageState extends State<WebSpacePage>
         siteCount: _webViewModels.length,
         loadedIndices: _loadedIndices,
         notificationsEnabled: (i) => _webViewModels[i].effectiveNotificationsEnabled,
+        backgroundAudioEnabled: (i) =>
+            _webViewModels[i].effectiveBackgroundAudioEnabled,
         cookieFlushSupported: CookieManager.flushSupported,
+      );
+      // Non-sensitive decision line (no site name/URL): lets a user report
+      // — and the CI lifecycle test assert — whether the background froze
+      // JS or a notification/background-audio exemption kept it running.
+      // `bgAudio` is the input to that decision (BGAUDIO-002): without it a
+      // jsPause=true line reads as a bug when it is really the site's
+      // Background audio toggle being off.
+      final loadedBgAudio = _loadedIndices
+          .where((i) =>
+              i >= 0 &&
+              i < _webViewModels.length &&
+              _webViewModels[i].effectiveBackgroundAudioEnabled)
+          .length;
+      LogService.instance.log(
+        'Lifecycle',
+        'App background: jsPause=${pausePlan.jsPauseIndex != null} '
+            'capture=${pausePlan.captureStateIndex != null} '
+            'bgAudio=$loadedBgAudio loaded',
       );
       // Backgrounding is the last moment we control before the OS may kill
       // the process, and Chromium commits cookies to disk lazily. Unawaited:
@@ -1609,9 +1639,32 @@ class _WebSpacePageState extends State<WebSpacePage>
       if (pausePlan.flushCookies) {
         unawaited(_cookieManager.flush());
       }
+      // BGAUDIO-012: a site that stops itself when the page reports hidden
+      // (YouTube and every other player built for a tab) needs to be told the
+      // app is backgrounded before the OS tells the page it is hidden.
+      for (final i in _loadedIndices) {
+        if (i < 0 || i >= _webViewModels.length) continue;
+        if (!_webViewModels[i].effectiveBackgroundAudioEnabled) continue;
+        unawaited(_webViewModels[i].setBackgroundPlayback(true));
+      }
+      // BGAUDIO-009: a site the user never opted in for must not keep sounding
+      // through a backgrounded app (and keep the system transport controls up
+      // with it). Dispatched before the JS pause below — on iOS that pause
+      // blocks the page's JS thread, so this would sit queued behind it.
+      final mediaStops = <int, Future<void>>{};
+      for (final i in pausePlan.mediaPauseIndices) {
+        if (i < 0 || i >= _webViewModels.length) continue;
+        mediaStops[i] = _webViewModels[i].pauseMediaPlayback();
+      }
+      final allMediaStopped = Future.wait(mediaStops.values);
       if (pausePlan.jsPauseIndex != null) {
-        _lifecyclePauseFuture =
-            _webViewModels[pausePlan.jsPauseIndex!].pauseForAppLifecycle();
+        final idx = pausePlan.jsPauseIndex!;
+        final stopped = mediaStops.remove(idx) ?? Future<void>.value();
+        _lifecyclePauseFuture = stopped
+            .then((_) => _webViewModels[idx].pauseForAppLifecycle());
+      }
+      for (final stop in mediaStops.values) {
+        unawaited(stop);
       }
       if (pausePlan.captureStateIndex != null) {
         final model = _webViewModels[pausePlan.captureStateIndex!];
@@ -1633,9 +1686,22 @@ class _WebSpacePageState extends State<WebSpacePage>
       // Both iOS and Android: ensure the periodic refresh is scheduled
       // before the process gets backgrounded.
       unawaited(_updateBackgroundRefreshSchedule());
+      // iOS: make sure the `.playback` audio session is live before the
+      // process is backgrounded, or active webview audio gets cut. Sequenced
+      // after the media stops above: WebKit republishes its Now Playing entry
+      // when it processes a pause, so clearing before that lands leaves the
+      // controls on screen (BGAUDIO-009).
+      unawaited(allMediaStopped.then((_) => _updateBackgroundAudioSession()));
     } else if (state == AppLifecycleState.resumed) {
       if (_maskBackground) {
         setState(() => _maskBackground = false);
+      }
+      // BGAUDIO-012: hand the page's own visibility back. On screen again, a
+      // player that pauses when hidden should behave exactly as it always has.
+      for (final i in _loadedIndices) {
+        if (i < 0 || i >= _webViewModels.length) continue;
+        if (!_webViewModels[i].effectiveBackgroundAudioEnabled) continue;
+        unawaited(_webViewModels[i].setBackgroundPlayback(false));
       }
       // Open the warm-start repaint window before the async resume sequence, so
       // a late SurfaceView re-attach (which surfaces as a metrics change) is
@@ -1678,7 +1744,7 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// `_nudgeSurfaceRepaint`, catching a SurfaceView that comes back after the
   /// `_onResumed` tail nudge has already drained.
   void _openResumeRepaintWindow() {
-    if (!Platform.isAndroid) return;
+    if (!hostIsAndroid) return;
     _resumeRepaintWindowOpen = true;
     _resumeRepaintWindowTimer?.cancel();
     _resumeRepaintWindowTimer = Timer(const Duration(seconds: 3), () {
@@ -1789,6 +1855,8 @@ class _WebSpacePageState extends State<WebSpacePage>
       siteCount: _webViewModels.length,
       loadedIndices: _loadedIndices,
       notificationsEnabled: (i) => _webViewModels[i].effectiveNotificationsEnabled,
+      backgroundAudioEnabled: (i) =>
+          _webViewModels[i].effectiveBackgroundAudioEnabled,
     );
     if (resumeIdx != null) {
       await _webViewModels[resumeIdx].resumeFromAppLifecycle();
@@ -1873,7 +1941,7 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// across several frames because the new surface may not be attached on the
   /// first frame after resume, which is why a single request is not enough.
   void _nudgeSurfaceRepaint() {
-    if (!Platform.isAndroid) return;
+    if (!hostIsAndroid) return;
     // Coalesce concurrent callers (e.g. _setCurrentIndex from a warm-shortcut
     // _openShortcutIndex, then _onResumed's tail call) onto a single loop.
     if (!_surfaceRepaint.request()) return;
@@ -2479,11 +2547,12 @@ class _WebSpacePageState extends State<WebSpacePage>
       homeTitle: model.name,
       siteId: model.siteId,
       incognito: model.incognito,
-      thirdPartyCookiesEnabled: model.thirdPartyCookiesEnabled,
+      thirdPartyCookiesEnabled: model.effectiveThirdPartyCookiesEnabled,
       clearUrlEnabled: model.clearUrlEnabled,
       dnsBlockEnabled: model.dnsBlockEnabled,
       contentBlockEnabled: model.contentBlockEnabled,
       localCdnEnabled: model.effectiveLocalCdnEnabled,
+      contributesBlockStats: model.contributesBlockStats,
       trackingProtectionEnabled: model.trackingProtectionEnabled,
       letterboxEnabled: model.letterboxEnabled,
       spoofWindowWidth: model.spoofWindowWidth,
@@ -3175,7 +3244,7 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// renames / additions / deletions show up in Shortcuts.app the next time
   /// the user touches it. No-op on non-iOS platforms.
   void _syncShortcutSites() {
-    if (!Platform.isIOS && !Platform.isMacOS) return;
+    if (!hostIsIOS && !hostIsMacOS) return;
     final sites = [
       for (final m in _webViewModels)
         if (!m.isArchiveTier)
@@ -3233,6 +3302,15 @@ class _WebSpacePageState extends State<WebSpacePage>
     if (isDemoMode) return;
     SharedPreferences prefs = await SharedPreferences.getInstance();
     await prefs.setBool('fullscreenOnShortcut', _fullscreenOnShortcut);
+  }
+
+  Future<void> _saveBackAtHistoryStart() async {
+    if (isDemoMode) return;
+    SharedPreferences prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(
+      kBackOpensMenuKey,
+      _backAtHistoryStart == BackAtHistoryStart.openMenu,
+    );
   }
 
   Future<void> _saveTabBarButton() async {
@@ -3487,6 +3565,8 @@ class _WebSpacePageState extends State<WebSpacePage>
     // re-evaluate the background refresh schedule (iOS BGAppRefreshTask
     // / Android WorkManager). No-op on other platforms.
     unawaited(_updateBackgroundRefreshSchedule());
+    // Same for `backgroundAudioEnabled` and the iOS audio session.
+    unawaited(_updateBackgroundAudioSession());
   }
 
   /// Dispose every loaded webview. Used after global user script edits,
@@ -3536,22 +3616,27 @@ class _WebSpacePageState extends State<WebSpacePage>
     final version = ++_setCurrentIndexVersion;
 
     if (index == null || index < 0 || index >= _webViewModels.length) {
-      // Going home: opportunistically capture state for the
-      // previously-active site so a later cold start (or
-      // OS-killed-while-backgrounded scenario) can re-hydrate its
-      // back/forward stack and form data on re-activation. The
-      // webview stays loaded (pause-only, not disposed) so a
-      // near-immediate return to the same site keeps its in-memory
-      // tab. Bytes-only capture — `lifecycleState` stays `live`
-      // because the webview is not actually disposed.
-      if (_currentIndex != null && _currentIndex! < _webViewModels.length && _loadedIndices.contains(_currentIndex)) {
-        await _captureStateBytes(_webViewModels[_currentIndex!]);
-        if (version != _setCurrentIndexVersion) return;
-        await _webViewModels[_currentIndex!].pauseWebView();
-        if (version != _setCurrentIndexVersion) return;
-      }
+      final leaving = _currentIndex != null &&
+              _currentIndex! < _webViewModels.length &&
+              _loadedIndices.contains(_currentIndex)
+          ? _webViewModels[_currentIndex!]
+          : null;
+      // Going home is committed before the teardown below, never after it
+      // (NAV-010): every step there is a native round-trip that can throw,
+      // be superseded, or never answer at all, and each of those used to
+      // abandon the whole call with `_currentIndex` still on the site the
+      // user asked to leave — a "back to webspaces" that silently did
+      // nothing. Nothing in the teardown decides where we end up.
       _currentIndex = index;
       _exitFullscreen();
+      // Opportunistically capture state for the previously-active site so a
+      // later cold start (or OS-killed-while-backgrounded scenario) can
+      // re-hydrate its back/forward stack and form data on re-activation.
+      // The webview stays loaded (pause-only, not disposed) so a
+      // near-immediate return to the same site keeps its in-memory tab.
+      // Bytes-only capture — `lifecycleState` stays `live` because the
+      // webview is not actually disposed.
+      if (leaving != null) await _quiesceOutgoingSite(leaving, version);
       return;
     }
 
@@ -3644,7 +3729,7 @@ class _WebSpacePageState extends State<WebSpacePage>
       // proxy (ProxyController fanned across sessions); a mismatched-proxy
       // sibling left loaded would route its next request through the wrong
       // proxy. iOS/macOS bind per-session, so no unload needed there.
-      proxyIsGlobal: Platform.isAndroid || Platform.isLinux,
+      proxyIsGlobal: hostIsAndroid || hostIsLinux,
     );
     for (final i in proxyMismatch) {
       LogService.instance.log(
@@ -3728,7 +3813,8 @@ class _WebSpacePageState extends State<WebSpacePage>
 
     // Pause the previously active webview to save resources
     if (_currentIndex != null && _currentIndex! < _webViewModels.length && _loadedIndices.contains(_currentIndex)) {
-      await _webViewModels[_currentIndex!].pauseWebView();
+      await _quiesceOutgoingSite(_webViewModels[_currentIndex!], version,
+          captureState: false);
       if (version != _setCurrentIndexVersion) return;
     }
 
@@ -3779,13 +3865,10 @@ class _WebSpacePageState extends State<WebSpacePage>
     // it unpaused. pauseWebView() is idempotent.
     //
     // unawaited: subsequent activation logic (fullscreen, logging)
-    // doesn't depend on these completing. Race-wise this is safe in
-    // Dart's single-threaded model: each pauseWebView dispatches on
-    // the platform channel synchronously up to its first await, and
-    // the channel preserves FIFO order — so the resumeWebView above
-    // is dispatched before any of these pauses. A subsequent
-    // _setCurrentIndex would also do its own resume after these
-    // pauses, so the latest target always ends up resumed.
+    // doesn't depend on these completing, and a page whose JS thread is
+    // frozen may never answer at all. Race-wise the version guard inside
+    // the teardown is what keeps a sweep still in flight from pausing the
+    // site a newer activation has since resumed.
     //
     // (Per-instance pause() doesn't stop JavaScript — see
     // openspec/specs/webview-pause-lifecycle/spec.md. This is a
@@ -3795,7 +3878,13 @@ class _WebSpacePageState extends State<WebSpacePage>
     for (final i in loadedSnapshot) {
       if (i == index) continue;
       if (i < 0 || i >= _webViewModels.length) continue;
-      unawaited(_webViewModels[i].pauseWebView());
+      // Camera stop is dispatched before the pause (CAM-012) and covers the
+      // sites pauseWebView() exempts — a notification or background-audio
+      // site keeps its JS running, which is exactly where a forgotten capture
+      // would survive. Bound to a local model: the steps run a microtask
+      // later, by which point _webViewModels may have been reindexed.
+      final model = _webViewModels[i];
+      unawaited(_quiesceOutgoingSite(model, version, captureState: false));
     }
 
     // Auto-enter fullscreen if the site has fullscreenMode enabled
@@ -3813,11 +3902,21 @@ class _WebSpacePageState extends State<WebSpacePage>
     // gesture is dead, so pull-to-refresh can't recover it — only this relayout
     // can. _probeRendererAndRecover above only relayouts web content, not the
     // surface (see its doc), so it does not cover this. No-op off Android.
+    //
+    // Activating a site whose document is still in flight has the PAUSE-021
+    // ordering on top of that: this nudge drains against a surface that has
+    // nothing to show yet, and the commit lands afterwards. Latch it so
+    // onLoadSettled repaints the committed document (PAUSE-025).
+    if (target.isLoading) _surfaceRepaint.noteCommitPending();
     _nudgeSurfaceRepaint();
     // _loadedIndices may have changed (LRU eviction, conflict unload,
     // first-load of target), so re-evaluate the background refresh
     // schedule. No-op on non-iOS / non-Android.
     unawaited(_updateBackgroundRefreshSchedule());
+    // Same trigger for the iOS audio session: the first load of a
+    // background-audio site must activate `.playback` before the user
+    // starts playback in it.
+    unawaited(_updateBackgroundAudioSession());
     } finally {
       // Clear the in-flight marker only if we still own it; a newer
       // _setCurrentIndex caller will have already overwritten it with
@@ -3889,6 +3988,42 @@ class _WebSpacePageState extends State<WebSpacePage>
       sensitivity: LogSensitivity.sensitive,
     );
     return true;
+  }
+
+  /// Quiesce the site the user is leaving — a site switch, or a return to the
+  /// webspace list (which also captures nav state).
+  ///
+  /// Ordering is CAM-012 / BGAUDIO-009: on iOS the per-instance pause blocks
+  /// the page's JS thread, so the camera stop and the media pause have to be
+  /// dispatched before it or they sit queued behind it forever. That same
+  /// freeze is why the engine bounds the sequence — a page an earlier pause
+  /// left frozen never answers `evaluateJavascript` again, and the caller's
+  /// own state change must not hang on it (NAV-010).
+  Future<void> _quiesceOutgoingSite(
+    WebViewModel model,
+    int version, {
+    bool captureState = true,
+  }) async {
+    final result = await SiteTeardownEngine.quiesceOutgoing(
+      superseded: () => version != _setCurrentIndexVersion,
+      steps: [
+        if (captureState)
+          SiteTeardownStep('captureState', () => _captureStateBytes(model)),
+        SiteTeardownStep('stopRealCameraCapture', model.stopRealCameraCapture),
+        SiteTeardownStep('pauseMediaPlayback', model.pauseMediaPlayback),
+        SiteTeardownStep('pauseWebView', model.pauseWebView),
+      ],
+    );
+    if (result.isClean) return;
+    LogService.instance.log(
+      'WebView',
+      'Teardown of "${model.name}" ran ${result.ran}'
+          '${result.errors.isEmpty ? '' : ', failed ${result.errors}'}'
+          '${result.stalledOn == null ? '' : ', stalled on ${result.stalledOn}'}'
+          '${result.supersededBefore == null ? '' : ', superseded before ${result.supersededBefore}'}',
+      level: result.stalledOn == null ? LogLevel.info : LogLevel.warning,
+      sensitivity: LogSensitivity.sensitive,
+    );
   }
 
   /// Capture state and flip the lifecycle to [SiteLifecycleState.savedForRestore].
@@ -4253,6 +4388,9 @@ class _WebSpacePageState extends State<WebSpacePage>
           prefs.getBool('tabBarButton') ?? prefs.getBool('tabBarButtonInFullscreen') ?? false;
       _tabBarButtonOnRight = prefs.getBool('tabBarButtonOnRight') ?? true;
       _fullscreenOnShortcut = prefs.getBool('fullscreenOnShortcut') ?? true;
+      _backAtHistoryStart = (prefs.getBool(kBackOpensMenuKey) ?? false)
+          ? BackAtHistoryStart.openMenu
+          : BackAtHistoryStart.ignore;
       _tabMaxWidth = prefs.getInt('tabMaxWidth') ?? 140;
       _showStatsBanner = prefs.getBool('showStatsBanner') ?? true;
       WebViewFactory.backForwardCacheEnabled =
@@ -4575,6 +4713,8 @@ class _WebSpacePageState extends State<WebSpacePage>
               AppLifecycleState.resumed,
         );
     BackgroundTaskService.instance.initialize();
+    // BGAUDIO-006: wire the Android media-notification transport channel.
+    MediaSessionService.instance.initialize();
     if (_anyNotificationSites()) {
       unawaited(BackgroundTaskService.instance.scheduleNextRefresh());
     }
@@ -4768,7 +4908,7 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// No-op (returns null) on non-Android — iOS uses `BGAppRefreshTask`
   /// which doesn't share a process-wide proxy controller.
   String? _notificationsBlockedBySite(WebViewModel target) {
-    if (!Platform.isAndroid) return null;
+    if (!hostIsAndroid) return null;
     final others = <WebViewModel>[];
     for (final m in _webViewModels) {
       if (identical(m, target)) continue;
@@ -4795,7 +4935,7 @@ class _WebSpacePageState extends State<WebSpacePage>
   /// Both submissions are idempotent — the platform replaces any existing
   /// pending request for the same identifier / unique-work name.
   Future<void> _updateBackgroundRefreshSchedule() async {
-    if (!Platform.isIOS && !Platform.isAndroid) return;
+    if (!hostIsIOS && !hostIsAndroid) return;
     int enabled = 0;
     int loaded = 0;
     for (int i = 0; i < _webViewModels.length; i++) {
@@ -4814,6 +4954,31 @@ class _WebSpacePageState extends State<WebSpacePage>
       await BackgroundTaskService.instance.scheduleNextRefresh();
     } else {
       await BackgroundTaskService.instance.cancelScheduledRefreshes();
+    }
+  }
+
+  /// BGAUDIO-003: keep the iOS `.playback` audio session in sync with
+  /// whether any loaded site has background audio enabled. Active playback
+  /// under that category (plus the `audio` UIBackgroundModes entry) is what
+  /// keeps iOS from suspending the app when it leaves the foreground.
+  /// No-op off iOS. Idempotent — safe to fire from settings-save, site
+  /// load/unload, and the lifecycle-pause path.
+  Future<void> _updateBackgroundAudioSession() async {
+    bool any = false;
+    for (int i = 0; i < _webViewModels.length; i++) {
+      if (!_webViewModels[i].effectiveBackgroundAudioEnabled) continue;
+      if (!_loadedIndices.contains(i)) continue;
+      any = true;
+      break;
+    }
+    await BackgroundTaskService.instance.setBackgroundAudioActive(any);
+    // With no background-audio site loaded there is nothing to drive the media
+    // surface — tear it down. On iOS that also removes the Now Playing entry
+    // WebKit publishes for any page that plays, which otherwise outlives the
+    // audio as a control that reaches nothing (BGAUDIO-009/010). While a site
+    // is loaded the surface is raised/updated by its page-JS reports.
+    if (!any) {
+      await MediaSessionService.instance.clearOsMediaSurface();
     }
   }
 
@@ -4907,7 +5072,10 @@ class _WebSpacePageState extends State<WebSpacePage>
     if (index == _activationInFlightIndex) return SiteRetentionPriority.activating;
     if (index >= 0 && index < _webViewModels.length) {
       final m = _webViewModels[index];
-      if (m.effectiveNotificationsEnabled) {
+      // Background-audio sites share the notification retention tier: both
+      // exist to keep running while other sites take the screen, so both
+      // are evicted only after every ordinary site is gone.
+      if (m.effectiveNotificationsEnabled || m.effectiveBackgroundAudioEnabled) {
         return SiteRetentionPriority.notification;
       }
     }
@@ -4929,6 +5097,7 @@ class _WebSpacePageState extends State<WebSpacePage>
     required bool dnsBlockEnabled,
     required bool contentBlockEnabled,
     required bool localCdnEnabled,
+    required bool contributesBlockStats,
     required bool trackingProtectionEnabled,
     bool letterboxEnabled = false,
     int? spoofWindowWidth,
@@ -4964,6 +5133,7 @@ class _WebSpacePageState extends State<WebSpacePage>
           dnsBlockEnabled: dnsBlockEnabled,
           contentBlockEnabled: contentBlockEnabled,
           localCdnEnabled: localCdnEnabled,
+          contributesBlockStats: contributesBlockStats,
           trackingProtectionEnabled: trackingProtectionEnabled,
           letterboxEnabled: letterboxEnabled,
           spoofWindowWidth: spoofWindowWidth,
@@ -4985,6 +5155,8 @@ class _WebSpacePageState extends State<WebSpacePage>
           userScripts: userScripts,
           onConfirmScriptFetch: _confirmScriptFetch,
           onProtectedMediaRequest: _promptProtectedMedia,
+          onCameraDecision: _resolveCameraDecision,
+          onMicrophoneDecision: _resolveMicrophoneDecision,
           onShowUrlBarChanged: (show) async {
             if (!mounted) return;
             setState(() {
@@ -5072,6 +5244,168 @@ class _WebSpacePageState extends State<WebSpacePage>
       ),
     );
     return result ?? false;
+  }
+
+  /// Stable resolver for a camera-only permission request (getUserMedia
+  /// video, e.g. a banking site's QR scanner). On the first request it shows
+  /// a Block / Use-a-media-file / Allow popup; picking "Use a media file"
+  /// opens a file picker and the chosen media becomes the site's simulated
+  /// camera. The per-site decision is remembered by the caller (the
+  /// parent webview persists it on the `WebViewModel`; nested webviews
+  /// remember it in-memory), so this only collects user intent. The Android
+  /// app-level permission is handled separately at real-grant time by
+  /// `CameraPermissionService`.
+  ///
+  /// [current] is the site's stored mode: a site already set to `virtual`
+  /// but missing a source skips the popup and goes straight to the picker.
+  /// A dismissed popup returns [CameraAccessMode.ask] so the request is
+  /// denied once and the popup returns next time; a cancelled picker leaves
+  /// the prior mode intact for the same reason.
+  Future<CameraDecision> _resolveCameraDecision(
+      String origin, CameraAccessMode current) async {
+    if (!mounted) return const CameraDecision.block();
+    if (current == CameraAccessMode.virtual) {
+      return _pickVirtualCameraOrKeep(current);
+    }
+    final loc = AppLocalizations.of(context);
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(loc.homeCameraAccessTitle),
+        content: Text(loc.homeCameraAccessBody(origin)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'block'),
+            child: Text(loc.homeBlockAction),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'file'),
+            child: Text(loc.homeCameraUseFileAction),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'real'),
+            child: Text(loc.homeAllowAction),
+          ),
+        ],
+      ),
+    );
+    switch (choice) {
+      case 'real':
+        return const CameraDecision(CameraAccessMode.real);
+      case 'file':
+        return _pickVirtualCameraOrKeep(CameraAccessMode.ask);
+      case 'block':
+        return const CameraDecision.block();
+      default:
+        // Dismissed: unresolved, deny this once and ask again next time.
+        return const CameraDecision(CameraAccessMode.ask);
+    }
+  }
+
+  /// Runs the image/video picker. On success returns a `virtual` decision
+  /// carrying the source; on cancel or error returns [fallback] with no
+  /// source, so the caller's stored mode is preserved and the request is
+  /// denied this once.
+  Future<CameraDecision> _pickVirtualCameraOrKeep(
+      CameraAccessMode fallback) async {
+    final result = await VirtualCameraService.pickSource();
+    if (result.source != null) {
+      return CameraDecision(CameraAccessMode.virtual, result.source);
+    }
+    if (result.error != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_virtualCameraErrorText(result.error!))),
+      );
+    }
+    return CameraDecision(fallback);
+  }
+
+  String _virtualCameraErrorText(VirtualCameraPickError error) {
+    final loc = AppLocalizations.of(context);
+    switch (error) {
+      case VirtualCameraPickError.tooLarge:
+        return loc.homeCameraSourceTooLarge;
+      case VirtualCameraPickError.type:
+      case VirtualCameraPickError.read:
+        return loc.homeCameraSourceError;
+    }
+  }
+
+  /// Stable resolver for a microphone request (any `getUserMedia` asking for
+  /// audio). On the first request it shows a Block / Use-audio-file popup;
+  /// picking the file opens a picker and the chosen clip becomes the site's
+  /// virtual microphone, looped forever. There is deliberately no "allow the
+  /// real microphone" answer: the app never asks the OS for a recording
+  /// permission. The per-site decision is remembered by the caller (the
+  /// parent webview persists it on the `WebViewModel`; nested webviews
+  /// remember it in-memory), so this only collects user intent.
+  ///
+  /// [current] is the site's stored mode: a site already set to `virtual` but
+  /// missing a clip skips the popup and goes straight to the picker. A
+  /// dismissed popup returns [MicrophoneAccessMode.ask] so the request is
+  /// denied once and the popup returns next time; a cancelled picker leaves
+  /// the prior mode intact for the same reason.
+  Future<MicrophoneDecision> _resolveMicrophoneDecision(
+      String origin, MicrophoneAccessMode current) async {
+    if (!mounted) return const MicrophoneDecision.block();
+    if (current == MicrophoneAccessMode.virtual) {
+      return _pickVirtualMicrophoneOrKeep(current);
+    }
+    final loc = AppLocalizations.of(context);
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text(loc.homeMicrophoneAccessTitle),
+        content: Text(loc.homeMicrophoneAccessBody(origin)),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'block'),
+            child: Text(loc.homeBlockAction),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'file'),
+            child: Text(loc.homeMicrophoneUseFileAction),
+          ),
+        ],
+      ),
+    );
+    switch (choice) {
+      case 'file':
+        return _pickVirtualMicrophoneOrKeep(MicrophoneAccessMode.ask);
+      case 'block':
+        return const MicrophoneDecision.block();
+      default:
+        // Dismissed: unresolved, deny this once and ask again next time.
+        return const MicrophoneDecision(MicrophoneAccessMode.ask);
+    }
+  }
+
+  /// Runs the audio picker. On success returns a `virtual` decision carrying
+  /// the clip; on cancel or error returns [fallback] with no source, so the
+  /// caller's stored mode is preserved and the request is denied this once.
+  Future<MicrophoneDecision> _pickVirtualMicrophoneOrKeep(
+      MicrophoneAccessMode fallback) async {
+    final result = await VirtualMicrophoneService.pickSource();
+    if (result.source != null) {
+      return MicrophoneDecision(MicrophoneAccessMode.virtual, result.source);
+    }
+    if (result.error != null && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_virtualMicrophoneErrorText(result.error!))),
+      );
+    }
+    return MicrophoneDecision(fallback);
+  }
+
+  String _virtualMicrophoneErrorText(VirtualMediaPickError error) {
+    final loc = AppLocalizations.of(context);
+    switch (error) {
+      case VirtualMediaPickError.tooLarge:
+        return loc.homeMicrophoneSourceTooLarge;
+      case VirtualMediaPickError.type:
+      case VirtualMediaPickError.read:
+        return loc.homeMicrophoneSourceError;
+    }
   }
 
   void _toggleFind() {
@@ -5544,6 +5878,12 @@ class _WebSpacePageState extends State<WebSpacePage>
           backup.globalPrefs['tabBarButtonOnRight'] as bool? ?? _tabBarButtonOnRight;
       _fullscreenOnShortcut =
           backup.globalPrefs['fullscreenOnShortcut'] as bool? ?? _fullscreenOnShortcut;
+      final backOpensMenu = backup.globalPrefs[kBackOpensMenuKey] as bool?;
+      if (backOpensMenu != null) {
+        _backAtHistoryStart = backOpensMenu
+            ? BackAtHistoryStart.openMenu
+            : BackAtHistoryStart.ignore;
+      }
       _tabMaxWidth =
           backup.globalPrefs['tabMaxWidth'] as int? ?? _tabMaxWidth;
       _showStatsBanner =
@@ -5746,6 +6086,12 @@ class _WebSpacePageState extends State<WebSpacePage>
       return null;
     }
     return _webViewModels[_currentIndex!].getController(launchUrl, _cookieManager, _containerCookieManager, _saveWebViewModels, globalUserScripts: _globalUserScripts);
+  }
+
+  void _openDrawerFromBackGesture(ScaffoldState? scaffoldState) {
+    if (scaffoldState == null) return;
+    _drawerOpenedByBackGesture = true;
+    scaffoldState.openDrawer();
   }
 
   /// Navigate the visible webview back one history entry, then recomposite the
@@ -5984,6 +6330,11 @@ class _WebSpacePageState extends State<WebSpacePage>
             }
           },
         ),
+        // Protection report shield, badged with the week's block count.
+        // Same visibility rule as the settings gear: the webspaces list is
+        // the app's "home", which is where a protection summary belongs.
+        if (_currentIndex == null || _currentIndex! >= _webViewModels.length)
+          _buildProtectionShield(context, loc),
         // Settings icon button (only visible on webspaces list screen)
         if (_currentIndex == null || _currentIndex! >= _webViewModels.length)
           IconButton(
@@ -6041,6 +6392,16 @@ class _WebSpacePageState extends State<WebSpacePage>
                         _fullscreenOnShortcut = value;
                       });
                       _saveFullscreenOnShortcut();
+                    },
+                    backOpensMenu:
+                        _backAtHistoryStart == BackAtHistoryStart.openMenu,
+                    onBackOpensMenuChanged: (value) {
+                      setState(() {
+                        _backAtHistoryStart = value
+                            ? BackAtHistoryStart.openMenu
+                            : BackAtHistoryStart.ignore;
+                      });
+                      _saveBackAtHistoryStart();
                     },
                     tabBarButton: _tabBarButton,
                     onTabBarButtonChanged: (value) {
@@ -6567,11 +6928,12 @@ class _WebSpacePageState extends State<WebSpacePage>
                   homeTitle: model.name,
                   siteId: model.siteId,
                   incognito: model.incognito,
-                  thirdPartyCookiesEnabled: model.thirdPartyCookiesEnabled,
+                  thirdPartyCookiesEnabled: model.effectiveThirdPartyCookiesEnabled,
                   clearUrlEnabled: model.clearUrlEnabled,
                   dnsBlockEnabled: model.dnsBlockEnabled,
                   contentBlockEnabled: model.contentBlockEnabled,
                   localCdnEnabled: model.localCdnEnabled,
+                  contributesBlockStats: model.contributesBlockStats,
                   trackingProtectionEnabled: model.trackingProtectionEnabled,
                   letterboxEnabled: model.letterboxEnabled,
                   spoofWindowWidth: model.spoofWindowWidth,
@@ -7011,7 +7373,7 @@ class _WebSpacePageState extends State<WebSpacePage>
                             final file = picked.files.first;
                             Uint8List? raw = file.bytes;
                             if (raw == null && file.path != null) {
-                              raw = await File(file.path!).readAsBytes();
+                              raw = await hostReadFileBytes(file.path!);
                             }
                             final processed = raw == null
                                 ? null
@@ -7334,7 +7696,7 @@ class _WebSpacePageState extends State<WebSpacePage>
     // (remap[tile] == siteId) — so deleting a site an orphaned tile was
     // rebound to still prompts about that tile.
     Set<String> reachingTiles = const {};
-    if (Platform.isAndroid) {
+    if (hostIsAndroid) {
       final pinnedNow = await ShortcutService.getPinnedSiteIds();
       if (!mounted) return;
       reachingTiles = ShortcutPinState.tilesReaching(
@@ -7431,6 +7793,8 @@ class _WebSpacePageState extends State<WebSpacePage>
     // down the background refresh schedule if so. No-op on other
     // platforms.
     unawaited(_updateBackgroundRefreshSchedule());
+    // May also have removed the last background-audio site.
+    unawaited(_updateBackgroundAudioSession());
 
     if (hadPinnedShortcut) {
       await _handleDeletedSiteShortcut(reachingTiles);
@@ -7439,13 +7803,17 @@ class _WebSpacePageState extends State<WebSpacePage>
     // delete would fire blindly on every deletion. Instead, tombstone silently:
     // if a tile was bound here it stays resolvable and routes (or offers to
     // reroute) when actually tapped (HS-011/HS-014). The list is capped.
-    if ((Platform.isIOS || Platform.isMacOS) && !deletedModel.isArchiveTier) {
+    if ((hostIsIOS || hostIsMacOS) && !deletedModel.isArchiveTier) {
       await _recordShortcutTombstone(
           deletedSiteId, deletedModel.name, deletedModel.initUrl);
     }
 
     if (!mounted) return;
-    Navigator.pop(context);
+    // closeDrawer() (not Navigator.pop): `context` belongs to the drawer tile
+    // of the site just removed, so by now its element can be defunct and
+    // Navigator.of would fail its null check — deterministically so when the
+    // deleted site was the last tile. Idempotent, like the other drawer taps.
+    _scaffoldKey.currentState?.closeDrawer();
   }
 
   /// Shared Keep/Reassign/Disable chooser for the delete-time shortcut prompt
@@ -7565,6 +7933,30 @@ class _WebSpacePageState extends State<WebSpacePage>
             child: Text(loc.commonCancel),
           ),
         ],
+      ),
+    );
+  }
+
+  /// Shield + week's block count in the app bar of the webspaces list,
+  /// opening the protection report. Reads the counters at build time rather
+  /// than subscribing: this bar only renders on the list screen, where no
+  /// page is loading, and returning from a site rebuilds it anyway.
+  Widget _buildProtectionShield(BuildContext context, AppLocalizations loc) {
+    final weekTotal = BlockStatsService.instance.engine.totalForLastDays(7);
+    return Badge.count(
+      count: weekTotal,
+      isLabelVisible: weekTotal > 0,
+      child: IconButton(
+        icon: const Icon(Icons.shield_outlined),
+        tooltip: loc.blockStatsTitle,
+        onPressed: () async {
+          await Navigator.push(
+            context,
+            MaterialPageRoute(builder: (context) => const BlockStatsScreen()),
+          );
+          if (!mounted) return;
+          setState(() {});
+        },
       ),
     );
   }
@@ -7703,97 +8095,7 @@ class _WebSpacePageState extends State<WebSpacePage>
             setState(() {});
             await _saveCurrentIndex();
           },
-          child: LayoutBuilder(
-            builder: (context, constraints) {
-              final isWide = constraints.maxWidth > constraints.maxHeight * 1.5;
-              return Container(
-                decoration: isSelected
-                    ? BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        color: theme.colorScheme.primaryContainer.withAlpha(80),
-                      )
-                    : null,
-                padding: isWide
-                    ? const EdgeInsets.symmetric(vertical: 4, horizontal: 12)
-                    : const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
-                child: isWide
-                    ? Row(
-                        children: [
-                          Container(
-                            width: 36,
-                            height: 36,
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(8),
-                              color: theme.colorScheme.surfaceContainerHighest,
-                            ),
-                            clipBehavior: Clip.antiAlias,
-                            child: Center(
-                              child: UnifiedFaviconImage(
-                                url: _webViewModels[index].initUrl,
-                                size: 28,
-                                proxy: _webViewModels[index].proxySettings,
-                                customIcon: _webViewModels[index].customIconPng,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Column(
-                              mainAxisAlignment: MainAxisAlignment.center,
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  _webViewModels[index].getDisplayName(),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(fontSize: 13),
-                                ),
-                                Text(
-                                  extractDomain(_webViewModels[index].initUrl),
-                                  maxLines: 1,
-                                  overflow: TextOverflow.ellipsis,
-                                  style: TextStyle(fontSize: 11, color: Colors.grey),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      )
-                    : Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Container(
-                            width: 48,
-                            height: 48,
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(12),
-                              color: theme.colorScheme.surfaceContainerHighest,
-                            ),
-                            clipBehavior: Clip.antiAlias,
-                            child: Center(
-                              child: UnifiedFaviconImage(
-                                url: _webViewModels[index].initUrl,
-                                size: 36,
-                                proxy: _webViewModels[index].proxySettings,
-                                customIcon: _webViewModels[index].customIconPng,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 4),
-                          Flexible(
-                            child: Text(
-                              _webViewModels[index].getDisplayName(),
-                              maxLines: 2,
-                              overflow: TextOverflow.ellipsis,
-                              textAlign: TextAlign.center,
-                              style: TextStyle(fontSize: 11),
-                            ),
-                          ),
-                        ],
-                      ),
-              );
-            },
-          ),
+          child: _buildSiteGridTileContent(context, index, isSelected, theme),
         ),
     );
   }
@@ -7853,27 +8155,51 @@ class _WebSpacePageState extends State<WebSpacePage>
                         ],
                       ),
                     ),
+                    SitePermissionBadges(
+                      model: _webViewModels[index],
+                      iconSize: 12,
+                    ),
                   ],
                 )
               : Column(
                   mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Container(
-                      width: 48,
-                      height: 48,
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        color: theme.colorScheme.surfaceContainerHighest,
-                      ),
-                      clipBehavior: Clip.antiAlias,
-                      child: Center(
-                        child: UnifiedFaviconImage(
-                          url: _webViewModels[index].initUrl,
-                          size: 36,
-                          proxy: _webViewModels[index].proxySettings,
-                          customIcon: _webViewModels[index].customIconPng,
+                    Stack(
+                      // The badge strip is anchored to the favicon's bottom
+                      // edge and can be wider than it; the tile has no spare
+                      // vertical room to stack it below the name.
+                      clipBehavior: Clip.none,
+                      children: [
+                        Container(
+                          width: 48,
+                          height: 48,
+                          decoration: BoxDecoration(
+                            borderRadius: BorderRadius.circular(12),
+                            color: theme.colorScheme.surfaceContainerHighest,
+                          ),
+                          clipBehavior: Clip.antiAlias,
+                          child: Center(
+                            child: UnifiedFaviconImage(
+                              url: _webViewModels[index].initUrl,
+                              size: 36,
+                              proxy: _webViewModels[index].proxySettings,
+                              customIcon: _webViewModels[index].customIconPng,
+                            ),
+                          ),
                         ),
-                      ),
+                        Positioned(
+                          left: 0,
+                          right: 0,
+                          bottom: -2,
+                          child: Center(
+                            child: SitePermissionBadges(
+                              model: _webViewModels[index],
+                              iconSize: 9,
+                              overlay: true,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                     const SizedBox(height: 4),
                     Flexible(
@@ -7963,7 +8289,19 @@ class _WebSpacePageState extends State<WebSpacePage>
                         // SurfaceView can come back blank-white. Reads
                         // _currentIndex live at fire time; no-op off Android.
                         webViewModel.onControllerReady = () {
-                          if (index == _currentIndex) _nudgeSurfaceRepaint();
+                          if (index != _currentIndex) return;
+                          // The nudge alone covers only a surface whose first
+                          // document has already committed. A fresh webview's
+                          // initial load commits an unbounded time after the
+                          // controller attaches — later than this loop's ~0.6s
+                          // budget on a slow page — so latch the commit too and
+                          // let onLoadSettled repaint it (PAUSE-025).
+                          _surfaceRepaint.noteCommitPending();
+                          if (hostIsAndroid) {
+                            LogService.instance.log(
+                                'SurfaceDiag', 'trigger=controller-attach -> nudge');
+                          }
+                          _nudgeSurfaceRepaint();
                         };
 
                         // A reload of the visible site blanks the surface
@@ -7980,7 +8318,7 @@ class _WebSpacePageState extends State<WebSpacePage>
                         webViewModel.onReloadIssued = () {
                           if (index != _currentIndex) return;
                           _surfaceRepaint.reloadIssued();
-                          if (Platform.isAndroid) {
+                          if (hostIsAndroid) {
                             LogService.instance
                                 .log('SurfaceDiag', 'trigger=reload -> nudge');
                           }
@@ -7989,9 +8327,9 @@ class _WebSpacePageState extends State<WebSpacePage>
                         webViewModel.onLoadSettled = () {
                           if (index != _currentIndex) return;
                           if (!_surfaceRepaint.consumeLoadSettled()) return;
-                          if (Platform.isAndroid) {
+                          if (hostIsAndroid) {
                             LogService.instance.log(
-                                'SurfaceDiag', 'trigger=reload-settled -> nudge');
+                                'SurfaceDiag', 'trigger=commit-settled -> nudge');
                           }
                           _nudgeSurfaceRepaint();
                         };
@@ -8097,6 +8435,9 @@ class _WebSpacePageState extends State<WebSpacePage>
                                   isActive: () => _currentIndex == index,
                                   onConfirmScriptFetch: _confirmScriptFetch,
                                   onProtectedMediaRequest: _promptProtectedMedia,
+                                  onCameraDecision: _resolveCameraDecision,
+                                  onMicrophoneDecision:
+                                      _resolveMicrophoneDecision,
                                   onUntrustedCertificate: _promptUntrustedCertificate,
                                   onExternalSchemeUrl: (url, info) async {
                                     if (!mounted) return;
@@ -8260,60 +8601,86 @@ class _WebSpacePageState extends State<WebSpacePage>
       // On Android, always intercept back so the gesture only ever navigates
       // webview history (never exits the app). On other platforms, allow pop
       // only when no webview is visible.
-      canPop: Platform.isAndroid ? false : !webviewIsVisible,
+      canPop: hostIsAndroid ? false : !webviewIsVisible,
       onPopInvokedWithResult: (didPop, _) async {
         if (didPop || _isBackHandling) return;
         _isBackHandling = true;
         try {
           final scaffoldState = _scaffoldKey.currentState;
-          // If the drawer is open, just close it.
-          if (scaffoldState != null && scaffoldState.isDrawerOpen) {
-            LogService.instance.log('Navigation', 'Back gesture: closing open drawer');
-            Navigator.pop(context);
-            return;
-          }
-          // The back gesture only navigates webview history. It never opens
-          // the drawer and never exits the app; if there is nothing to go
-          // back to, it is a no-op.
+          final drawerOpen = scaffoldState?.isDrawerOpen ?? false;
           final controller = getController();
-          if (controller == null) {
-            LogService.instance.log('Navigation', 'Back gesture: no controller, ignoring');
-            return;
-          }
           // Android's canGoBack() is reliable (including for pushState/SPA
           // entries on Chromium). Trust it directly: URL-comparison can
           // false-positive when goBack() succeeds but the navigation
-          // hasn't propagated within the timeout.
-          if (Platform.isAndroid) {
-            if (await controller.canGoBack()) {
-              await _goBackAndRepaint(controller);
-              LogService.instance.log('Navigation', 'Back gesture: navigated back (canGoBack)');
-            } else {
-              LogService.instance.log('Navigation', 'Back gesture: no history, ignoring');
-            }
-            return;
-          }
-          // iOS/macOS: canGoBack() can return false for pushState entries,
-          // so attempt goBack() unconditionally and use URL comparison as
-          // the authoritative check.
-          final urlBefore = (await controller.getUrl())?.toString();
-          await controller.goBack();
-          // Give the native webview time to process the navigation
-          await Future.delayed(const Duration(milliseconds: 150));
+          // hasn't propagated within the timeout. iOS/macOS decide from the
+          // URL diff instead, so they don't sample it at all.
+          final canGoBack = !drawerOpen && controller != null && hostIsAndroid
+              ? await controller.canGoBack()
+              : false;
           if (!mounted) return;
-          final urlAfter = (await controller.getUrl())?.toString();
-          if (urlBefore == urlAfter) {
-            LogService.instance.log(
-              'Navigation',
-              'Back gesture: URL unchanged ($urlAfter), ignoring',
-              sensitivity: LogSensitivity.sensitive,
-            );
-          } else {
-            LogService.instance.log(
-              'Navigation',
-              'Back gesture: navigated back from $urlBefore to $urlAfter',
-              sensitivity: LogSensitivity.sensitive,
-            );
+          final action = decideBackGesture(
+            drawerOpen: drawerOpen,
+            drawerOpenedByGesture: _drawerOpenedByBackGesture,
+            drawerAvailable: !_kioskLocked,
+            hasWebView: controller != null,
+            trustsCanGoBack: hostIsAndroid,
+            canGoBack: canGoBack,
+            atHistoryStart: _backAtHistoryStart,
+            canExitApp: hostIsAndroid,
+          );
+          switch (action) {
+            case BackGestureAction.ignore:
+              LogService.instance.log('Navigation', 'Back gesture: nothing to do, ignoring');
+              break;
+            case BackGestureAction.closeDrawer:
+              LogService.instance.log('Navigation', 'Back gesture: closing open drawer');
+              _scaffoldKey.currentState?.closeDrawer();
+              break;
+            case BackGestureAction.closeDrawerAndExit:
+              LogService.instance.log('Navigation', 'Back gesture: closing drawer and leaving app');
+              _scaffoldKey.currentState?.closeDrawer();
+              await SystemNavigator.pop();
+              break;
+            case BackGestureAction.openDrawer:
+              LogService.instance.log('Navigation', 'Back gesture: no history, opening drawer');
+              _openDrawerFromBackGesture(scaffoldState);
+              break;
+            case BackGestureAction.exitApp:
+              LogService.instance.log('Navigation', 'Back gesture: no site shown, leaving app');
+              await SystemNavigator.pop();
+              break;
+            case BackGestureAction.goBack:
+              await _goBackAndRepaint(controller!);
+              LogService.instance.log('Navigation', 'Back gesture: navigated back (canGoBack)');
+              break;
+            case BackGestureAction.attemptGoBack:
+              // iOS/macOS: canGoBack() can return false for pushState
+              // entries, so attempt goBack() unconditionally and use URL
+              // comparison as the authoritative check.
+              final urlBefore = (await controller!.getUrl())?.toString();
+              await controller.goBack();
+              // Give the native webview time to process the navigation
+              await Future.delayed(const Duration(milliseconds: 150));
+              if (!mounted) return;
+              final urlAfter = (await controller.getUrl())?.toString();
+              final urlChanged = urlBefore != urlAfter;
+              LogService.instance.log(
+                'Navigation',
+                urlChanged
+                    ? 'Back gesture: navigated back from $urlBefore to $urlAfter'
+                    : 'Back gesture: URL unchanged ($urlAfter)',
+                sensitivity: LogSensitivity.sensitive,
+              );
+              final next = decideAfterAttemptedGoBack(
+                urlChanged: urlChanged,
+                drawerAvailable: !_kioskLocked,
+                atHistoryStart: _backAtHistoryStart,
+              );
+              if (next == BackGestureAction.openDrawer) {
+                LogService.instance.log('Navigation', 'Back gesture: no history, opening drawer');
+                _openDrawerFromBackGesture(_scaffoldKey.currentState);
+              }
+              break;
           }
         } finally {
           _isBackHandling = false;
@@ -8321,6 +8688,11 @@ class _WebSpacePageState extends State<WebSpacePage>
       },
       child: Scaffold(
       key: _scaffoldKey,
+      // Clearing on close covers every way the drawer goes away; a drawer
+      // opened by any other affordance therefore starts with the flag down.
+      onDrawerChanged: (isOpen) {
+        if (!isOpen) _drawerOpenedByBackGesture = false;
+      },
       // Disable the drawer edge-swipe whenever a webview is active so the back
       // gesture never opens the drawer. The drawer is reached via the AppBar
       // menu button instead.

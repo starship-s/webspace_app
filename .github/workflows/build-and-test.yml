@@ -52,6 +52,12 @@ jobs:
             puppeteer-${{ runner.os }}-
       - name: Install npm dependencies
         run: npm ci
+      # DESIGN-001: the designer's environment is the real app, so every UI
+      # file has to keep compiling for web. This is a static import walk, so
+      # it costs a second and catches the usual cause: a widget reaching
+      # dart:io through a service instead of through a platform seam.
+      - name: Check UI files still compile for web
+        run: npm run design:check
       # JS shim + localization tests (jsdom + node:test). Node-only, so
       # they belong in this lightweight checks job rather than gated behind
       # a platform build; runs early to fail fast.
@@ -120,6 +126,81 @@ jobs:
       # requireBrowser() in test/browser/helpers/launch.js.
       - name: Run browser tests (real-Chromium shim tier)
         run: npm run test:browser
+
+  design-web:
+    name: Design gallery + designer app
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: '.nvmrc'
+          cache: 'npm'
+      - name: Cache Puppeteer Chromium
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            puppeteer-${{ runner.os }}-
+      - name: Install npm dependencies
+        run: npm ci
+      - name: Setup Flutter (for Dart SDK)
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+      - name: Cache fvm Flutter SDK
+        uses: actions/cache@v4
+        with:
+          path: ~/.fvm/versions
+          key: fvm-${{ runner.os }}-${{ hashFiles('**/.fvmrc') }}
+          restore-keys: |
+            fvm-${{ runner.os }}-
+      - name: Install fvm
+        run: |
+          dart pub global activate fvm
+          echo "$HOME/.pub-cache/bin" >> $GITHUB_PATH
+      - name: Setup Flutter with fvm
+        run: |
+          fvm install
+          fvm use --force
+      - name: Cache pub dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.pub-cache
+            .dart_tool
+          key: pub-${{ runner.os }}-${{ hashFiles('**/pubspec.lock') }}
+          restore-keys: |
+            pub-${{ runner.os }}-
+      - name: Get dependencies
+        run: fvm flutter pub get --enforce-lockfile
+      # DESIGN-002 + DESIGN-003. The build is the compile gate; shoot.js is
+      # the only check that can see a correct widget tree render an empty
+      # frame, and it fails on unexpected page errors too.
+      - name: Build the design gallery
+        run: ./scripts/design_web.sh gallery
+      - name: Install Puppeteer Chromium
+        run: npx puppeteer browsers install chrome
+      - name: Screenshot every card
+        run: node tool/design_gallery/shoot.js
+      - name: Upload design cards
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: design-cards
+          path: build/design_cards
+          if-no-files-found: warn
+      # DESIGN-002 + DESIGN-008. The designer drives this build, and the
+      # packing step is what makes it survive being served from a
+      # subdirectory inside the Claude Design project.
+      - name: Build the designer app
+        run: ./scripts/design_web.sh app
+      - name: Pack it for the design project
+        run: node tool/design_gallery/pack_app.js
+      - name: Boot the packed app in an iframe
+        run: node --test --test-timeout=180000 test/browser/design_app_packaging.test.js
 
   build-android:
     name: Build Android
@@ -371,11 +452,23 @@ jobs:
           disable-animations: true
           script: echo "Generated AVD snapshot for caching."
 
-      # White-screen pixel scenarios (BUG-001 / INTEG-010): drive the known
-      # blank-screen entry paths on the booted emulator and assert on
-      # composited window pixels over the webview via SurfaceDiagPlugin's
-      # PixelCopy. Runs on every push/PR.
-      - name: Run white-screen pixel scenarios
+      # Emulator scenarios, run on every push/PR:
+      #   INTEG-010 white-screen pixels — drive the known blank-screen entry
+      #     paths and assert on composited window pixels over the webview via
+      #     SurfaceDiagPlugin's PixelCopy;
+      #   INTEG-013 home shortcuts — launch, menu gating, orphan routing and
+      #     the delete-time tile prompt through the real widget tree;
+      #   CAM-010 per-site camera modes — the virtual source must reach the
+      #     page through the real Android WebView (the real-camera scenario
+      #     self-skips: the AVD camera never settles a getUserMedia call);
+      #   BGAUDIO-005/006 background audio — the JS-liveness exemption and its
+      #     negative control against a real pauseTimers(), plus the media
+      #     foreground service, asserted through the OS notification list;
+      #   BUG-008 page zoom — the per-site zoom contract against the real
+      #     Android System WebView, the one engine with the wide-viewport
+      #     quirk (the Linux/macOS jobs run the same file on WPE/WKWebView);
+      #   INTEG-011/012 lifecycle + background refresh, adb-driven.
+      - name: Run emulator integration scenarios
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 34
@@ -384,17 +477,28 @@ jobs:
           profile: pixel_5
           disk-size: 4096M
           force-avd-creation: false
+          # No `-camera-back emulated`: the AVD's emulated camera never
+          # settles a getUserMedia call under `-no-window -gpu
+          # swiftshader_indirect` (observed hanging past the 90s probe
+          # deadline), and adding the flag also invalidated the cached
+          # snapshot, forcing a cold boot. The camera tier's real-camera
+          # scenario therefore skips here by design and stays a manual /
+          # on-device check; its virtual scenarios are the CI gate (CAM-010).
           emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim
           disable-animations: true
           # The action runs each script line as a separate `sh -c`, so the
-          # test invocations live in single-command wrapper scripts. The
-          # lifecycle tier (INTEG-011) must run after the in-process suite:
-          # it replaces the test-entrypoint APK the suite installed.
+          # test invocations live in wrapper scripts. The lifecycle tier
+          # (INTEG-011) must run after the in-process suites: it replaces the
+          # test-entrypoint APK they installed.
           script: |
             adb wait-for-device
             adb shell input keyevent 82
             adb shell settings put global hide_error_dialogs 1
             bash scripts/run_android_integration_tests.sh
+            bash scripts/run_android_shortcut_tests.sh
+            bash scripts/run_android_background_audio_tests.sh
+            bash scripts/run_android_camera_tests.sh
+            bash scripts/run_android_page_zoom_tests.sh
             bash scripts/run_android_lifecycle_tests.sh
 
       - name: Upload white-screen lifecycle diagnostics
@@ -747,8 +851,24 @@ jobs:
                 # Screenshot generator is an iOS/Android fastlane helper,
                 # not a Linux-runnable test. The white-screen pixel suite is
                 # Android-only (window PixelCopy); skip its no-op build here.
+                # The camera suite (CAM-010) exercises media gates specific to
+                # the Android WebView, which the desktop WPE/WKWebView targets
+                # do not have; it runs in the emulator job instead.
+                # NOTE: this whole block is a single-quoted `bash -c` string,
+                # so an apostrophe in a comment terminates it and the loop
+                # dies with "syntax error: unexpected end of file".
                 [ "$(basename "$t")" = "screenshot_test.dart" ] && continue
                 [ "$(basename "$t")" = "white_screen_test.dart" ] && continue
+                # Home-shortcut scenarios are Android-only (the menu, pin
+                # state and delete prompt are Platform.isAndroid-gated).
+                [ "$(basename "$t")" = "shortcut_behavior_test.dart" ] && continue
+                [ "$(basename "$t")" = "camera_test.dart" ] && continue
+                # BGAUDIO-006 media notification is an Android foreground
+                # service; the emulator job owns it.
+                [ "$(basename "$t")" = "background_audio_media_notification_test.dart" ] && continue
+                # BGAUDIO-009 needs a real media pipeline (WPE crash-loops on
+                # one here) and a real pauseTimers(); emulator job owns it.
+                [ "$(basename "$t")" = "background_audio_media_stop_test.dart" ] && continue
                 echo "::group::$t"
                 # Hard per-test wall-clock cap: a WebView mount can deadlock
                 # the platform thread below Dart timeout layer, which would
@@ -1010,6 +1130,15 @@ jobs:
             [ "$(basename "$t")" = "screenshot_test.dart" ] && continue
             # Android-only window-PixelCopy suite; skip its no-op build here.
             [ "$(basename "$t")" = "white_screen_test.dart" ] && continue
+            # Android-only home-shortcut scenarios; same reason.
+            [ "$(basename "$t")" = "shortcut_behavior_test.dart" ] && continue
+            # Android-only WebView media-gate suite (CAM-010); runs in the
+            # emulator job.
+            [ "$(basename "$t")" = "camera_test.dart" ] && continue
+            # Android-only BGAUDIO-006 media foreground service; emulator job.
+            [ "$(basename "$t")" = "background_audio_media_notification_test.dart" ] && continue
+            # Android-only BGAUDIO-009 media-stop tier; emulator job.
+            [ "$(basename "$t")" = "background_audio_media_stop_test.dart" ] && continue
             echo "::group::$t"
             if [ -n "$TIMEOUT" ]; then
               "$TIMEOUT" -k 30s 12m fvm flutter test "$t" -d macos --ci || status=$?

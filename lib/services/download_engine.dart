@@ -1,10 +1,10 @@
 import 'dart:convert';
-import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:http/http.dart' as http;
-import 'package:http/io_client.dart';
 
+import 'package:webspace/platform/host_platform.dart';
+import 'package:webspace/services/download_client.dart';
 import 'package:webspace/services/outbound_http.dart';
 import 'package:webspace/settings/proxy.dart';
 
@@ -84,9 +84,7 @@ class DownloadEngine {
         }
       }
     }
-    final httpClient = HttpClient();
-    httpClient.autoUncompress = false;
-    return IOClient(httpClient);
+    return createDirectDownloadClient();
   }
 
   /// RFC 6265 `Cookie:` header value from an ordered list of name/value
@@ -226,8 +224,8 @@ class DownloadEngine {
     final Uint8List bytes;
     try {
       bytes = switch (encoding) {
-        'gzip' || 'x-gzip' => _inflateBounded(gzip.decoder, bytesReceived),
-        'deflate' => _inflateBounded(zlib.decoder, bytesReceived),
+        'gzip' || 'x-gzip' => _inflateBounded(hostGzipDecoder, bytesReceived),
+        'deflate' => _inflateBounded(hostZlibDecoder, bytesReceived),
         _ => bytesReceived,
       };
     } on FormatException catch (e) {
@@ -282,6 +280,10 @@ class DownloadEngine {
     return name
         .replaceAll(RegExp(r'[/\\]'), '_')
         .replaceAll(RegExp(r'[\x00-\x1f]'), '')
+        // Bidi controls reorder the rendered name without changing the bytes,
+        // so a page can suggest "invoice\u202Egnp.exe" and have the save
+        // dialog and file manager both show "invoiceexe.png".
+        .replaceAll(RegExp(r'[\u200e\u200f\u202a-\u202e\u2066-\u2069]'), '')
         .trim();
   }
 

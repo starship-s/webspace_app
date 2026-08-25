@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io';
+import 'package:webspace/platform/host_platform.dart';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
@@ -202,6 +202,10 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
 
   final ScrollController _consoleScrollController = ScrollController();
   final ScrollController _logScrollController = ScrollController();
+
+  /// Guards `_copyLogs` against re-entry: a second tap while its confirmation
+  /// dialog is up would stack a second dialog (or pop the first).
+  bool _isCopyingLogs = false;
 
   bool _isSearchVisible = false;
   String _searchQuery = '';
@@ -1203,7 +1207,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
       final fileName = '${domain}_$timestamp.html';
       final bytes = utf8.encode(html);
 
-      final bool isMobile = !kIsWeb && (Platform.isIOS || Platform.isAndroid);
+      final bool isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
       final outputPath = await FilePicker.saveFile(
         dialogTitle: AppLocalizations.of(context).devToolsSaveHtmlDialogTitle,
         fileName: fileName,
@@ -1212,7 +1216,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
 
       if (outputPath != null && !isMobile) {
         final filePath = outputPath.endsWith('.html') ? outputPath : '$outputPath.html';
-        await File(filePath).writeAsString(html);
+        await hostWriteFileText(filePath, html);
       }
 
       if (mounted && outputPath != null) {
@@ -1267,7 +1271,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
 
       final domain = extractDomain(host.currentUrl);
       final fileName = '${domain}_icon.png';
-      final bool isMobile = !kIsWeb && (Platform.isIOS || Platform.isAndroid);
+      final bool isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
       final outputPath = await FilePicker.saveFile(
         dialogTitle: loc.devToolsSaveIconDialogTitle,
         fileName: fileName,
@@ -1276,7 +1280,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
 
       if (outputPath != null && !isMobile) {
         final filePath = outputPath.endsWith('.png') ? outputPath : '$outputPath.png';
-        await File(filePath).writeAsBytes(png);
+        await hostWriteFileBytes(filePath, png);
       }
 
       if (mounted && outputPath != null) {
@@ -1312,7 +1316,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
       children: [
         _buildDnsStats(stats),
         _buildDnsFilters(stats),
-        _buildDnsActions(stats),
+        _buildDnsActions(entries),
         Expanded(
           child: entries.isEmpty
               ? Center(child: Text(_searchQuery.isEmpty ? loc.devToolsDnsEmpty : loc.devToolsNoMatches))
@@ -1408,7 +1412,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
-  Widget _buildDnsActions(DnsStats stats) {
+  Widget _buildDnsActions(List<DnsLogEntry> entries) {
     final loc = AppLocalizations.of(context);
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
@@ -1422,10 +1426,11 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
             label: Text(loc.devToolsClear),
           ),
           TextButton.icon(
-            onPressed: stats.log.isEmpty
+            key: const Key('devtools-dns-copy'),
+            onPressed: entries.isEmpty
                 ? null
                 : () {
-                    final text = stats.log
+                    final text = entries
                         .map((e) =>
                             '[${_formatTimeMs(e.timestamp)}] ${e.blocked ? 'BLOCKED' : 'ALLOWED'} ${e.domain}')
                         .join('\n');
@@ -1735,6 +1740,54 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
+  /// Copies exactly what the Logs tab shows. Sensitive entries reach the
+  /// clipboard only through the confirmation below: the show-sensitive toggle
+  /// is consent to display them, not to hand them to clipboard history, a
+  /// cloud clipboard or a third-party keyboard. Files written by Export never
+  /// carry them at all.
+  Future<void> _copyLogs(List<LogEntry> filtered) async {
+    if (_isCopyingLogs) return;
+    final loc = AppLocalizations.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+    final sensitive =
+        filtered.where((e) => e.sensitivity == LogSensitivity.sensitive).length;
+    var includeSensitive = false;
+    _isCopyingLogs = true;
+    try {
+      if (sensitive > 0) {
+        final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (dialogContext) => AlertDialog(
+            title: Text(loc.devToolsLogsCopySensitiveTitle),
+            content: Text(loc.devToolsLogsCopySensitiveBody(sensitive)),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(false),
+                child: Text(loc.commonCancel),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: Text(loc.devToolsCopy),
+              ),
+            ],
+          ),
+        );
+        if (confirmed != true || !mounted) return;
+        includeSensitive = true;
+      }
+      await Clipboard.setData(ClipboardData(
+        text: LogService.formatForClipboard(filtered,
+            includeSensitive: includeSensitive),
+      ));
+      if (!mounted) return;
+      messenger.showSnackBar(
+        SnackBar(content: Text(loc.devToolsLogsCopied(filtered.length))),
+      );
+    } finally {
+      _isCopyingLogs = false;
+    }
+  }
+
   Widget _buildLogActions(List<LogEntry> filtered) {
     final loc = AppLocalizations.of(context);
     return Padding(
@@ -1747,22 +1800,8 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
             label: Text(loc.devToolsExport),
           ),
           TextButton.icon(
-            onPressed: filtered.isEmpty
-                ? null
-                : () {
-                    // Strip sensitive entries from the clipboard even when the
-                    // tab shows them: the clipboard syncs off-device, same
-                    // contract as export(). See LogService.formatForClipboard.
-                    final text = LogService.formatForClipboard(filtered);
-                    final copied = filtered
-                        .where((e) =>
-                            e.sensitivity != LogSensitivity.sensitive)
-                        .length;
-                    Clipboard.setData(ClipboardData(text: text));
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(loc.devToolsLogsCopied(copied))),
-                    );
-                  },
+            key: const Key('devtools-logs-copy'),
+            onPressed: filtered.isEmpty ? null : () => _copyLogs(filtered),
             icon: const Icon(Icons.copy, size: 18),
             label: Text(loc.devToolsCopy),
           ),
@@ -1848,7 +1887,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
     final fileName = 'webspace_logs_$timestamp.txt';
 
-    final bool isMobile = !kIsWeb && (Platform.isIOS || Platform.isAndroid);
+    final bool isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
     if (!mounted) return;
     final outputPath = await FilePicker.saveFile(
       dialogTitle: AppLocalizations.of(context).devToolsExportLogsDialogTitle,
@@ -1858,7 +1897,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
 
     if (outputPath != null && !isMobile) {
       final filePath = outputPath.endsWith('.txt') ? outputPath : '$outputPath.txt';
-      await File(filePath).writeAsString(text);
+      await hostWriteFileText(filePath, text);
     }
 
     if (mounted && outputPath != null) {

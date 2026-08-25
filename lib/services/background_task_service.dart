@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'dart:io';
+import 'package:webspace/platform/host_platform.dart';
 
 import 'package:flutter/services.dart';
 import 'package:webspace/services/log_service.dart';
@@ -43,7 +43,7 @@ class BackgroundTaskService {
 
   bool _initialized = false;
 
-  bool get _enabled => Platform.isIOS || Platform.isAndroid;
+  bool get _enabled => hostIsIOS || hostIsAndroid;
 
   /// Wires the method-call handler. Call once during app startup, after
   /// the first frame, before the first lifecycle transition.
@@ -77,7 +77,7 @@ class BackgroundTaskService {
   }
 
   Future<void> beginGracePeriod() async {
-    if (!Platform.isIOS) return;
+    if (!hostIsIOS) return;
     try {
       await _channel.invokeMethod('beginGracePeriod');
       LogService.instance.log(
@@ -92,7 +92,7 @@ class BackgroundTaskService {
   }
 
   Future<void> endGracePeriod() async {
-    if (!Platform.isIOS) return;
+    if (!hostIsIOS) return;
     try {
       await _channel.invokeMethod('endGracePeriod');
     } on PlatformException catch (e) {
@@ -141,6 +141,36 @@ class BackgroundTaskService {
         'bgRefreshDidComplete failed: ${e.message}',
         level: LogLevel.warning,
       );
+    }
+  }
+
+  bool? _backgroundAudioActive;
+
+  /// BGAUDIO-003: iOS-only. Switches the shared `AVAudioSession` to the
+  /// `.playback` category while any loaded site has background audio
+  /// enabled (and back to `.ambient` when none does). `.playback` plus the
+  /// `audio` UIBackgroundModes entry is what lets WKWebView media keep
+  /// running after the app leaves the foreground; `.ambient` restores the
+  /// respect-the-silent-switch default so ordinary sites don't blast
+  /// through a muted phone. Android needs no equivalent — WebView audio
+  /// keeps playing as long as the process (and its JS) stays alive.
+  Future<void> setBackgroundAudioActive(bool active) async {
+    if (!hostIsIOS) return;
+    if (_backgroundAudioActive == active) return;
+    _backgroundAudioActive = active;
+    try {
+      await _channel
+          .invokeMethod('setBackgroundAudioActive', {'active': active});
+      LogService.instance.log(
+          'BackgroundTask', 'Background audio session active=$active');
+    } on PlatformException catch (e) {
+      LogService.instance.log(
+        'BackgroundTask',
+        'setBackgroundAudioActive failed: ${e.message}',
+        level: LogLevel.warning,
+      );
+    } on MissingPluginException {
+      // Older native side without the handler; harmless.
     }
   }
 }

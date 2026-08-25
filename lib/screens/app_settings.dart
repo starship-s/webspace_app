@@ -1,4 +1,4 @@
-import 'dart:io';
+import 'package:webspace/platform/host_platform.dart';
 
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webspace/l10n/gen/app_localizations.dart';
 import 'package:webspace/settings/app_locale.dart';
 import 'package:webspace/main.dart' show AppThemeSettings, AccentColor;
+import 'package:webspace/screens/block_stats.dart';
 import 'package:webspace/screens/dev_tools.dart';
 import 'package:webspace/screens/trusted_certificates.dart';
 import 'package:webspace/services/clearurl_service.dart';
@@ -24,6 +25,7 @@ import 'package:webspace/settings/global_outbound_proxy.dart';
 import 'package:webspace/settings/proxy.dart';
 import 'package:webspace/settings/user_script.dart';
 import 'package:webspace/screens/user_scripts.dart';
+import 'package:webspace/widgets/firefox_version_tile.dart';
 import 'package:webspace/widgets/hint_button.dart';
 
 // Accent color definitions for display
@@ -59,6 +61,10 @@ class AppSettingsScreen extends StatefulWidget {
   final ValueChanged<bool> onTabStripInFullscreenChanged;
   final bool fullscreenOnShortcut;
   final ValueChanged<bool> onFullscreenOnShortcutChanged;
+  /// NAV-009: back gesture opens the drawer where a site has no page left to
+  /// go back to (and leaves the app on the press after that). Off by default.
+  final bool backOpensMenu;
+  final ValueChanged<bool> onBackOpensMenuChanged;
   final bool tabBarButton;
   final ValueChanged<bool> onTabBarButtonChanged;
   final int tabMaxWidth;
@@ -102,6 +108,8 @@ class AppSettingsScreen extends StatefulWidget {
     required this.onTabStripInFullscreenChanged,
     required this.fullscreenOnShortcut,
     required this.onFullscreenOnShortcutChanged,
+    required this.backOpensMenu,
+    required this.onBackOpensMenuChanged,
     required this.tabBarButton,
     required this.onTabBarButtonChanged,
     required this.tabMaxWidth,
@@ -128,6 +136,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
   late bool _showTabStrip;
   late bool _tabStripInFullscreen;
   late bool _fullscreenOnShortcut;
+  late bool _backOpensMenu;
   late bool _tabBarButton;
   late double _tabMaxWidth;
   late bool _showStatsBanner;
@@ -188,6 +197,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
     _showTabStrip = widget.showTabStrip;
     _tabStripInFullscreen = widget.tabStripInFullscreen;
     _fullscreenOnShortcut = widget.fullscreenOnShortcut;
+    _backOpensMenu = widget.backOpensMenu;
     _tabBarButton = widget.tabBarButton;
     _tabMaxWidth = widget.tabMaxWidth.toDouble();
     _showStatsBanner = widget.showStatsBanner;
@@ -967,8 +977,15 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
               ),
             ),
           SwitchListTile(
-            title: Text(loc.appSettingsFullscreenOnShortcut),
-            subtitle: Text(loc.appSettingsFullscreenOnShortcutSubtitle),
+            title: Row(
+              children: [
+                Flexible(child: Text(loc.appSettingsFullscreenOnShortcut)),
+                HintButton(
+                  title: loc.appSettingsFullscreenOnShortcut,
+                  description: loc.appSettingsFullscreenOnShortcutHint,
+                ),
+              ],
+            ),
             value: _fullscreenOnShortcut,
             onChanged: (value) {
               setState(() {
@@ -987,13 +1004,19 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
                   children: [
                     Row(
                       children: [
-                        Expanded(child: Text(loc.appSettingsTabMaxWidth)),
+                        Expanded(
+                          child: Row(
+                            children: [
+                              Flexible(child: Text(loc.appSettingsTabMaxWidth)),
+                              HintButton(
+                                title: loc.appSettingsTabMaxWidth,
+                                description: loc.appSettingsTabMaxWidthHint,
+                              ),
+                            ],
+                          ),
+                        ),
                         Text(tabWidthLabel),
                       ],
-                    ),
-                    Text(
-                      loc.appSettingsTabMaxWidthSubtitle,
-                      style: Theme.of(context).textTheme.bodySmall,
                     ),
                     Slider(
                       value: _tabMaxWidth,
@@ -1020,6 +1043,24 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
             },
           ),
           SwitchListTile(
+            title: Row(
+              children: [
+                Flexible(child: Text(loc.appSettingsBackOpensMenu)),
+                HintButton(
+                  title: loc.appSettingsBackOpensMenu,
+                  description: loc.appSettingsBackOpensMenuHint,
+                ),
+              ],
+            ),
+            value: _backOpensMenu,
+            onChanged: (value) {
+              setState(() {
+                _backOpensMenu = value;
+              });
+              widget.onBackOpensMenuChanged(value);
+            },
+          ),
+          SwitchListTile(
             title: Text(loc.appSettingsStatsBar),
             subtitle: Text(loc.appSettingsStatsBarSubtitle),
             value: _showStatsBanner,
@@ -1029,6 +1070,16 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
               });
               widget.onShowStatsBannerChanged(value);
             },
+          ),
+          ListTile(
+            leading: const Icon(Icons.shield_outlined),
+            title: Text(loc.blockStatsTitle),
+            subtitle: Text(loc.appSettingsProtectionReportSubtitle),
+            trailing: const Icon(Icons.chevron_right),
+            onTap: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const BlockStatsScreen()),
+            ),
           ),
           ListTile(
             leading: const Icon(Icons.language),
@@ -1054,11 +1105,13 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Row(
               children: [
-                Text(
-                  loc.appSettingsOutboundProxy,
-                  style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                        fontWeight: FontWeight.bold,
-                      ),
+                Flexible(
+                  child: Text(
+                    loc.appSettingsOutboundProxy,
+                    style: Theme.of(context).textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.bold,
+                        ),
+                  ),
                 ),
                 HintButton(
                   title: loc.appSettingsOutboundProxy,
@@ -1159,9 +1212,11 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Row(
               children: [
-                Text(
-                  loc.appSettingsLocationPicker,
-                  style: Theme.of(context).textTheme.labelLarge,
+                Flexible(
+                  child: Text(
+                    loc.appSettingsLocationPicker,
+                    style: Theme.of(context).textTheme.labelLarge,
+                  ),
                 ),
                 HintButton(
                   title: loc.appSettingsLocationPicker,
@@ -1196,7 +1251,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
             leading: const Icon(Icons.public),
             title: Row(
               children: [
-                Text(loc.appSettingsTimezonePolygons),
+                Flexible(child: Text(loc.appSettingsTimezonePolygons)),
                 HintButton(
                   title: loc.appSettingsTimezonePolygons,
                   description: loc.appSettingsTimezonePolygonsHint,
@@ -1358,12 +1413,12 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
           // still apply via HttpClient.badCertificateCallback even on
           // Apple platforms, but the rare "inspect-imported-pins-on-
           // iOS" case doesn't justify an always-empty settings tile.
-          if (Platform.isAndroid || Platform.isLinux)
+          if (hostIsAndroid || hostIsLinux)
             ListTile(
               leading: const Icon(Icons.lock_outline),
               title: Row(
                 children: [
-                  Text(loc.appSettingsTrustedCertificates),
+                  Flexible(child: Text(loc.appSettingsTrustedCertificates)),
                   HintButton(
                     title: loc.appSettingsTrustedCertificates,
                     description: loc.appSettingsTrustedCertificatesHint,
@@ -1385,7 +1440,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
             leading: const Icon(Icons.cleaning_services),
             title: Row(
               children: [
-                Text(loc.appSettingsClearUrlsRules),
+                Flexible(child: Text(loc.appSettingsClearUrlsRules)),
                 HintButton(
                   title: loc.appSettingsClearUrlsRules,
                   description: loc.appSettingsClearUrlsHint,
@@ -1422,53 +1477,13 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
                   ),
           ),
 
-          ListTile(
-            leading: const Icon(Icons.travel_explore),
-            title: Row(
-              children: [
-                Text(loc.appSettingsFirefoxVersion),
-                HintButton(
-                  title: loc.appSettingsFirefoxVersion,
-                  description: loc.appSettingsFirefoxVersionHint,
-                ),
-              ],
-            ),
-            subtitle: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(loc.appSettingsFirefoxVersionCurrent(
-                    FirefoxUserAgentService.instance.majorVersion)),
-                if (FirefoxUserAgentService.instance.lastChecked != null)
-                  Text(
-                    loc.appSettingsFirefoxVersionChecked(
-                      FirefoxUserAgentService.instance.lastChecked!
-                          .toLocal()
-                          .toString()
-                          .split('.')[0],
-                    ),
-                    style: const TextStyle(fontSize: 12),
-                  ),
-              ],
-            ),
-            trailing: _isUpdatingFirefoxVersion
-                ? const SizedBox(
-                    width: 24,
-                    height: 24,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : IconButton(
-                    icon: const Icon(Icons.sync),
-                    tooltip: loc.appSettingsUpdateFirefoxVersion,
-                    onPressed: _updateFirefoxVersion,
-                  ),
-          ),
-          SwitchListTile(
-            title: Text(loc.appSettingsFirefoxAutoUpdate),
-            subtitle: Text(loc.appSettingsFirefoxAutoUpdateHint),
-            value: _firefoxAutoRefresh,
-            onChanged: (bool value) {
-              _setFirefoxAutoRefresh(value);
-            },
+          FirefoxVersionTile(
+            majorVersion: FirefoxUserAgentService.instance.majorVersion,
+            lastChecked: FirefoxUserAgentService.instance.lastChecked,
+            isUpdating: _isUpdatingFirefoxVersion,
+            autoUpdate: _firefoxAutoRefresh,
+            onUpdate: _updateFirefoxVersion,
+            onAutoUpdateChanged: _setFirefoxAutoRefresh,
           ),
 
           // DNS Blocklist
@@ -1476,7 +1491,7 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
             leading: const Icon(Icons.shield),
             title: Row(
               children: [
-                Text(loc.appSettingsDnsBlocklist),
+                Flexible(child: Text(loc.appSettingsDnsBlocklist)),
                 HintButton(
                   title: loc.appSettingsDnsBlocklist,
                   description: loc.appSettingsDnsBlocklistHint,
@@ -1564,12 +1579,12 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
           ),
 
           // LocalCDN (Android only)
-          if (Platform.isAndroid)
+          if (hostIsAndroid)
             ListTile(
               leading: const Icon(Icons.storage),
               title: Row(
                 children: [
-                  Text(loc.appSettingsLocalCdn),
+                  Flexible(child: Text(loc.appSettingsLocalCdn)),
                   HintButton(
                     title: loc.appSettingsLocalCdn,
                     description: loc.appSettingsLocalCdnHint,
@@ -1642,11 +1657,14 @@ class _AppSettingsScreenState extends State<AppSettingsScreen>
                 Expanded(
                   child: Row(
                     children: [
-                      Text(
-                        loc.appSettingsContentBlocker,
-                        style: Theme.of(context).textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.bold,
-                            ),
+                      Flexible(
+                        child: Text(
+                          loc.appSettingsContentBlocker,
+                          style: Theme.of(context)
+                              .textTheme
+                              .titleMedium
+                              ?.copyWith(fontWeight: FontWeight.bold),
+                        ),
                       ),
                       HintButton(
                         title: loc.appSettingsContentBlocker,

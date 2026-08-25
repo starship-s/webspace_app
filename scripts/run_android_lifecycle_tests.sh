@@ -9,6 +9,10 @@
 # Flutter never draws so a matching dominant color proves the webview
 # composited.
 #
+# The same driver covers the warm home-shortcut taps (HS-002 / HS-006,
+# INTEG-013): a tap on a pinned tile while the app runs arrives as
+# onNewIntent, which no in-process test can produce.
+#
 # The in-process suite (run_android_integration_tests.sh) leaves an APK
 # whose Dart entrypoint is the *test* main, so this tier always rebuilds
 # and installs the default-entrypoint debug APK before driving it.
@@ -37,6 +41,7 @@ artifacts="$root/build/white_screen_adb"
 classify="$root/scripts/classify_window_pixels.py"
 dark=123524
 magenta=8c1d5a
+blue=1d3f8c
 mkdir -p "$artifacts"
 
 # System error dialogs: a launcher ANR on the loaded CI host parks a
@@ -75,6 +80,7 @@ page() { # $1 = css background, $2 = optional link target (full-page anchor)
 page '#123524' 'magenta.html' > "$www/dark.html"
 page '#8c1d5a' > "$www/magenta.html"
 page '#ffffff' > "$www/white.html"
+page '#1d3f8c' > "$www/blue.html"
 
 # Same dark fill, plus a JS Notification on every load: a forced
 # background refresh reloads the page, so a new OS notification is the
@@ -137,10 +143,20 @@ run_tag="adb-$(date +%s)"
 dark_site_id="ws-$run_tag-dark"
 white_site_id="ws-$run_tag-white"
 notif_site_id="ws-$run_tag-notif"
+blue_site_id="ws-$run_tag-blue"
+
+site_json() { # $1 = page basename, $2 = siteId, $3 = extra site fields (optional)
+  printf '{"name":"Diag","url":"%s/%s","siteId":"%s"%s}' \
+    "$base" "$1" "$2" "${3:-}"
+}
 
 seed_b64() { # $1 = page basename, $2 = siteId, $3 = extra site fields (optional)
-  printf '{"sites":[{"name":"Diag","url":"%s/%s","siteId":"%s"%s}]}' \
-    "$base" "$1" "$2" "${3:-}" | base64 | tr -d '\n'
+  printf '{"sites":[%s]}' "$(site_json "$1" "$2" "${3:-}")" | base64 | tr -d '\n'
+}
+
+seed_pair_b64() { # $1/$2 = first page + siteId, $3/$4 = second page + siteId
+  printf '{"sites":[%s,%s]}' \
+    "$(site_json "$1" "$2")" "$(site_json "$3" "$4")" | base64 | tr -d '\n'
 }
 
 echo "== Building default-entrypoint fdebug APK"
@@ -253,6 +269,13 @@ beacon_hits() {
   grep -c 'GET /beacon' "$server_log" || true
 }
 
+# The worker only dispatches `onBackgroundRefresh` when the Flutter engine is
+# reachable, so an OS eviction of the backgrounded process looks exactly like a
+# broken dispatch leg from the outside. The pid separates them.
+app_pid() {
+  adb shell pidof "$pkg" 2>/dev/null | tr -d '\r\n' || true
+}
+
 dump_bg_diagnostics() { # $1 = slug
   adb shell dumpsys jobscheduler 2>/dev/null | grep -B2 -A12 "$pkg" \
     > "$artifacts/fail-$1.jobscheduler.txt" || true
@@ -288,6 +311,8 @@ echo "  notification identities after foreground load: $(printf '%s\n' "$baselin
 baseline_beacons="$(beacon_hits)"
 adb shell input keyevent 3
 sleep 3
+baseline_pid="$(app_pid)"
+echo "  app pid while backgrounded: ${baseline_pid:-none}"
 
 # NOTIF-005-A schedules unique periodic work (webspace-notification-refresh)
 # whenever a notification site exists; WorkManager backs it with a
@@ -314,11 +339,17 @@ while :; do
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
     now_beacons="$(beacon_hits)"
+    now_pid="$(app_pid)"
     echo "FAIL: no new notification within 90s of forcing the refresh job" >&2
     echo "  notification identities unchanged (page loads: $baseline_beacons -> $now_beacons)" >&2
     if [ "$now_beacons" -gt "$baseline_beacons" ]; then
       echo "  the site DID reload in the background — the break is downstream," \
            "in the polyfill -> NotificationService -> flutter_local_notifications leg" >&2
+    elif [ -z "$now_pid" ] || [ "$now_pid" != "$baseline_pid" ]; then
+      echo "  the app process is GONE (pid ${baseline_pid:-none} -> ${now_pid:-none}) —" \
+           "the OS reclaimed it while backgrounded, so the worker had no engine to" \
+           "dispatch to. NOTIF-005-A accepts that; this is emulator memory pressure," \
+           "not the dispatch leg." >&2
     else
       echo "  the site did NOT reload — the break is upstream," \
            "in the worker -> engine dispatch -> onBackgroundRefresh leg" >&2
@@ -334,4 +365,37 @@ done
 adb shell am start -W -n "$component"
 wait_for_pixels notif-foreground-dark 90 --expect-dominant "$dark"
 
-echo "White-screen lifecycle tier passed."
+# ---- Warm home-shortcut taps (HS-002 / HS-006 / INTEG-013) ----
+#
+# A tap on a pinned tile while the app is running is delivered as
+# onNewIntent, not as a fresh launch: the siteId extra has to be drained
+# from the *replaced* intent and routed through _handleShortcutIntent on
+# the resume. Only an out-of-process driver produces that transition, so
+# the in-process suite (integration_test/shortcut_behavior_test.dart)
+# cannot cover these two.
+
+echo "== Scenario G: warm shortcut tap switches sites (HS-002)"
+adb shell am force-stop "$pkg"
+adb shell am start -W -n "$component" \
+  --es ws_diag_seed \
+  "$(seed_pair_b64 dark.html "$dark_site_id" blue.html "$blue_site_id")" \
+  --es siteId "$dark_site_id"
+wait_for_pixels shortcut-cold-dark 180 --expect-dominant "$dark"
+
+adb shell am start -W -n "$component" --es siteId "$blue_site_id"
+wait_for_pixels shortcut-warm-switch-blue 90 --expect-dominant "$blue"
+
+echo "== Scenario H: warm tap leaves the running session intact (HS-006)"
+# Back to the dark site, drive it off its initUrl (the full-page link),
+# then re-tap its shortcut: HS-006 resets to initUrl on cold launch only,
+# so the live session must survive. A regression repaints dark here.
+adb shell am start -W -n "$component" --es siteId "$dark_site_id"
+wait_for_pixels shortcut-warm-back-dark 90 --expect-dominant "$dark"
+adb shell input tap "$((w / 2))" "$((h / 2))"
+wait_for_pixels shortcut-session-magenta 90 --expect-dominant "$magenta"
+adb shell input keyevent 3
+sleep 5
+adb shell am start -W -n "$component" --es siteId "$dark_site_id"
+wait_for_pixels shortcut-warm-preserves-session 90 --expect-dominant "$magenta"
+
+echo "White-screen lifecycle + shortcut tier passed."

@@ -851,9 +851,17 @@
   "@appSettingsFullscreenOnShortcut": {
     "description": "Toggle title for automatically entering full screen when a site is opened from a home-screen shortcut or notification tap"
   },
-  "appSettingsFullscreenOnShortcutSubtitle": "Open sites in full screen from home-screen shortcuts or notifications",
-  "@appSettingsFullscreenOnShortcutSubtitle": {
-    "description": "Subtitle for the toggle that enters full screen when a site is opened from a pinned home-screen shortcut or notification"
+  "appSettingsFullscreenOnShortcutHint": "Open in full screen when launched from a home-screen shortcut",
+  "@appSettingsFullscreenOnShortcutHint": {
+    "description": "Hint dialog body for the toggle that enters full screen when a site is opened from a pinned home-screen shortcut"
+  },
+  "appSettingsBackOpensMenu": "Back gesture opens the menu",
+  "@appSettingsBackOpensMenu": {
+    "description": "Toggle title in app settings: the system back gesture opens the side menu once the site has no page left to go back to"
+  },
+  "appSettingsBackOpensMenuHint": "Where a site has nothing left to go back to, the back gesture opens the side menu instead of doing nothing. On Android, pressing back again leaves the app.",
+  "@appSettingsBackOpensMenuHint": {
+    "description": "Hint dialog body for that toggle: at the start of a site's browsing history the back gesture opens the navigation drawer, and a second back press quits the app on Android"
   },
   "appSettingsFullscreenTabStrip": "In full screen, tab strip",
   "@appSettingsFullscreenTabStrip": {
@@ -875,9 +883,9 @@
   "@appSettingsTabMaxWidth": {
     "description": "Title for the slider that caps the maximum width of each tab in the tab bar"
   },
-  "appSettingsTabMaxWidthSubtitle": "Limit how wide each tab can grow so long names stay compact",
-  "@appSettingsTabMaxWidthSubtitle": {
-    "description": "Subtitle explaining the tab width limit slider"
+  "appSettingsTabMaxWidthHint": "Limit how wide each tab can grow so long names stay compact",
+  "@appSettingsTabMaxWidthHint": {
+    "description": "Hint dialog body explaining the tab width limit slider"
   },
   "appSettingsStatsBar": "Stats Bar",
   "@appSettingsStatsBar": {
@@ -1663,6 +1671,19 @@
       }
     }
   },
+  "devToolsLogsCopySensitiveTitle": "Copy sensitive entries?",
+  "@devToolsLogsCopySensitiveTitle": {
+    "description": "Title of the dialog shown when the Copy button on the app-log screen would put sensitive log entries on the clipboard."
+  },
+  "devToolsLogsCopySensitiveBody": "{count} of the entries shown carry site IDs, URLs and hostnames. The clipboard can sync off the device.",
+  "@devToolsLogsCopySensitiveBody": {
+    "description": "Body of the dialog asking whether sensitive log entries may be copied to the clipboard. {count} is how many of the visible entries are sensitive.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
   "devToolsExportLogsDialogTitle": "Export Logs",
   "@devToolsExportLogsDialogTitle": {
     "description": "Title of the file-save dialog when exporting app logs."
@@ -1840,10 +1861,6 @@
   "@siteSettingsTrackingProtectionSubtitle": {
     "description": "Subtitle for the Tracking Protection switch."
   },
-  "siteSettingsForcedByTrackingProtection": "Forced on by Tracking Protection",
-  "@siteSettingsForcedByTrackingProtection": {
-    "description": "Subtitle shown for a per-site toggle that is forced on because Tracking Protection is enabled."
-  },
   "siteSettingsClearUrls": "ClearURLs",
   "@siteSettingsClearUrls": {
     "description": "Switch label and hint title for the ClearURLs feature."
@@ -1979,10 +1996,6 @@
   "@siteSettingsExternalLinksInBrowserHint": {
     "description": "Hint body explaining that off-site links open externally while claimed domains stay in the app."
   },
-  "siteSettingsExternalLinksInBrowserSubtitle": "Links outside this site's domains open in your default browser",
-  "@siteSettingsExternalLinksInBrowserSubtitle": {
-    "description": "Subtitle for the Open External Links in Browser switch."
-  },
   "siteSettingsFullscreen": "Full screen mode",
   "@siteSettingsFullscreen": {
     "description": "Switch label for full screen mode."
@@ -2011,10 +2024,6 @@
   "@siteSettingsHtmlCachingHint": {
     "description": "Hint body describing HTML caching."
   },
-  "siteSettingsHtmlCachingSubtitle": "Show cached page on cold start (offline fallback always on)",
-  "@siteSettingsHtmlCachingSubtitle": {
-    "description": "Subtitle for the HTML caching switch."
-  },
   "siteSettingsNotifications": "Notifications",
   "@siteSettingsNotifications": {
     "description": "Switch label and hint title for per-site web notifications."
@@ -2022,6 +2031,14 @@
   "siteSettingsNotificationsHint": "Allow this site to show system notifications. Keeps the site polling in the background so notifications fire even when you are on a different tab.",
   "@siteSettingsNotificationsHint": {
     "description": "Hint body describing per-site notifications."
+  },
+  "siteSettingsBackgroundAudio": "Background audio",
+  "@siteSettingsBackgroundAudio": {
+    "description": "Switch label and hint title for keeping a site's audio playing when the site is not visible or the app is in the background."
+  },
+  "siteSettingsBackgroundAudioHint": "Keep this site's audio playing when you switch to another site or leave the app. The page is never paused in the background. Intended for music, radio and podcast sites.",
+  "@siteSettingsBackgroundAudioHint": {
+    "description": "Hint body describing the per-site background audio switch."
   },
   "siteSettingsNotificationsBlockedByProxy": "Cannot enable: \"{site}\" is already polling in background with a different proxy. Android allows only one proxy at a time.",
   "@siteSettingsNotificationsBlockedByProxy": {
@@ -2065,13 +2082,73 @@
   "@siteSettingsProtectedContentBlockedByEtp": {
     "description": "Subtitle shown under the protected content (DRM) setting when it is forced to block because Tracking Protection is enabled for this site."
   },
+  "siteSettingsCameraAccess": "Camera access",
+  "@siteSettingsCameraAccess": {
+    "description": "List tile label and hint title for the per-site web camera access setting."
+  },
+  "siteSettingsCameraAccessHint": "Controls whether this site may use your camera, for example to scan a QR code in a banking web app.\n\nAsk (default): a popup asks the first time the site requests it, then remembers your choice.\nAlways allow / Always block: skip the popup.\nSimulated camera: the site is served a media file you pick, and the real camera is never opened.",
+  "@siteSettingsCameraAccessHint": {
+    "description": "Hint body describing the per-site web camera access setting (getUserMedia video, e.g. scanning a QR code in a banking web app)."
+  },
+  "siteSettingsCameraAccessAsk": "Ask",
+  "@siteSettingsCameraAccessAsk": {
+    "description": "Camera access dropdown option: ask each time."
+  },
+  "siteSettingsCameraAccessAllow": "Always allow",
+  "@siteSettingsCameraAccessAllow": {
+    "description": "Camera access dropdown option: always allow."
+  },
+  "siteSettingsCameraAccessBlock": "Always block",
+  "@siteSettingsCameraAccessBlock": {
+    "description": "Camera access dropdown option: always block."
+  },
+  "siteSettingsCameraAccessVirtual": "Simulated camera",
+  "@siteSettingsCameraAccessVirtual": {
+    "description": "Camera access dropdown option: serve a picked media file as a simulated camera instead of the real one"
+  },
+  "siteSettingsCameraAccessChooseSource": "Choose media file",
+  "@siteSettingsCameraAccessChooseSource": {
+    "description": "Button in per-site settings to pick the media file the simulated camera plays"
+  },
+  "siteSettingsCameraAccessNoSource": "No file chosen",
+  "@siteSettingsCameraAccessNoSource": {
+    "description": "Placeholder shown in per-site settings when no simulated-camera media file has been chosen yet"
+  },
+  "siteSettingsMicrophoneAccess": "Microphone access",
+  "@siteSettingsMicrophoneAccess": {
+    "description": "List tile label and hint title for the per-site web microphone access setting."
+  },
+  "siteSettingsMicrophoneAccessHint": "Controls whether this site may capture audio.\n\nWebSpace never opens your real microphone and never asks the system for a recording permission. Instead, the site can be fed an audio file that it hears on repeat.\n\nAsk (default): a popup asks the first time, then remembers your choice.\nAudio file: loop the chosen file to the site.\nAlways block: reject every request.",
+  "@siteSettingsMicrophoneAccessHint": {
+    "description": "Hint body describing the per-site web microphone access setting: no real microphone is ever used; the site can instead be fed a looped audio file."
+  },
+  "siteSettingsMicrophoneAccessAsk": "Ask",
+  "@siteSettingsMicrophoneAccessAsk": {
+    "description": "Microphone access dropdown option: ask each time."
+  },
+  "siteSettingsMicrophoneAccessVirtual": "Audio file",
+  "@siteSettingsMicrophoneAccessVirtual": {
+    "description": "Microphone access dropdown option: play a picked audio file to the site on a loop instead of using a real microphone"
+  },
+  "siteSettingsMicrophoneAccessBlock": "Always block",
+  "@siteSettingsMicrophoneAccessBlock": {
+    "description": "Microphone access dropdown option: always block."
+  },
+  "siteSettingsMicrophoneAccessChooseSource": "Choose audio file",
+  "@siteSettingsMicrophoneAccessChooseSource": {
+    "description": "Button in per-site settings to pick the audio file looped as the virtual microphone"
+  },
+  "siteSettingsMicrophoneAccessNoSource": "No file chosen",
+  "@siteSettingsMicrophoneAccessNoSource": {
+    "description": "Placeholder shown in per-site settings when no virtual-microphone file has been chosen yet"
+  },
   "siteSettingsGeolocation": "Geolocation",
   "@siteSettingsGeolocation": {
     "description": "Title and hint title for the geolocation section."
   },
-  "siteSettingsGeolocationHint": "Geolocation",
+  "siteSettingsGeolocationHint": "Controls what this site learns about where you are.\n\nLive: the device's real position, snapped to the precision tier you choose.\nStatic: a fixed point you pick on a map. The real position is never read.\nOff: every request is refused, exactly as a denied browser prompt would be.",
   "@siteSettingsGeolocationHint": {
-    "description": "Hint description for the geolocation section."
+    "description": "Explanatory body shown on the geolocation permission sheet: what each of the three modes hands to the site. Follows the same shape as the camera and microphone hints."
   },
   "siteSettingsLocationOff": "Off",
   "@siteSettingsLocationOff": {
@@ -2085,9 +2162,9 @@
   "@siteSettingsLocationLive": {
     "description": "Geolocation mode segment: live device GPS."
   },
-  "siteSettingsLocationOffDetail": "Pages get your real location (or are blocked by the OS).",
+  "siteSettingsLocationOffDetail": "This site is refused access to your location.",
   "@siteSettingsLocationOffDetail": {
-    "description": "Detail text shown when geolocation override is off."
+    "description": "Detail text shown when the site is refused geolocation entirely."
   },
   "siteSettingsLocationLiveDetail": "Forwarding live device location to pages.",
   "@siteSettingsLocationLiveDetail": {
@@ -2136,10 +2213,6 @@
   "siteSettingsLocationPick": "Pick",
   "@siteSettingsLocationPick": {
     "description": "Button to open the location picker."
-  },
-  "siteSettingsLocationSectionTitle": "Location & timezone",
-  "@siteSettingsLocationSectionTitle": {
-    "description": "Section header for the location and timezone settings."
   },
   "siteSettingsTimezoneLabel": "Timezone",
   "@siteSettingsTimezoneLabel": {
@@ -2753,6 +2826,56 @@
   "@homeBlockAction": {
     "description": "Button label to block protected content playback"
   },
+  "homeCameraAccessTitle": "Allow camera access?",
+  "@homeCameraAccessTitle": {
+    "description": "Title of the web camera access permission dialog"
+  },
+  "homeCameraAccessBody": "{origin} wants to use your camera.\n\nThis lets the site capture video, for example to scan a QR code. Your choice is remembered for this site.",
+  "@homeCameraAccessBody": {
+    "description": "Body of the web camera access permission dialog",
+    "placeholders": {
+      "origin": {
+        "type": "String"
+      }
+    }
+  },
+  "homeCameraUseFileAction": "Use a media file",
+  "@homeCameraUseFileAction": {
+    "description": "Button in the camera permission dialog to serve a picked media file to the site as a simulated camera instead of the real one"
+  },
+  "homeCameraSourceError": "Could not use that file. Choose an image or video.",
+  "@homeCameraSourceError": {
+    "description": "Error shown when the picked simulated-camera media file can't be used (wrong type or unreadable)"
+  },
+  "homeCameraSourceTooLarge": "That file is too large. Choose one under 24 MB.",
+  "@homeCameraSourceTooLarge": {
+    "description": "Error shown when the picked simulated-camera media file exceeds the size limit (24 MB)"
+  },
+  "homeMicrophoneAccessTitle": "Allow microphone access?",
+  "@homeMicrophoneAccessTitle": {
+    "description": "Title of the web microphone access permission dialog"
+  },
+  "homeMicrophoneAccessBody": "{origin} wants to use your microphone.\n\nWebSpace will not open your real microphone. You can instead pick an audio file that the site hears on repeat. Your choice is remembered for this site.",
+  "@homeMicrophoneAccessBody": {
+    "description": "Body of the web microphone access permission dialog, explaining that only a looped audio file can be offered",
+    "placeholders": {
+      "origin": {
+        "type": "String"
+      }
+    }
+  },
+  "homeMicrophoneUseFileAction": "Use audio file",
+  "@homeMicrophoneUseFileAction": {
+    "description": "Button in the microphone permission dialog to play a picked audio file to the site instead of a real microphone"
+  },
+  "homeMicrophoneSourceError": "Could not use that file. Choose an audio file.",
+  "@homeMicrophoneSourceError": {
+    "description": "Error shown when the picked virtual-microphone file can't be used (wrong type or unreadable)"
+  },
+  "homeMicrophoneSourceTooLarge": "That file is too large. Choose one under 8 MB.",
+  "@homeMicrophoneSourceTooLarge": {
+    "description": "Error shown when the picked virtual-microphone file exceeds the size limit (8 MB)"
+  },
   "homeExitFullscreenHint": "Tap the top of the screen to exit full screen",
   "@homeExitFullscreenHint": {
     "description": "Snackbar hint shown when entering fullscreen mode"
@@ -3296,5 +3419,186 @@
   "appSettingsContentBlockerHint": "Blocks ads, trackers, and unwanted page elements using filter lists like EasyList. Supports domain-level blocking, CSS cosmetic filters to hide page elements, and text-based hiding rules. Enable or disable individual filter lists below, and toggle content blocking per-site in each site's settings.",
   "@appSettingsContentBlockerHint": {
     "description": "Info dialog explaining the content blocker: it blocks ads, trackers, and unwanted page elements using filter lists like EasyList, supports domain, CSS cosmetic, and text-hiding rules, and is toggled on per-site."
+  },
+  "blockStatsTitle": "Protection report",
+  "@blockStatsTitle": {
+    "description": "Title of the screen (and of the App Settings entry that opens it) summarising how many tracking requests the app's blockers stopped over time."
+  },
+  "blockStatsSubtitleWeek": "Trackers blocked this week",
+  "@blockStatsSubtitleWeek": {
+    "description": "Caption under the large headline number on the protection report when the 7-day range is selected. The number itself is rendered separately above this text."
+  },
+  "blockStatsSubtitleMonth": "Trackers blocked in the last 30 days",
+  "@blockStatsSubtitleMonth": {
+    "description": "Caption under the large headline number on the protection report when the 30-day range is selected. The number itself is rendered separately above this text."
+  },
+  "blockStatsRange7": "7 days",
+  "@blockStatsRange7": {
+    "description": "Label of the button that switches the protection report to the last 7 days. Keep it short: it sits in a two-segment toggle."
+  },
+  "blockStatsRange30": "30 days",
+  "@blockStatsRange30": {
+    "description": "Label of the button that switches the protection report to the last 30 days. Keep it short: it sits in a two-segment toggle."
+  },
+  "blockStatsCategoryFilterList": "Ad and tracker requests",
+  "@blockStatsCategoryFilterList": {
+    "description": "Protection report row for requests blocked by an ABP filter list (EasyList, EasyPrivacy, Fanboy's). Preceded on screen by the count of such requests."
+  },
+  "blockStatsCategoryDns": "Known tracker domains",
+  "@blockStatsCategoryDns": {
+    "description": "Protection report row for requests blocked because the domain is on the downloaded DNS blocklist. Preceded on screen by the count of such requests."
+  },
+  "blockStatsCategoryParam": "Tracking parameters removed",
+  "@blockStatsCategoryParam": {
+    "description": "Protection report row counting URLs whose tracking query parameters (utm_source and similar) were stripped before the page loaded. Preceded on screen by the count."
+  },
+  "blockStatsCategoryCdn": "CDN requests served locally",
+  "@blockStatsCategoryCdn": {
+    "description": "Protection report row counting third-party CDN resources (JavaScript libraries, fonts) that were served from the local cache instead of being fetched from the CDN. Preceded on screen by the count."
+  },
+  "blockStatsSince": "{count} blocked since {date}",
+  "@blockStatsSince": {
+    "description": "Footer line of the protection report giving the all-time total and the day counting started, e.g. \"115 blocked since 22 June 2026\".",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "date": {
+        "type": "String"
+      }
+    }
+  },
+  "blockStatsEmpty": "Nothing blocked yet",
+  "@blockStatsEmpty": {
+    "description": "Headline of the protection report's empty state, shown when no request has been blocked since counting started."
+  },
+  "blockStatsEmptyHint": "Turn on tracking protection for a site and the requests it blocks show up here.",
+  "@blockStatsEmptyHint": {
+    "description": "Explanation under the protection report's empty state, telling the user that per-site tracking protection has to be switched on before anything is counted."
+  },
+  "blockStatsReset": "Reset statistics",
+  "@blockStatsReset": {
+    "description": "Action that clears every counter on the protection report. Used as the AppBar button tooltip, the confirmation dialog title, and its confirm button."
+  },
+  "blockStatsResetConfirm": "Every counter returns to zero and counting restarts from today.",
+  "@blockStatsResetConfirm": {
+    "description": "Body of the confirmation dialog shown before clearing the protection report counters."
+  },
+  "appSettingsProtectionReportSubtitle": "What the blockers stopped, over time",
+  "@appSettingsProtectionReportSubtitle": {
+    "description": "Subtitle of the App Settings row that opens the protection report screen."
+  },
+  "permissionsTitle": "Permissions",
+  "@permissionsTitle": {
+    "description": "Title of the per-site permission screen, and of the row in site settings that opens it."
+  },
+  "permissionsGroupDeviceAccess": "Device access",
+  "@permissionsGroupDeviceAccess": {
+    "description": "Heading for the permission group covering camera, microphone and location."
+  },
+  "permissionsGroupBackground": "Background activity",
+  "@permissionsGroupBackground": {
+    "description": "Heading for the permission group covering notifications and background audio playback."
+  },
+  "permissionsGroupMedia": "Media",
+  "@permissionsGroupMedia": {
+    "description": "Heading for the permission group covering protected (DRM) media playback."
+  },
+  "permissionsRealDeviceNote": "Only Allowed opens real hardware. Simulated serves a file you picked and never touches the device.",
+  "@permissionsRealDeviceNote": {
+    "description": "Explanatory line under the device access group, distinguishing a real device grant from a served file."
+  },
+  "permissionsBackgroundAudioNotAGrant": "Exempt from pausing. Grants nothing.",
+  "@permissionsBackgroundAudioNotAGrant": {
+    "description": "Subtitle for the background audio switch, clarifying it is a playback exemption rather than a permission."
+  },
+  "permissionMicrophoneNeverReal": "Not available. WebSpace never opens a real microphone and never asks the system for a recording permission.",
+  "@permissionMicrophoneNeverReal": {
+    "description": "Shown on the greyed-out Allowed option for microphone, stating that a real microphone is never used."
+  },
+  "permissionStateAsk": "Ask",
+  "@permissionStateAsk": {
+    "description": "One-word permission state: no decision recorded yet, the first request will prompt."
+  },
+  "permissionStateAllowed": "Allowed",
+  "@permissionStateAllowed": {
+    "description": "One-word permission state: the real device or capability is handed to the site."
+  },
+  "permissionStateSimulated": "Simulated",
+  "@permissionStateSimulated": {
+    "description": "One-word permission state: the site is served a file the user picked instead of a real device."
+  },
+  "permissionStateBlocked": "Blocked",
+  "@permissionStateBlocked": {
+    "description": "One-word permission state: requests are rejected without prompting."
+  },
+  "permissionsSummaryNothingGranted": "Nothing granted",
+  "@permissionsSummaryNothingGranted": {
+    "description": "Summary on the permissions row in site settings when the site holds no permission."
+  },
+  "permissionsSummaryMore": "{count} more",
+  "@permissionsSummaryMore": {
+    "description": "Appended to the permissions or privacy summary in site settings when more entries are on than fit on the row.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "privacyTitle": "Privacy",
+  "@privacyTitle": {
+    "description": "Title of the per-site privacy screen, and of the row in site settings that opens it. Covers tracking protection, its subordinate blockers, and what the site is allowed to keep on disk."
+  },
+  "privacyGroupTrackers": "Trackers and ads",
+  "@privacyGroupTrackers": {
+    "description": "Heading for the privacy group covering URL parameter stripping, DNS blocking, the content blocker, LocalCDN and third-party cookies."
+  },
+  "privacyGroupFingerprinting": "Fingerprinting",
+  "@privacyGroupFingerprinting": {
+    "description": "Heading for the privacy group covering measures that make the browser harder to identify by its characteristics rather than by stored data."
+  },
+  "privacyFingerprintingNote": "Tracking Protection also randomises canvas, audio, font and hardware readings for this site.",
+  "@privacyFingerprintingNote": {
+    "description": "Explanatory line under the fingerprinting group, noting that the umbrella switch brings anti-fingerprinting measures beyond the one switch shown."
+  },
+  "privacySummaryProtectionOn": "Tracking Protection on",
+  "@privacySummaryProtectionOn": {
+    "description": "Summary on the privacy row in site settings when the umbrella tracking protection switch is on."
+  },
+  "privacySummaryNothingOn": "No protection enabled",
+  "@privacySummaryNothingOn": {
+    "description": "Summary on the privacy row in site settings when the site has no privacy protection turned on at all."
+  },
+  "siteSettingsForcedOffByTrackingProtection": "Forced off by Tracking Protection",
+  "@siteSettingsForcedOffByTrackingProtection": {
+    "description": "Subtitle on a setting that Tracking Protection turns off and locks while it is on. The inverse of the 'Forced on by Tracking Protection' subtitle."
+  },
+  "siteSettingsNeedsTrackingProtection": "Requires Tracking Protection",
+  "@siteSettingsNeedsTrackingProtection": {
+    "description": "Subtitle on a setting that can only be turned on while Tracking Protection is on."
+  },
+  "siteSettingsThirdPartyCookiesSubtitle": "Let embedded content set cookies across sites",
+  "@siteSettingsThirdPartyCookiesSubtitle": {
+    "description": "Subtitle for the third-party cookies switch, describing what turning it on permits."
+  },
+  "siteSettingsThirdPartyCookiesHint": "Cookies set by content embedded from another site, such as ads, share buttons and analytics widgets. They are the oldest way a tracker follows you from one site to the next, which is why Tracking Protection turns them off. Some sign-in redirects and embedded checkouts need them, so turn them back on for a site that breaks without them.",
+  "@siteSettingsThirdPartyCookiesHint": {
+    "description": "Explanatory popup for the third-party cookies switch: what such cookies are, why tracking protection blocks them, and when a user might legitimately want them."
+  },
+  "siteSettingsSectionContent": "Content",
+  "@siteSettingsSectionContent": {
+    "description": "Heading in site settings for the group covering what the page is served and how it renders: scripts, user agent, language, zoom."
+  },
+  "siteSettingsSectionBehaviour": "Behaviour",
+  "@siteSettingsSectionBehaviour": {
+    "description": "Heading in site settings for the group covering how the app treats the site: where it opens, how links leave it, and how much of the screen it uses."
+  },
+  "siteSettingsSectionNetwork": "Network",
+  "@siteSettingsSectionNetwork": {
+    "description": "Heading in site settings for the group covering how the site's traffic reaches the internet: proxy and WebRTC."
+  },
+  "siteSettingsSectionSite": "Site",
+  "@siteSettingsSectionSite": {
+    "description": "Heading in site settings for the group holding the Permissions and Privacy rows, which open screens of their own."
   }
 }

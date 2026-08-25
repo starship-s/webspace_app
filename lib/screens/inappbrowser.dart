@@ -1,19 +1,25 @@
 import 'dart:async';
-import 'dart:io';
+import 'package:webspace/platform/host_platform.dart';
 
 import 'package:flutter/material.dart';
-import 'package:flutter_inappwebview/flutter_inappwebview.dart' as inapp
+import 'package:flutter_inappwebview/flutter_inappwebview.dart'
+    as inapp
     show PullToRefreshController, PullToRefreshSettings, SslCertificate;
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import 'package:webspace/l10n/gen/app_localizations.dart';
 import 'package:webspace/screens/dev_tools.dart';
+import 'package:webspace/services/camera_decision_engine.dart';
+import 'package:webspace/services/microphone_decision_engine.dart';
 import 'package:webspace/services/connectivity_service.dart';
 import 'package:webspace/services/log_service.dart';
 import 'package:webspace/services/resume_reload_engine.dart';
 import 'package:webspace/services/surface_repaint_engine.dart';
+import 'package:webspace/services/surface_route_observer.dart';
 import 'package:webspace/services/webview.dart';
+import 'package:webspace/settings/camera.dart';
+import 'package:webspace/settings/microphone.dart';
 import 'package:webspace/settings/location.dart';
 import 'package:webspace/settings/proxy.dart';
 import 'package:webspace/settings/user_script.dart';
@@ -25,6 +31,11 @@ import 'package:webspace/widgets/find_toolbar.dart';
 import 'package:webspace/widgets/untrusted_cert_prompt.dart';
 import 'package:webspace/widgets/url_bar.dart';
 
+/// Identifies the nested webview's slot, the counterpart of the main page's
+/// per-site `ValueKey(siteId)` slot. The BUG-001 pixel suite samples the
+/// composited window over this rect (integration_test/white_screen_test.dart).
+const String kNestedWebViewSlotKey = 'nested-webview-slot';
+
 class InAppWebViewScreen extends StatefulWidget {
   final String url;
   final String? homeTitle;
@@ -35,6 +46,11 @@ class InAppWebViewScreen extends StatefulWidget {
   final bool dnsBlockEnabled;
   final bool contentBlockEnabled;
   final bool localCdnEnabled;
+
+  /// Mirrors the parent site's `contributesBlockStats` so a nested webview
+  /// for an archive-tier site never rolls its blocks into the app-wide
+  /// protection report (ARCH-006).
+  final bool contributesBlockStats;
   final bool trackingProtectionEnabled;
   final bool letterboxEnabled;
   final int? spoofWindowWidth;
@@ -51,6 +67,7 @@ class InAppWebViewScreen extends StatefulWidget {
   final bool spoofTimezoneFromLocation;
   final LocationGranularity liveLocationGranularity;
   final WebRtcPolicy webRtcPolicy;
+
   /// Pre-combined per-site + opted-in global user scripts to inject. Carried
   /// over from the parent webview so cosmetic/privacy/custom scripts keep
   /// working when the user follows an outbound link into a nested screen.
@@ -60,15 +77,42 @@ class InAppWebViewScreen extends StatefulWidget {
   final String? userAgent;
   final bool javascriptEnabled;
   final Future<bool> Function(String url)? onConfirmScriptFetch;
+
   /// Protected-content (Widevine/EME) permission popup, forwarded from the
   /// parent so a DRM site followed through an outbound link prompts the
   /// same way. The decision is remembered in-memory for this screen only
   /// (nested screens have no persisted `WebViewModel`).
   final Future<bool> Function(String origin)? onProtectedMediaRequest;
+
+  /// Web camera-access resolver, forwarded from the parent so a site
+  /// followed through an outbound link (e.g. a bank's QR-scan verification
+  /// page) prompts the same way — including the "use image or video"
+  /// virtual-camera path. Called with the origin and this screen's
+  /// in-memory current mode; the decision is remembered in-memory for this
+  /// screen only (nested screens have no persisted `WebViewModel`).
+  final Future<CameraDecision> Function(
+    String origin,
+    CameraAccessMode current,
+  )?
+  onCameraDecision;
+
+  /// Web microphone-access resolver, forwarded from the parent so a site
+  /// followed through an outbound link prompts the same way — including the
+  /// "use audio file" virtual-microphone path. Called with the origin and
+  /// this screen's in-memory current mode; the decision is remembered
+  /// in-memory for this screen only (nested screens have no persisted
+  /// `WebViewModel`).
+  final Future<MicrophoneDecision> Function(
+    String origin,
+    MicrophoneAccessMode current,
+  )?
+  onMicrophoneDecision;
+
   /// Invoked when the user toggles the URL bar from this nested screen's
   /// popup menu. Threaded back to `_WebSpacePageState` so the change
   /// updates the same global preference shown in the parent menu.
   final Future<void> Function(bool show)? onShowUrlBarChanged;
+
   /// Per-site proxy of the parent site that opened this nested browser.
   /// Forwarded into the nested [WebViewConfig] so cross-domain links from
   /// a proxied site stay proxied. Resolves through the global outbound
@@ -92,6 +136,7 @@ class InAppWebViewScreen extends StatefulWidget {
     required this.dnsBlockEnabled,
     required this.contentBlockEnabled,
     required this.localCdnEnabled,
+    this.contributesBlockStats = true,
     required this.trackingProtectionEnabled,
     this.letterboxEnabled = false,
     this.spoofWindowWidth,
@@ -113,19 +158,21 @@ class InAppWebViewScreen extends StatefulWidget {
     this.javascriptEnabled = true,
     this.onConfirmScriptFetch,
     this.onProtectedMediaRequest,
+    this.onCameraDecision,
+    this.onMicrophoneDecision,
     this.onShowUrlBarChanged,
     UserProxySettings? proxySettings,
     this.notificationsEnabled = false,
     this.externalLinksInBrowser = false,
-  }) : proxySettings = proxySettings ??
-            UserProxySettings(type: ProxyType.DEFAULT);
+  }) : proxySettings =
+           proxySettings ?? UserProxySettings(type: ProxyType.DEFAULT);
 
   @override
   _InAppWebViewScreenState createState() => _InAppWebViewScreenState();
 }
 
 class _InAppWebViewScreenState extends State<InAppWebViewScreen>
-    with WidgetsBindingObserver {
+    with WidgetsBindingObserver, RouteAware {
   WebViewController? _controller;
   String? title;
   late String _currentUrl;
@@ -138,6 +185,21 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
   /// burst of `PROTECTED_MEDIA_ID` requests onto one popup.
   bool? _protectedContentAllowed;
   Future<bool>? _protectedMediaInFlight;
+
+  /// In-memory camera-access decision for this nested screen. Starts
+  /// unresolved (`ask`); once the popup / file-pick settles it holds the
+  /// chosen mode and, for virtual, the picked source for the life of this
+  /// screen. Resolution runs through the same [CameraDecisionEngine] as the
+  /// parent — only the storage differs (in-memory, no persistence).
+  CameraAccessMode _cameraMode = CameraAccessMode.ask;
+  VirtualCameraSource? _cameraSource;
+  final CameraDecisionEngine _cameraEngine = CameraDecisionEngine();
+
+  /// In-memory microphone-access decision for this nested screen, same
+  /// contract as the camera one above.
+  MicrophoneAccessMode _microphoneMode = MicrophoneAccessMode.ask;
+  VirtualMicrophoneSource? _microphoneSource;
+  final MicrophoneDecisionEngine _microphoneEngine = MicrophoneDecisionEngine();
 
   /// Cached InAppWebView widget. Built once in initState and reused on
   /// every build() so setState calls (URL bar updates, find results,
@@ -177,6 +239,8 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
   /// SurfaceView; mirror the main page's `_goBackAndRepaint`/`_nudgeSurfaceRepaint`
   /// here so the nested screen recomposites too. No-op off Android.
   final SurfaceRepaintEngine _surfaceRepaint = SurfaceRepaintEngine();
+  bool _resumeRepaintWindowOpen = false;
+  Timer? _resumeRepaintWindowTimer;
 
   /// Recovery state for a load the OS stranded while the app was backgrounded
   /// (PAUSE-022). The nested screen is as exposed as the main page: it is the
@@ -210,13 +274,15 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
       siteId: widget.siteId,
       currentUrl: widget.url,
     );
-    final bool isMobile = Platform.isIOS || Platform.isAndroid;
-    _pullToRefreshController = isMobile ? inapp.PullToRefreshController(
-      settings: inapp.PullToRefreshSettings(enabled: true),
-      onRefresh: () async {
-        await _reloadAndRepaint();
-      },
-    ) : null;
+    final bool isMobile = hostIsIOS || hostIsAndroid;
+    _pullToRefreshController = isMobile
+        ? inapp.PullToRefreshController(
+            settings: inapp.PullToRefreshSettings(enabled: true),
+            onRefresh: () async {
+              await _reloadAndRepaint();
+            },
+          )
+        : null;
     _webView = WebViewFactory.createWebView(
       config: WebViewConfig(
         siteId: widget.siteId,
@@ -229,14 +295,21 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
         incognito: widget.incognito,
         javascriptEnabled: widget.javascriptEnabled,
         userAgent: widget.userAgent,
-        thirdPartyCookiesEnabled: widget.thirdPartyCookiesEnabled,
-        // Mirror parent: when umbrella protection is on, force the four
-        // tracker-protection subordinates effectively-on regardless of
-        // their stored value.
-        clearUrlEnabled: widget.clearUrlEnabled || widget.trackingProtectionEnabled,
-        dnsBlockEnabled: widget.dnsBlockEnabled || widget.trackingProtectionEnabled,
-        contentBlockEnabled: widget.contentBlockEnabled || widget.trackingProtectionEnabled,
-        localCdnEnabled: widget.localCdnEnabled || widget.trackingProtectionEnabled,
+        // Mirror parent: when umbrella protection is on, the five
+        // tracker-protection subordinates behave as forced regardless of
+        // their stored value. Third-party cookies is the one forced *off*.
+        thirdPartyCookiesEnabled:
+            widget.thirdPartyCookiesEnabled &&
+            !widget.trackingProtectionEnabled,
+        clearUrlEnabled:
+            widget.clearUrlEnabled || widget.trackingProtectionEnabled,
+        dnsBlockEnabled:
+            widget.dnsBlockEnabled || widget.trackingProtectionEnabled,
+        contentBlockEnabled:
+            widget.contentBlockEnabled || widget.trackingProtectionEnabled,
+        localCdnEnabled:
+            widget.localCdnEnabled || widget.trackingProtectionEnabled,
+        contributesBlockStats: widget.contributesBlockStats,
         trackingProtectionEnabled: widget.trackingProtectionEnabled,
         letterboxEnabled: widget.letterboxEnabled,
         spoofWindowWidth: widget.spoofWindowWidth,
@@ -252,12 +325,14 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
         spoofLatitude: widget.spoofLatitude,
         spoofLongitude: widget.spoofLongitude,
         spoofAccuracy: widget.spoofAccuracy,
-        spoofTimezone: (widget.trackingProtectionEnabled &&
+        spoofTimezone:
+            (widget.trackingProtectionEnabled &&
                 widget.spoofLatitude != null &&
                 widget.spoofLongitude != null)
             ? null
             : widget.spoofTimezone,
-        spoofTimezoneFromLocation: (widget.trackingProtectionEnabled &&
+        spoofTimezoneFromLocation:
+            (widget.trackingProtectionEnabled &&
                 widget.spoofLatitude != null &&
                 widget.spoofLongitude != null)
             ? true
@@ -279,8 +354,7 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
                   return _protectedContentAllowed!;
                 }
                 _protectedMediaInFlight ??= () async {
-                  final granted =
-                      await widget.onProtectedMediaRequest!(origin);
+                  final granted = await widget.onProtectedMediaRequest!(origin);
                   _protectedContentAllowed = granted;
                   return granted;
                 }();
@@ -290,6 +364,45 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
                   _protectedMediaInFlight = null;
                 }
               },
+        onCameraDecision: widget.onCameraDecision == null
+            ? null
+            : (origin) => _cameraEngine.decide(
+                origin: origin,
+                // A nested screen is the visible webview for as long as it
+                // is mounted; a route pushed above it (including the camera
+                // popup itself) must not read as backgrounded, or a burst
+                // would stop coalescing onto that one popup.
+                isSiteActive: () => mounted,
+                effectiveMode: _cameraMode,
+                currentSource: () => _cameraSource,
+                resolve: widget.onCameraDecision!,
+                persist: (mode, source) {
+                  _cameraMode = mode;
+                  if (source != null) _cameraSource = source;
+                },
+                // Nested screens have no persisted model.
+                save: () async {},
+              ),
+        currentCameraMode: () => _cameraMode,
+        onMicrophoneDecision: widget.onMicrophoneDecision == null
+            ? null
+            : (origin) => _microphoneEngine.decide(
+                origin: origin,
+                // Mounted is the nested screen's "on screen": a route pushed
+                // above it (the popup itself included) must not read as
+                // backgrounded, or a burst would stop coalescing onto it.
+                isSiteActive: () => mounted,
+                effectiveMode: _microphoneMode,
+                currentSource: () => _microphoneSource,
+                resolve: widget.onMicrophoneDecision!,
+                persist: (mode, source) {
+                  _microphoneMode = mode;
+                  if (source != null) _microphoneSource = source;
+                },
+                // Nested screens have no persisted model.
+                save: () async {},
+              ),
+        currentMicrophoneMode: () => _microphoneMode,
         notificationsEnabled: widget.notificationsEnabled,
         pullToRefreshController: _pullToRefreshController,
         onUrlChanged: (url) {
@@ -344,7 +457,8 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
                 if (!hasGesture) return true;
                 final scheme = Uri.tryParse(url)?.scheme ?? '';
                 if (scheme != 'http' && scheme != 'https') return true;
-                if (getNormalizedDomain(url) == getNormalizedDomain(_currentUrl)) {
+                if (getNormalizedDomain(url) ==
+                    getNormalizedDomain(_currentUrl)) {
                   return true;
                 }
                 launchUrlInSystemBrowser(url);
@@ -369,13 +483,18 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
             loadInWebView: _controller,
           );
         },
-        onHttpDownload: Platform.isAndroid
-            ? launchUrlInSystemBrowser
-            : null,
+        onHttpDownload: hostIsAndroid ? launchUrlInSystemBrowser : null,
       ),
       onControllerCreated: (controller) {
         _controller = controller;
         _devToolsHost.controller = controller;
+        // This screen always mounts a brand-new hybrid-composition
+        // SurfaceView, which shows its white default fill until something
+        // paints it — the main page's PAUSE-017 case, which the nested screen
+        // never had. Latch the first commit too: the entry URL is remote, so
+        // it routinely settles after this nudge drains (PAUSE-025).
+        _surfaceRepaint.noteCommitPending();
+        _nudgeSurfaceRepaint();
         // Remove all cookies on load
         controller.evaluateJavascript('''
           (function() {
@@ -392,7 +511,25 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    final route = ModalRoute.of(context);
+    if (route is PageRoute) surfaceRouteObserver.subscribe(this, route);
+  }
+
+  /// An opaque route pushed over this screen (Developer Tools, site settings,
+  /// a further nested webview) has popped. The platform view was not
+  /// composited while it was covered, so it re-attaches blank here — the
+  /// nested counterpart of the main page's route return (PAUSE-024).
+  @override
+  void didPopNext() {
+    _nudgeSurfaceRepaint();
+  }
+
+  @override
   void dispose() {
+    _resumeRepaintWindowTimer?.cancel();
+    surfaceRouteObserver.unsubscribe(this);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -418,7 +555,7 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
   /// restore re-attaches a blank SurfaceView (BUG-001 / PAUSE-018). Mirrors
   /// `_WebSpacePageState._nudgeSurfaceRepaint`; no-op off Android.
   void _nudgeSurfaceRepaint() {
-    if (!Platform.isAndroid) return;
+    if (!hostIsAndroid) return;
     if (!_surfaceRepaint.request()) return;
     void tick() {
       if (!mounted) {
@@ -521,10 +658,12 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
   Future<void> _probeNestedRenderer() async {
     final controller = _controller;
     if (controller == null) return;
-    final result = await controller
-        .evaluateJavascriptReturning('document.body ? document.body.offsetHeight : -1');
+    final result = await controller.evaluateJavascriptReturning(
+      'document.body ? document.body.offsetHeight : -1',
+    );
     if (!mounted) return;
-    if (rendererProbeIndicatesGone(result) && identical(_controller, controller)) {
+    if (rendererProbeIndicatesGone(result) &&
+        identical(_controller, controller)) {
       _handleRendererGone(false);
     }
   }
@@ -535,8 +674,36 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
       _resumeReload.noteAppBackgrounded();
     } else if (state == AppLifecycleState.resumed) {
       _probeNestedRenderer();
+      // A warm start destroys and re-creates this screen's SurfaceView exactly
+      // as it does the main page's, and the main page's nudge cannot reach it:
+      // that one toggles the inset around an IndexedStack sitting under this
+      // route. Same two-part fix as PAUSE-020 — a tail nudge now, plus a
+      // re-nudge on the attach signal for a surface that comes back later.
+      _openResumeRepaintWindow();
+      _nudgeSurfaceRepaint();
       unawaited(_retryIncompleteLoadOnResume());
     }
+  }
+
+  @override
+  void didChangeMetrics() {
+    super.didChangeMetrics();
+    if (!_resumeRepaintWindowOpen) return;
+    _nudgeSurfaceRepaint();
+  }
+
+  /// Post-resume window during which a `didChangeMetrics` — the closest
+  /// Dart-side signal to the SurfaceView re-attaching — re-fires the nudge.
+  /// Bounded so steady-state metric changes (keyboard, rotation) don't nudge.
+  /// Mirrors `_WebSpacePageState._openResumeRepaintWindow` (PAUSE-020).
+  void _openResumeRepaintWindow() {
+    if (!hostIsAndroid) return;
+    _resumeRepaintWindowOpen = true;
+    _resumeRepaintWindowTimer?.cancel();
+    _resumeRepaintWindowTimer = Timer(const Duration(seconds: 3), () {
+      _resumeRepaintWindowOpen = false;
+      _resumeRepaintWindowTimer = null;
+    });
   }
 
   Future<void> launchExternalUrl(String url) async {
@@ -599,7 +766,10 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(loc.inappBrowserVerificationTitle, style: TextStyle(fontWeight: FontWeight.bold)),
+                      Text(
+                        loc.inappBrowserVerificationTitle,
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
                       IconButton(
                         icon: Icon(Icons.close),
                         onPressed: () => Navigator.of(dialogContext).pop(),
@@ -650,15 +820,19 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
             if (mounted) navigator.pop();
             return;
           }
-          if (Platform.isAndroid) {
+          if (hostIsAndroid) {
             if (await controller.canGoBack()) {
               await _goBackAndRepaint(controller);
-              LogService.instance.log('Navigation',
-                  'Nested back gesture: navigated back (canGoBack)');
+              LogService.instance.log(
+                'Navigation',
+                'Nested back gesture: navigated back (canGoBack)',
+              );
             } else {
               if (!mounted) return;
-              LogService.instance.log('Navigation',
-                  'Nested back gesture: no history, exiting nested');
+              LogService.instance.log(
+                'Navigation',
+                'Nested back gesture: no history, exiting nested',
+              );
               navigator.pop();
             }
             return;
@@ -688,171 +862,185 @@ class _InAppWebViewScreenState extends State<InAppWebViewScreen>
         }
       },
       child: Scaffold(
-      appBar: AppBar(
-        bottom: PreferredSize(
-          preferredSize: const Size.fromHeight(_loadingBarHeight),
-          child: _isLoading
-              ? LinearProgressIndicator(
-                  value: _loadingProgress > 0 ? _loadingProgress / 100 : null,
-                  minHeight: _loadingBarHeight,
-                  backgroundColor: Colors.transparent,
-                )
-              : const SizedBox(height: _loadingBarHeight),
-        ),
-        // Custom back button that bypasses PopScope by calling
-        // Navigator.pop directly (vs maybePop), so the AppBar back
-        // arrow always closes the nested screen. Only the system back
-        // gesture (iOS edge swipe / Android back) routes through
-        // PopScope and walks the nested webview's history first.
-        leading: IconButton(
-          icon: const BackButtonIcon(),
-          tooltip: MaterialLocalizations.of(context).backButtonTooltip,
-          onPressed: () => Navigator.of(context).pop(),
-        ),
-        title: Text(title ?? loc.inappBrowserDefaultTitle),
-        actions: [
-          const DownloadButton(),
-          PopupMenuButton<String>(
-            itemBuilder: (BuildContext context) {
-              return [
-                PopupMenuItem<String>(
-                  value: "openbrowser",
-                  child: Row(
-                    children: [
-                      Icon(Icons.link),
-                      SizedBox(width: 8),
-                      Text(loc.inappBrowserMenuOpenInBrowser),
-                    ],
+        appBar: AppBar(
+          bottom: PreferredSize(
+            preferredSize: const Size.fromHeight(_loadingBarHeight),
+            child: _isLoading
+                ? LinearProgressIndicator(
+                    value: _loadingProgress > 0 ? _loadingProgress / 100 : null,
+                    minHeight: _loadingBarHeight,
+                    backgroundColor: Colors.transparent,
+                  )
+                : const SizedBox(height: _loadingBarHeight),
+          ),
+          // Custom back button that bypasses PopScope by calling
+          // Navigator.pop directly (vs maybePop), so the AppBar back
+          // arrow always closes the nested screen. Only the system back
+          // gesture (iOS edge swipe / Android back) routes through
+          // PopScope and walks the nested webview's history first.
+          leading: IconButton(
+            icon: const BackButtonIcon(),
+            tooltip: MaterialLocalizations.of(context).backButtonTooltip,
+            onPressed: () => Navigator.of(context).pop(),
+          ),
+          title: Text(title ?? loc.inappBrowserDefaultTitle),
+          actions: [
+            const DownloadButton(),
+            PopupMenuButton<String>(
+              itemBuilder: (BuildContext context) {
+                return [
+                  PopupMenuItem<String>(
+                    value: "openbrowser",
+                    child: Row(
+                      children: [
+                        Icon(Icons.link),
+                        SizedBox(width: 8),
+                        Text(loc.inappBrowserMenuOpenInBrowser),
+                      ],
+                    ),
                   ),
-                ),
-                PopupMenuItem<String>(
-                  value: "refresh",
-                  child: Row(
-                    children: [
-                      Icon(Icons.refresh),
-                      SizedBox(width: 8),
-                      Text(loc.inappBrowserMenuRefresh),
-                    ],
+                  PopupMenuItem<String>(
+                    value: "refresh",
+                    child: Row(
+                      children: [
+                        Icon(Icons.refresh),
+                        SizedBox(width: 8),
+                        Text(loc.inappBrowserMenuRefresh),
+                      ],
+                    ),
                   ),
-                ),
-                PopupMenuItem<String>(
-                  value: "search",
-                  child: Row(
-                    children: [
-                      Icon(Icons.search),
-                      SizedBox(width: 8),
-                      Text(loc.inappBrowserMenuFind),
-                    ],
+                  PopupMenuItem<String>(
+                    value: "search",
+                    child: Row(
+                      children: [
+                        Icon(Icons.search),
+                        SizedBox(width: 8),
+                        Text(loc.inappBrowserMenuFind),
+                      ],
+                    ),
                   ),
-                ),
-                PopupMenuItem<String>(
-                  value: "share",
-                  child: Row(
-                    children: [
-                      Icon(Icons.share),
-                      SizedBox(width: 8),
-                      Text(loc.commonShare),
-                    ],
+                  PopupMenuItem<String>(
+                    value: "share",
+                    child: Row(
+                      children: [
+                        Icon(Icons.share),
+                        SizedBox(width: 8),
+                        Text(loc.commonShare),
+                      ],
+                    ),
                   ),
-                ),
-                PopupMenuItem<String>(
-                  value: "toggleUrlBar",
-                  child: Row(
-                    children: [
-                      Icon(_showUrlBar ? Icons.visibility_off : Icons.visibility),
-                      SizedBox(width: 8),
-                      Text(_showUrlBar ? loc.inappBrowserMenuHideUrlBar : loc.inappBrowserMenuShowUrlBar),
-                    ],
+                  PopupMenuItem<String>(
+                    value: "toggleUrlBar",
+                    child: Row(
+                      children: [
+                        Icon(
+                          _showUrlBar ? Icons.visibility_off : Icons.visibility,
+                        ),
+                        SizedBox(width: 8),
+                        Text(
+                          _showUrlBar
+                              ? loc.inappBrowserMenuHideUrlBar
+                              : loc.inappBrowserMenuShowUrlBar,
+                        ),
+                      ],
+                    ),
                   ),
-                ),
-                PopupMenuItem<String>(
-                  value: "devTools",
-                  child: Row(
-                    children: [
-                      Icon(Icons.developer_mode),
-                      SizedBox(width: 8),
-                      Text(loc.inappBrowserMenuDeveloperTools),
-                    ],
+                  PopupMenuItem<String>(
+                    value: "devTools",
+                    child: Row(
+                      children: [
+                        Icon(Icons.developer_mode),
+                        SizedBox(width: 8),
+                        Text(loc.inappBrowserMenuDeveloperTools),
+                      ],
+                    ),
                   ),
-                ),
-              ];
-            },
-            onSelected: (String value) async {
-              switch (value) {
-                case 'share':
-                  if (_controller != null) {
-                    final url = await _controller!.getUrl();
-                    if (url != null) {
-                      SharePlus.instance.share(ShareParams(uri: Uri.parse(url.toString())));
-                    }
-                  }
-                  break;
-                case 'openbrowser':
-                  if (_controller != null) {
-                    final url = await _controller!.getUrl();
-                    if (url != null) {
-                      launchExternalUrl(url.toString());
-                      if (mounted) {
-                        Navigator.pop(context);
+                ];
+              },
+              onSelected: (String value) async {
+                switch (value) {
+                  case 'share':
+                    if (_controller != null) {
+                      final url = await _controller!.getUrl();
+                      if (url != null) {
+                        SharePlus.instance.share(
+                          ShareParams(uri: Uri.parse(url.toString())),
+                        );
                       }
                     }
-                  }
-                  break;
-                case 'search':
-                  _toggleFind();
-                  break;
-                case 'toggleUrlBar':
-                  setState(() {
-                    _showUrlBar = !_showUrlBar;
-                  });
-                  await widget.onShowUrlBarChanged?.call(_showUrlBar);
-                  break;
-                case 'refresh':
-                  await _reloadAndRepaint();
-                  break;
-                case 'devTools':
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => DevToolsScreen(
-                        host: _devToolsHost,
-                        cookieManager: CookieManager(),
+                    break;
+                  case 'openbrowser':
+                    if (_controller != null) {
+                      final url = await _controller!.getUrl();
+                      if (url != null) {
+                        launchExternalUrl(url.toString());
+                        if (mounted) {
+                          Navigator.pop(context);
+                        }
+                      }
+                    }
+                    break;
+                  case 'search':
+                    _toggleFind();
+                    break;
+                  case 'toggleUrlBar':
+                    setState(() {
+                      _showUrlBar = !_showUrlBar;
+                    });
+                    await widget.onShowUrlBarChanged?.call(_showUrlBar);
+                    break;
+                  case 'refresh':
+                    await _reloadAndRepaint();
+                    break;
+                  case 'devTools':
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (context) => DevToolsScreen(
+                          host: _devToolsHost,
+                          cookieManager: CookieManager(),
+                        ),
                       ),
-                    ),
-                  );
-                  break;
-              }
-            },
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          if (_isFindVisible && _controller != null)
-            FindToolbar(
-              webViewController: _controller,
-              matches: findMatches,
-              onClose: () {
-                _toggleFind();
+                    );
+                    break;
+                }
               },
             ),
-          Expanded(
-            // KeyedSubtree key bumped by _handleRendererGone remounts a fresh
-            // InAppWebView after a renderer death (BUG-002 gap #1).
-            child: KeyedSubtree(key: ValueKey(_rendererGen), child: _webView),
-          ),
-          if (_showUrlBar)
-            SafeArea(
-              top: false,
-              child: UrlBar(
-                currentUrl: _currentUrl,
-                onUrlSubmitted: (url) {
-                  _controller?.loadUrl(url, language: widget.language);
+          ],
+        ),
+        body: Column(
+          children: [
+            if (_isFindVisible && _controller != null)
+              FindToolbar(
+                webViewController: _controller,
+                matches: findMatches,
+                onClose: () {
+                  _toggleFind();
                 },
               ),
+            Expanded(
+              // Stable slot key used by the nested pixel sampler; the inner key
+              // still remounts the WebView after renderer-process recovery.
+              child: KeyedSubtree(
+                key: const ValueKey(kNestedWebViewSlotKey),
+                child: KeyedSubtree(
+                  key: ValueKey(_rendererGen),
+                  child: _webView,
+                ),
+              ),
             ),
-        ],
-      ),
+            if (_showUrlBar)
+              SafeArea(
+                top: false,
+                child: UrlBar(
+                  currentUrl: _currentUrl,
+                  onUrlSubmitted: (url) {
+                    _controller?.loadUrl(url, language: widget.language);
+                  },
+                ),
+              ),
+          ],
+        ),
       ),
     );
   }

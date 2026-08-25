@@ -59,7 +59,7 @@ function webViewConfigFields(src) {
   const ctor = body.search(/\n  (?:const )?WebViewConfig\(/);
   const decls = body.slice(0, ctor);
   const fields = new Set();
-  for (const m of decls.matchAll(/^\s*final\s+.+?\s(\w+);/gm)) fields.add(m[1]);
+  for (const m of decls.matchAll(/^\s*final\s+[\s\S]*?\s(\w+);/gm)) fields.add(m[1]);
   return fields;
 }
 
@@ -138,20 +138,35 @@ const POSTURE = new Set([
   'localCdnEnabled', 'userScripts', 'locationMode', 'spoofLatitude',
   'spoofLongitude', 'spoofAccuracy', 'spoofTimezone', 'spoofTimezoneFromLocation',
   'liveLocationGranularity', 'webRtcPolicy', 'proxySettings',
-  'notificationsEnabled',
+  'notificationsEnabled', 'contributesBlockStats',
 ]);
 
 const PLUMBING = new Set([
   'key', 'initialUrl', 'initialHtml', 'initialHtmlMayAutoRefresh',
   'deferInitialLoad',
   'backForwardGestures', // deliberate root-only: nested uses route-pop (NAV-008)
+  // deliberate root-only (BGAUDIO-006): drives the Android media notification
+  // for the root site's playback. Not a privacy posture, so a nested
+  // cross-domain webview not raising the notification is acceptable, not a
+  // bypass — Android-only behavioral wiring, like backForwardGestures.
+  'backgroundAudioEnabled',
   'onUrlChanged', 'onCookiesChanged', 'cookieManager', 'containerCookieManager',
   'cookieSiteId', 'onFindResult', 'shouldOverrideUrlLoading', 'onLoadingChanged',
   'onProgressChanged', 'onReloadIssued', 'onMainFrameLoad',
   'onWindowRequested', 'onHtmlLoaded', 'shouldFetchHtml', 'onConsoleMessage',
-  'onConfirmScriptFetch', 'onExternalSchemeUrl', 'onHttpDownload',
+  'onConfirmScriptFetch', 'onExternalSchemeUrl', 'onUntrustedCertificate',
+  'onHttpDownload',
   'pullToRefreshController',
   'onRendererGone', 'onProtectedMediaRequest',
+  'onCameraDecision',
+  // Accessor for the host's live camera mode (backs the non-prompting
+  // webCameraMode handler), not a posture value to copy: the nested screen
+  // supplies its own in-memory mode.
+  'currentCameraMode',
+  'onMicrophoneDecision',
+  // Same shape as currentCameraMode: an accessor for the host's live
+  // microphone mode (backs the non-prompting webMicrophoneMode handler).
+  'currentMicrophoneMode',
 ]);
 
 // Posture-ish but not yet threaded to nested webviews. An archive-tier site
