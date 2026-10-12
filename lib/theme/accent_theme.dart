@@ -1,6 +1,5 @@
 import 'package:flutter/material.dart';
 
-// Accent colors
 const Color accentBlue = Color(0xFF6B8DD6);
 const Color accentGreen = Color(0xFF7be592);
 const Color accentPurple = Color(0xFF9B7BD6);
@@ -23,7 +22,8 @@ Color _onAccent(Color background) {
 /// Build a ColorScheme that preserves the full saturation of [accent].
 /// Uses fromSeed only for neutral surface/background colors, then overrides
 /// all accent-derived roles so nothing gets desaturated by Material 3's HCT.
-ColorScheme buildAccentColorScheme(Color accent, Brightness brightness) {
+ColorScheme buildAccentColorScheme(Color accent,
+    {required Brightness brightness}) {
   final bool isLight = brightness == Brightness.light;
   final hsl = HSLColor.fromColor(accent);
 
@@ -36,7 +36,6 @@ ColorScheme buildAccentColorScheme(Color accent, Brightness brightness) {
       ? hsl.withLightness(0.15).toColor()
       : hsl.withLightness(0.90).toColor();
 
-  // Use fromSeed as base for surface/neutral colors only
   final base = ColorScheme.fromSeed(seedColor: accent, brightness: brightness);
 
   return base.copyWith(

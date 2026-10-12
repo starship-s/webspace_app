@@ -42,9 +42,9 @@ Add a per-site `trackingProtectionEnabled` boolean (default true) to
 
 * The four pre-existing toggles (`clearUrlEnabled`, `dnsBlockEnabled`,
   `contentBlockEnabled`, `localCdnEnabled`) behave as ON regardless of
-  their stored value — `WebViewModel.getWebView` and
-  `InAppWebViewScreen` compute `effective = stored ||
-  trackingProtectionEnabled` and pass that to `WebViewConfig`.
+  their stored value — `WebViewModel.sitePosture` computes `effective =
+  stored || trackingProtectionEnabled` once, into the `SitePosture` every
+  webview of the site is built from, the nested and popup ones included.
 * When a static spoof location is set, the timezone is forced to
   "from picked location" so `Date` / `Intl` match the spoofed geo.
   The geolocation mode itself (`off` / `spoof` / `live`) is NOT
@@ -145,6 +145,13 @@ identical in page and worker (WORK-002), and the window-only sections (`screen.*
 the `matchMedia` wrapper, `plugins` / `mimeTypes` / `getBattery`) MUST NOT be
 applied in worker scope (WORK-003).
 
+The WebGL kill switch (`webgl_kill_switch_shim.dart`) SHALL ride the same
+worker payload, so a worker cannot obtain through an `OffscreenCanvas` a
+WebGL or WebGPU context the page reports absent. The Canvas 2D noise SHALL
+cover `OffscreenCanvasRenderingContext2D.getImageData` and
+`OffscreenCanvas.convertToBlob` in page and worker alike, so copying a
+covered canvas into an `OffscreenCanvas` does not read it clean.
+
 #### Scenario: Shim injected on construction
 
 **Given** a webview is constructed for a site with the umbrella on
@@ -168,9 +175,7 @@ a `UserScript` with `groupName: 'anti_fingerprinting'`
 
 ### Requirement: ETP-004 - Per-site stability and cross-site uniqueness
 
-The shim's randomized values SHALL be deterministic per `siteId` so a
-site sees the same fingerprint across launches, but distinct seeds
-SHALL produce distinct shim sources so two sites differ.
+The shim's randomized values SHALL be deterministic per `siteId` so a non-incognito site sees the same fingerprint across launches, but distinct seeds SHALL produce distinct shim sources so two sites differ. When the site has `incognito` set, the seed SHALL additionally mix in the per-launch nonce defined by ETP-028, so the fingerprint is stable within a single app session but randomizes across cold restarts. The shim builder itself remains a pure function of its seed string — the seed-derivation rule lives in `computeAntiFingerprintingSeed` ([lib/services/anti_fingerprinting_shim.dart](../../../lib/services/anti_fingerprinting_shim.dart)).
 
 #### Scenario: Same seed reproduces the same shim
 
@@ -184,6 +189,52 @@ SHALL produce distinct shim sources so two sites differ.
 **And** `buildAntiFingerprintingShim('seed-B')` returns `S2`
 **Then** `S1 != S2`
 **And** both contain the literal seed string for the FNV-1a hash
+
+#### Scenario: Non-incognito seed is the siteId verbatim
+
+**Given** `computeAntiFingerprintingSeed(siteId: 's1', incognito: false, launchNonce: 'n1')`
+**Then** the returned seed equals `'s1'`
+**And** `computeAntiFingerprintingSeed(siteId: 's1', incognito: false, launchNonce: 'n2')` also equals `'s1'`
+(non-incognito sites see the same fingerprint across launches regardless of nonce)
+
+#### Scenario: Incognito seed mixes in the launch nonce
+
+**Given** `computeAntiFingerprintingSeed(siteId: 's1', incognito: true, launchNonce: 'n1')` returns `seed1`
+**And** `computeAntiFingerprintingSeed(siteId: 's1', incognito: true, launchNonce: 'n2')` returns `seed2`
+**Then** `seed1 != seed2`
+**And** `seed1 != 's1'`
+**And** both seeds embed the siteId so two incognito sites under the same nonce remain distinct
+
+#### Scenario: Incognito seed is stable within a launch
+
+**Given** the launch nonce is `n1` for the lifetime of the process
+**When** `computeAntiFingerprintingSeed(siteId: 's1', incognito: true, launchNonce: 'n1')` is called twice within that process
+**Then** both calls return the same seed
+(same fingerprint across iframe re-injections, tab switches, and nested webview opens within one session)
+
+---
+
+### Requirement: ETP-027 - The seed the page sees is a digest
+
+`computeAntiFingerprintingSeed` names the record: `siteId`, the reset nonce
+(ETP-022) and, under incognito, the launch nonce. The shim text is copied
+into the worker payload (worker-shim-propagation), which page script can read
+back through `URL.createObjectURL`, so the record MUST NOT be embedded as
+it is. `buildAntiFingerprintingScriptSource` SHALL pass
+`opaqueAntiFingerprintingSeed(seed)` (SHA-256 over a fixed prefix and the
+seed) to `buildAntiFingerprintingShim`. Determinism (ETP-004), the reroll on
+data clear (ETP-022) and the per-launch incognito reroll are unchanged, since
+the digest is a function of the same input; what changes is that a page that
+captures its own shim learns neither the `siteId` nor the launch nonce, so
+two incognito sites in one launch cannot be joined and a site cannot
+recognise a user across a data wipe. Gated by
+`test/anti_fingerprinting_seed_opacity_test.dart`.
+
+#### Scenario: A page captures its own shim
+
+**Given** site "Acme" is incognito with `siteId = site-A` and a reset nonce
+**When** page script overrides `URL.createObjectURL` and reads the worker payload
+**Then** the payload contains a 64-hex-digit `SEED` and neither `site-A`, the reset nonce nor the launch nonce
 
 ---
 
@@ -333,19 +384,45 @@ self-incriminate) so:
 * `screen.colorDepth = 24`, `screen.pixelDepth = 24`
 * `navigator.hardwareConcurrency` ∈ [4, 8] derived from the seed
 * `navigator.deviceMemory` ∈ {4, 8} derived from the seed
+* `navigator.maxTouchPoints` = 0, so the digitizer count agrees with the
+  pinned desktop screen size. The `desktop-mode` shim already covers
+  desktop UAs; this is the mobile-UA case, which it does not reach.
 * `navigator.plugins` and `navigator.mimeTypes` are empty
   PluginArray-shaped objects (with `length`, `item`, `namedItem`, and
   for plugins `refresh`).
 
-The shim SHALL ALSO wrap `window.matchMedia` so single-feature
-`(min-|max-)?device-width` / `device-height` media queries resolve against
-the SAME dimensions `screen.*` reports — the pinned `SCREEN_W`/`SCREEN_H`
-(1920x1080) normally, or the live `window.inner*` in letterbox mode
-(ETP-020). Without this, a fingerprinter binary-searching
-`(max-device-width: Npx)` recovers the real screen size and contradicts
-`screen.width` (CreepJS's "CSS Media Queries" leak). Non-device queries fall
-through to the real implementation, and the wrapper stringifies as
+Each SHALL be corrected only where the engine already exposes it, and the
+shim SHALL NOT introduce one the engine lacks. `navigator.deviceMemory` and
+`navigator.getBattery` (ETP-011) are Chromium-only and secure-context-gated:
+absent from every WebKit build, so from iOS, macOS and Linux WPE, and absent
+from Chromium itself on a plain-http page. Defining them regardless is
+answered by `'deviceMemory' in navigator` in one expression with no
+measurement — the same self-incrimination as the own-property leak below,
+and the rule worker scope already follows for `plugins` / `mimeTypes`
+(WORK-003).
+
+The shim SHALL ALSO wrap `window.matchMedia` so every `device-width`,
+`device-height` and `device-aspect-ratio` feature in a query resolves
+against the SAME dimensions `screen.*` reports — the pinned
+`SCREEN_W`/`SCREEN_H` (1920x1080) normally, or the live `window.inner*` in
+letterbox mode (ETP-020) — whatever surrounds the feature: a media type,
+`not`, `and`, a comma list, the colon or the range syntax, and any absolute
+length unit. A single feature is answered by the shim; in a compound query
+each device feature is replaced by a standard feature that is always true
+or always false and the rewritten string is handed to the engine, so the
+query's boolean structure stays the engine's to evaluate. Without this, a
+fingerprinter binary-searching `(max-device-width: Npx)`, or
+`(max-device-width: Npx) and (min-width: 0px)` once the single-feature
+form is covered, recovers the real screen size and contradicts
+`screen.width` (CreepJS's "CSS Media Queries" leak). Non-device queries
+fall through to the real implementation, and the wrapper stringifies as
 `[native code]`.
+
+Residual: a stylesheet `@media (max-device-width: Npx)` block is evaluated
+by the engine's CSS cascade, which the shim does not reach, so a page that
+measures a probe element's computed style under such a block still learns
+the real screen size. Closing that needs the engine's own media
+environment, not a JS wrapper.
 
 #### Scenario: screen dimensions pinned
 
@@ -358,6 +435,14 @@ through to the real implementation, and the wrapper stringifies as
 **Then** `matchMedia('(max-device-width: 1920px)').matches` is `true`
 **And** `matchMedia('(max-device-width: 1919px)').matches` is `false`
 **And** `matchMedia('(device-height: 1080px)').matches` is `true`
+
+#### Scenario: compound and range device queries agree too
+
+**Given** the shim is loaded (non-letterbox)
+**Then** `matchMedia('(max-device-width: 1919px) and (min-width: 0px)').matches` is `false`
+**And** `matchMedia('(1000px <= device-width <= 2000px)').matches` is `true`
+**And** `matchMedia('(device-aspect-ratio: 16/9)').matches` is `true`
+**And** the string the engine receives names no `device-` feature
 **And** a non-device query such as `(min-width: 100px)` is delegated to the
 real `matchMedia`
 
@@ -369,6 +454,22 @@ of `hardwareConcurrency`, `deviceMemory`, `plugins`, `mimeTypes`,
 `getBattery`
 **And** `Object.getOwnPropertyNames(screen)` does NOT contain `width`,
 `height`, `colorDepth`, or `pixelDepth`
+
+#### Scenario: Absent properties are NOT introduced
+
+**Given** the shim is loaded in a context whose engine exposes neither
+`navigator.deviceMemory` nor `navigator.getBattery` (any WebKit build, or
+Chromium on an insecure origin)
+**Then** `'deviceMemory' in navigator` is `false`
+**And** `'getBattery' in navigator` is `false`
+**And** the set of keys reachable on `navigator`, own and inherited, is the
+same as without the injection
+
+#### Scenario: Present properties are still corrected
+
+**Given** the shim is loaded on Chromium over a secure origin
+**Then** `navigator.deviceMemory` ∈ {4, 8}
+**And** `await navigator.getBattery()` reports the ETP-011 fixed values
 
 ---
 
@@ -394,6 +495,18 @@ live `window.inner*` so screen and window agree (rather than the fixed
 1920x1080 of ETP-010). Letterboxing is gated on `trackingProtectionEnabled`
 (the shim is) and propagates to nested webviews via `launchUrl`.
 
+The snap is a step function, so a transient sub-grid change in the available
+area moves the box a whole grid step. Android's blank-surface repaint nudge
+(`PAUSE-015`, BUG-001) is exactly such a change: it toggles a one-pixel body
+inset several times a second, and fed into the snap raw it makes the bars
+appear and disappear on every toggle. The host SHALL therefore publish the
+inset it is applying (`SurfaceNudgeScope`) and `computeLetterboxTarget` SHALL
+snap against the extent with that inset backed out, then take the inset off the
+resulting box. The margin is then invariant under the nudge while the webview
+still changes size, so the platform view recomposites. The same holds for a
+`spoofWindowWidth`/`spoofWindowHeight` box (ETP-021), which would otherwise
+absorb the inset whole and leave the nudge with nothing to resize.
+
 #### Scenario: Available area snaps down to the grid
 
 **Given** an available area of 1366 x 768
@@ -410,6 +523,18 @@ live `window.inner*` so screen and window agree (rather than the fixed
 **Then** the box never exceeds the available area
 **And** the trimmed margin on each axis is at most 1/8 of that axis (a
 390-wide phone yields a ~350px box, not 200)
+
+#### Scenario: The repaint nudge moves the box, not the bars
+
+**Given** a letterboxed site on Android with an available height of 800
+**When** the surface-repaint nudge applies its one-pixel body inset
+**Then** `computeLetterboxTarget` is called with `availableHeight: 799` and
+`transientInsetHeight: 1` and returns a box one pixel shorter than the
+un-nudged box
+**And** the margin on that axis is unchanged, so the bars do not move (raw, the
+799 would snap to 750 and flash a 49px bar in and out)
+**And** a fixed box (ETP-021) shrinks by the same pixel, so the platform view
+still resizes
 
 #### Scenario: screen.* mirrors the letterboxed viewport
 
@@ -495,6 +620,22 @@ the user across the wipe. The nonce SHALL propagate to nested webviews via
 **Then** the non-incognito seed is `siteId:r1`
 **And** the incognito seed is `siteId:r1:launchNonce`
 
+Clearing a site's data SHALL additionally remove the two app-side artefacts
+that are keyed by `siteId` and replayed on the site's next activation, in
+**both** engine modes and outside every `SiteDataClearEngine` plan branch:
+
+- the saved `controller.saveState()` bytes
+  (`WebViewStateStorage.removeState`), plus any capture still pending on the
+  `NavStateCaptureDebouncer`;
+- the encrypted HTML snapshot (`HtmlCacheService.deleteCache`).
+
+Neither is reached by a container wipe or a cookie delete, and both restore
+the pre-clear URL. A page that ran
+`history.pushState(null, '', '/?uid=ABC')` before the clear is reloaded at
+that URL afterwards and reads its own identifier back, which defeats the
+reroll this requirement exists to guarantee. The delete-site and
+archive-close paths already removed both; the clear path had drifted.
+
 #### Scenario: Clearing site data rerolls the fingerprint
 
 **Given** a site whose data is cleared
@@ -504,18 +645,29 @@ the user across the wipe. The nonce SHALL propagate to nested webviews via
 pre-clear seed
 **And** the new value round-trips through `toJson` / `fromJson`
 
+#### Scenario: Clearing site data leaves nothing restorable
+
+**Given** a site that pushed `/?uid=ABC` into its own history and whose
+navigation state and HTML snapshot are on disk
+**When** the user taps "Clear Site Data"
+**Then** the pending debounced capture is cancelled
+**And** `removeState(siteId)` and `deleteCache(siteId)` both run
+**And** the rebuilt webview loads `initUrl`, not `/?uid=ABC`
+**And** this holds whether the container engine or the legacy engine is live
+
 ---
 
 ### Requirement: ETP-011 - Battery and speech-synthesis
 
-The shim SHALL define `navigator.getBattery()` to resolve a Promise of
-fixed values (`charging: true`, `chargingTime: 0`,
-`dischargingTime: Infinity`, `level: 1`) and shall override
-`SpeechSynthesis.prototype.getVoices` to return an empty array.
+Where the engine exposes it (ETP-010), the shim SHALL correct
+`navigator.getBattery()` to resolve a Promise of fixed values
+(`charging: true`, `chargingTime: 0`, `dischargingTime: Infinity`,
+`level: 1`) and shall override `SpeechSynthesis.prototype.getVoices` to
+return an empty array.
 
 #### Scenario: getBattery returns fixed values
 
-**Given** the shim is loaded
+**Given** the shim is loaded on an engine that exposes `navigator.getBattery`
 **When** `await navigator.getBattery()` is awaited
 **Then** the result has `charging === true`, `level === 1`,
 `dischargingTime === Infinity`
@@ -525,6 +677,67 @@ fixed values (`charging: true`, `chargingTime: 0`,
 **Given** the shim is loaded
 **When** `(new SpeechSynthesis()).getVoices()` is called
 **Then** the result is `[]`
+
+---
+
+### Requirement: ETP-026 - Network information
+
+`navigator.connection` describes the user's link. `effectiveType`, `rtt`,
+`downlink` and `saveData` are readable with no permission and change as the
+user moves between networks, which together make a coarse location and
+mobility signal. The shim SHALL correct them to fixed values
+(`effectiveType` `'4g'`, `rtt` 50, `downlink` 10, `saveData` false) under
+ETP-010's presence rule, so nothing the engine lacks is introduced:
+`type` and `downlinkMax` are absent on desktop Chromium and MUST NOT
+appear there.
+
+The `connection` object itself SHALL be left in place. Removing a property
+a real WebView exposes is a tell in its own right. `NetworkInformation` is
+exposed to workers, so this section is not window-only and page and worker
+MUST report the same values (WORK-002).
+
+With the values fixed there is nothing truthful left to announce: a `change`
+listener that wakes and reads back the same constants is a contradiction no
+real device produces, and the event's timing alone tracks the user moving
+between networks. The shim SHALL therefore not deliver `change` on the
+connection object.
+
+Assigning `onchange` SHALL nonetheless read back the assigned value, and
+`null` for a non-function, exactly as it does natively. A handler slot that
+answers `null` after an assignment is a one-expression tell of the same kind
+this requirement exists to close. The value is held off the engine, so it is
+never registered and cannot fire.
+
+#### Scenario: link values are the fixed ones
+
+**Given** the shim is loaded on an engine exposing `navigator.connection`
+**Then** `navigator.connection.effectiveType` is `'4g'`
+**And** `navigator.connection.rtt` is `50`
+**And** `navigator.connection.downlink` is `10`
+**And** `navigator.connection.saveData` is `false`
+
+#### Scenario: absent NetworkInformation fields are NOT introduced
+
+**Given** the shim is loaded on desktop Chromium, where `NetworkInformation`
+has no `type` and no `downlinkMax`
+**Then** `'type' in navigator.connection` is `false`
+**And** `'downlinkMax' in navigator.connection` is `false`
+**And** the set of keys reachable on `navigator.connection` is the same as
+without the injection
+
+#### Scenario: change is not delivered
+
+**Given** the shim is loaded
+**When** a `change` listener is registered on `navigator.connection`
+**Then** it is not registered with the engine
+
+#### Scenario: onchange round-trips but never fires
+
+**Given** the shim is loaded
+**When** `navigator.connection.onchange` is assigned a function
+**Then** reading `navigator.connection.onchange` returns that function
+**And** assigning a non-function reads back as `null`
+**And** the handler is never registered with the engine
 
 ---
 
@@ -575,12 +788,14 @@ element
 ### Requirement: ETP-014 - Function.prototype.toString hardening
 
 Every wrapper installed by the shim SHALL be recorded into the
-`__wsFnStubs` WeakMap (shared with `desktop_mode_shim.dart` and
-`location_spoof_service.dart`) so `Function.prototype.toString.call(fn)`
+`__wsFnStubs` WeakMap (`lib/js/_native_fn.js`, the one part every shim that
+wraps a function includes) so `Function.prototype.toString.call(fn)`
 returns the `[native code]` stub instead of the wrapper's source. The
 patched `Function.prototype.toString` itself SHALL stringify as
 `[native code]` so a fingerprinter probing toString-of-toString cannot
-detect the patch.
+detect the patch. A same-origin frame SHALL share its parent's map, so one
+realm's `toString` answers for another realm's wrappers too (BUG-009
+attempt 8).
 
 #### Scenario: wrapped method stringifies as native
 
@@ -594,6 +809,48 @@ detect the patch.
 **When** `Function.prototype.toString.call(Function.prototype.toString)`
 is called
 **Then** the result matches `/\[native code\]/`
+
+#### Scenario: one realm stringifies another realm's wrapper as native
+
+**Given** the shim is loaded in a page and in a same-origin iframe
+**When** the page calls its own `Function.prototype.toString` on a wrapper
+from the iframe, or the iframe calls its own on a wrapper from the page
+**Then** the result matches `/\[native code\]/`, not the wrapper's source
+
+---
+
+### Requirement: ETP-025 - Wrapper prototypes do not leak the native constructor
+
+Any shim that wraps a constructor and takes the native prototype object
+(`Wrapped.prototype = Native.prototype`) SHALL re-point that object's own
+`constructor` property at the wrapper:
+
+```js
+try {
+  Object.defineProperty(Wrapped.prototype, 'constructor',
+    { value: Wrapped, writable: true, configurable: true });
+} catch (e) {}
+```
+
+Without it the native constructor stays reachable as
+`Wrapped.prototype.constructor` and the whole wrapper is one expression away
+from being bypassed — the same class of escape as an un-stubbed
+`Function.prototype.toString` (ETP-014), and the same class as a realm the
+shims never reach (BUG-009). The re-point also keeps `instance.constructor`
+consistent with the global the page can see, which a mismatch would otherwise
+expose as a tell.
+
+The `defineProperty` SHALL be individually guarded so a non-configurable
+prototype degrades to "this one wrapper is bypassable" rather than throwing out
+of the shim payload, where an uncaught error silences every shim after it.
+
+#### Scenario: The native constructor is not reachable through the wrapper
+
+**Given** any shim-wrapped constructor `C` (`RTCPeerConnection`,
+`Intl.DateTimeFormat`, `Worker`, `SharedWorker`, …)
+**When** a page evaluates `C.prototype.constructor`
+**Then** it is the wrapper, identical to the global `C`
+**And** constructing through it applies the same per-site policy
 
 ---
 
@@ -619,16 +876,18 @@ seeded noise per frame.
 When `trackingProtectionEnabled` is true the umbrella SHALL, if a
 static spoof location is set (`spoofLatitude` and `spoofLongitude`
 both non-null), force the effective timezone to "from picked location"
-(`spoofTimezoneFromLocation: true`, `spoofTimezone: null`) so spoofed
-`Date` / `Intl.DateTimeFormat` values match the spoofed geo. With no
+so spoofed `Date` / `Intl.DateTimeFormat` values match the spoofed
+geo. The forcing is applied where the zone is resolved
+(`derivesTimezoneFromLocation`, at settings save and on startup for a site
+saved before that), which stores the zone the coordinates fall in as
+`spoofTimezone`; every webview of the site, root, nested and popup, applies
+that stored zone through its `SitePosture` and none re-derives it. With no
 spoof location set the umbrella SHALL leave the timezone untouched.
 The umbrella SHALL NOT modify `locationMode`: `off` / `spoof` / `live`
-flow to `WebViewConfig` verbatim because legitimate use cases (maps,
+flow into the posture verbatim because legitimate use cases (maps,
 navigation, weather) need real GPS even under tracker-blocking, and
-the geolocation mode is the user's per-site choice. Stored fields on
-`WebViewModel` are unchanged; only the `WebViewConfig` sees the
-forced timezone values, and the same forcing applies to nested
-webviews via `InAppWebViewScreen.initState`.
+the geolocation mode is the user's per-site choice. The stored
+`spoofTimezoneFromLocation` choice is not modified.
 
 #### Scenario: Live location is independent of the umbrella
 
@@ -643,9 +902,10 @@ webviews via `InAppWebViewScreen.initState`.
 **Given** a site with `spoofLatitude: 48.8`, `spoofLongitude: 2.3`,
 `spoofTimezone: 'America/New_York'`, `spoofTimezoneFromLocation: false`,
 and `trackingProtectionEnabled: true`
-**When** the webview is constructed
-**Then** the `WebViewConfig` has `spoofTimezone: null`
-**And** `spoofTimezoneFromLocation: true`
+**When** its settings are saved with the polygon dataset loaded
+**Then** the stored `spoofTimezone` is `'Europe/Paris'`
+**And** the site's webview and every nested webview it opens report
+`Europe/Paris` (BUG-025: the nested one used to report the device zone)
 
 #### Scenario: No coords leaves timezone untouched
 
@@ -653,8 +913,7 @@ and `trackingProtectionEnabled: true`
 `spoofTimezone: 'Europe/London'`, `spoofTimezoneFromLocation: false`,
 and `trackingProtectionEnabled: true`
 **When** the webview is constructed
-**Then** the `WebViewConfig` has `spoofTimezone: 'Europe/London'`
-**And** `spoofTimezoneFromLocation: false`
+**Then** its `SitePosture` has `location.timezone: 'Europe/London'`
 
 #### Scenario: Settings UI keeps Live selectable under the umbrella
 
@@ -671,16 +930,15 @@ editable
 
 ### Requirement: ETP-016 - Nested webview propagation
 
-The system SHALL propagate `trackingProtectionEnabled` to every nested `InAppWebViewScreen` opened via `launchUrl` so a nested page sees the same umbrella posture as the parent (shim injected and subordinates forced when true; subordinates passed verbatim and shim NOT injected when false).
+The system SHALL propagate `trackingProtectionEnabled` to every nested `InAppWebViewScreen` opened via `launchUrl` so a nested page sees the same umbrella posture as the parent (shim injected and subordinates forced when true; subordinates passed verbatim and shim NOT injected when false). The nested screen is built from the parent's `SitePosture`, so the forcing arrives already applied (NESTED-010).
 
 #### Scenario: Umbrella propagates to nested
 
 **Given** the parent site has `trackingProtectionEnabled: true`
 **When** a nested webview is opened via `launchUrl`
-**Then** the constructed `InAppWebViewScreen.trackingProtectionEnabled`
-is `true`
-**And** the constructed `WebViewConfig.trackingProtectionEnabled` is
-`true`
+**Then** the nested `WebViewConfig.posture` has
+`fingerprint.trackingProtection: true`
+**And** its blocking group is the parent's, forced subordinates included
 
 ---
 
@@ -715,8 +973,8 @@ closed tracking channel.
 
 HTML caching SHALL NOT appear here. It decides whether a page is redrawn
 from disk on a cold start, which is a behaviour of the app rather than
-something a site learns; it lives with the other behaviour switches on
-the settings screen.
+something a site learns; it lives with the other behaviour switches, on
+the Behaviour screen (BEHAV-001).
 
 The anti-fingerprinting note under the letterbox group SHALL render only
 while the umbrella is on, since with it off nothing is being randomised.
@@ -726,10 +984,10 @@ fields, the dirty-snapshot diff and the save path (BUG-006 / EDIT-009);
 the screen reads a `SitePrivacyValues` and reports whole values back
 through `onChanged`.
 
-The Privacy and Permissions rows SHALL sit at the foot of site settings
-under a "Site" heading, below the leaf switches, Privacy first. They are
-the two rows a reader visits deliberately; the switches above are what
-they scroll past on the way to something else.
+The Behaviour, Privacy and Permissions rows SHALL sit at the foot of site
+settings under a "Site" heading, below the leaf controls, in that order
+(BEHAV-002). They are the rows a reader visits deliberately; the
+controls above are what they scroll past on the way to something else.
 
 The Privacy row SHALL summarise the current posture without being opened:
 "Tracking Protection on" while the umbrella is on, otherwise the names of
@@ -919,6 +1177,140 @@ forced row that captions itself (ETP-017)
 
 ---
 
+### Requirement: ETP-031 - No direct WebRTC behind a proxy under umbrella
+
+While `trackingProtectionEnabled` is true and the site's traffic goes through
+a proxy, the umbrella SHALL raise a stored `webRtcPolicy` of `defaultPolicy`
+to `relayOnly` (LOC-004). "Goes through a proxy" follows the precedence ladder
+the webview itself uses (LEAK-001): the site's own proxy type is not
+`DEFAULT`, or it is `DEFAULT` and the app-wide outbound proxy is set. `TOR`
+counts. A stored `disabled` is stricter than the floor and SHALL be kept.
+
+A direct ICE candidate (host or server-reflexive) is the device's own address,
+gathered over UDP the proxy never sees, so a site behind a proxy with WebRTC
+left on Default can read the very IP the user picked the proxy to hide
+(LEAK-005). Relay only keeps WebRTC usable wherever the site brings a TURN
+server; Disabled would break calls that relay would carry, and the umbrella
+forces the least it has to.
+
+As with ETP-024 the stored value SHALL be preserved: turning the umbrella off,
+or leaving the proxy, gives the site its stored policy back, and a settings
+export records the stored value.
+
+The forcing SHALL be derived on `WebViewModel` as `effectiveWebRtcPolicy`,
+through the pure `resolveWebRtcPolicy` in
+[lib/settings/location.dart](../../../lib/settings/location.dart), and every
+path that hands the policy to a webview SHALL read that getter: `WebViewConfig`
+construction and both `launchUrl` call sites. The nested `InAppWebViewScreen`
+SHALL apply `resolveWebRtcPolicy` to the config it builds, from its own
+umbrella value and proxy settings. `test/js/tracking_protection_umbrella_funnel.test.js`
+fails any carrier that passes the stored field.
+
+The app-wide proxy is read when the webview is built; changing it rebuilds
+every loaded webview, so a site picks up or drops the floor with it.
+
+On the Network screen (NET-001) the WebRTC row SHALL, while the floor applies,
+show the forced value in its dropdown, render the Default item disabled, and
+caption the row "Direct connections blocked by Tracking Protection behind a
+proxy". The floor is computed from the unsaved form, so picking a proxy on the
+screen applies it at once. Relay only and Disabled stay selectable; re-picking
+the Relay only the dropdown already shows SHALL store nothing, so a stored
+Default survives. The Network settings row (NET-002) SHALL name the policy the
+site will run, not the stored one.
+
+#### Scenario: Site's own proxy, umbrella on
+
+**Given** a site with proxy `SOCKS5 127.0.0.1:1080`,
+`trackingProtectionEnabled: true` and `webRtcPolicy: defaultPolicy`
+**When** the webview is constructed
+**Then** the `WebViewConfig` has `webRtcPolicy: relayOnly`
+**And** the page's `RTCPeerConnection` gathers only `typ relay` candidates
+**And** the stored `webRtcPolicy` remains `defaultPolicy`
+
+#### Scenario: App-wide proxy counts for a site on DEFAULT
+
+**Given** a site with proxy type `DEFAULT` and `webRtcPolicy: defaultPolicy`
+**And** the app-wide outbound proxy is `HTTP 10.0.0.1:8080`
+**And** `trackingProtectionEnabled` is true
+**When** the webview is constructed
+**Then** the `WebViewConfig` has `webRtcPolicy: relayOnly`
+
+#### Scenario: No proxy, no floor
+
+**Given** a site with no proxy of its own and no app-wide proxy
+**And** `trackingProtectionEnabled` is true
+**When** the webview is constructed
+**Then** the `WebViewConfig` has the stored `webRtcPolicy`
+
+#### Scenario: Umbrella off restores the stored value
+
+**Given** a proxied site with `webRtcPolicy: defaultPolicy`
+**When** the user turns Tracking Protection off for it
+**Then** the `WebViewConfig` has `webRtcPolicy: defaultPolicy`
+
+#### Scenario: Disabled is kept
+
+**Given** a proxied site with `trackingProtectionEnabled: true` and
+`webRtcPolicy: disabled`
+**When** the webview is constructed
+**Then** the `WebViewConfig` has `webRtcPolicy: disabled`
+
+#### Scenario: Nested webview forces too
+
+**Given** a parent site on `TOR` with `trackingProtectionEnabled: true` and
+`webRtcPolicy: defaultPolicy`
+**When** a cross-domain link opens a nested `InAppWebViewScreen`
+**Then** the nested `WebViewConfig` has `webRtcPolicy: relayOnly`
+
+#### Scenario: Network screen reflects the floor
+
+**Given** the umbrella is on and the site has a proxy of its own
+**When** the user opens the Network screen
+**Then** the WebRTC dropdown shows "Relay only" with the "Default" item disabled
+**And** the row reads "Direct connections blocked by Tracking Protection
+behind a proxy"
+**And** picking "Disabled" is still possible and is stored
+
+---
+
+### Requirement: ETP-028 - Per-launch nonce for incognito fingerprint randomization
+
+The system SHALL maintain a process-lifetime random nonce, exposed as `LaunchNonce.value` in [lib/services/launch_nonce.dart](../../../lib/services/launch_nonce.dart). The nonce SHALL be generated lazily on first read using `dart:math` `Random.secure` and SHALL remain identical for every subsequent read within the same process. The nonce SHALL NOT be persisted to disk: a new process start (cold launch, OS-killed restore, debug hot-restart) SHALL produce a fresh nonce. App resume from background is NOT a new launch and SHALL NOT regenerate the nonce. The nonce SHALL be mixed into the anti-fingerprinting seed only when the site has `incognito: true` (per ETP-004).
+
+#### Scenario: Stable across reads within a process
+
+**Given** `LaunchNonce.value` returns `n` on first read
+**When** `LaunchNonce.value` is read again later in the same process
+**Then** the returned value equals `n`
+
+#### Scenario: Non-empty cryptographic random
+
+**Given** `LaunchNonce.value` is read
+**Then** the returned string is non-empty
+**And** matches `^[0-9a-f]+$` (hex encoding of `Random.secure` bytes)
+
+#### Scenario: Test override
+
+**Given** a test calls `LaunchNonce.overrideForTesting('fixed')`
+**When** `LaunchNonce.value` is read
+**Then** the returned value equals `'fixed'`
+**And** a subsequent `LaunchNonce.resetForTesting()` causes the next read to regenerate a fresh random nonce
+
+#### Scenario: Incognito + Tracking Protection randomizes per launch
+
+**Given** a site has `incognito: true` and `trackingProtectionEnabled: true`
+**When** the webview is constructed
+**Then** the seed passed to `buildAntiFingerprintingShim` is `'${siteId}:${LaunchNonce.value}'`
+**And** after a process restart the seed embeds a different nonce
+**And** therefore the shim source (and every fingerprintable surface seeded by the PRNG) changes across launches
+
+#### Scenario: Non-incognito site keeps stable per-site fingerprint
+
+**Given** a site has `incognito: false` and `trackingProtectionEnabled: true`
+**When** the webview is constructed
+**Then** the seed passed to `buildAntiFingerprintingShim` is `siteId` verbatim
+**And** the fingerprint is identical across launches (ETP-004 baseline preserved)
+
 ## Implementation Details
 
 ### Shim seeding
@@ -959,6 +1351,16 @@ bool get effectiveThirdPartyCookiesEnabled =>
     trackingProtectionEnabled ? false : thirdPartyCookiesEnabled;
 ```
 
+`effectiveWebRtcPolicy` raises Default to Relay only behind a proxy (ETP-031):
+
+```dart
+WebRtcPolicy get effectiveWebRtcPolicy => resolveWebRtcPolicy(
+      stored: webRtcPolicy,
+      trackingProtectionEnabled: trackingProtectionEnabled,
+      proxied: resolveEffectiveProxy(proxySettings).type != ProxyType.DEFAULT,
+    );
+```
+
 The stored `WebViewModel` field is unchanged; only the `WebViewConfig`
 that flows into the platform webview sees the forced values.
 
@@ -984,7 +1386,7 @@ if (config.trackingProtectionEnabled && config.siteId != null) {
 
 `trackingProtectionEnabled` is a per-site field on `WebViewModel.toJson`,
 so it rides through the settings backup path automatically — no entry
-in `kExportedAppPrefs` is needed.
+in `AppPref` is needed.
 
 ---
 
@@ -994,8 +1396,7 @@ in `kExportedAppPrefs` is needed.
 - `lib/services/anti_fingerprinting_shim.dart` — Pure-Dart shim builder.
 - `test/anti_fingerprinting_shim_test.dart` — Dart shape tests.
 - `test/js/anti_fingerprinting_shim.test.js` — Node + jsdom behavioural tests.
-- `test/js_fixtures/anti_fingerprinting/shim_seed_alpha.js`
-- `test/js_fixtures/anti_fingerprinting/shim_seed_beta.js`
+- `lib/js/anti_fingerprinting.js` — the shim itself.
 - `openspec/specs/tracking-protection/spec.md` — This spec.
 - `lib/screens/site_privacy.dart` — The Privacy screen (ETP-017):
   `SitePrivacyValues` plus the umbrella card and its three groups.
@@ -1012,7 +1413,11 @@ in `kExportedAppPrefs` is needed.
   propagation, plus `rerollFingerprint`.
   `effectiveProtectedContentAllowed` forces deny under the umbrella
   (ETP-023); `effectiveThirdPartyCookiesEnabled` forces third-party
-  cookies off under it (ETP-024).
+  cookies off under it (ETP-024); `effectiveWebRtcPolicy` raises Default
+  WebRTC to Relay only on a proxied site (ETP-031).
+- `lib/settings/location.dart` — `resolveWebRtcPolicy`, the ETP-031 rule
+  shared by the model, the nested screen and the Network screen.
+- `lib/screens/site_network.dart` — The WebRTC row shows the ETP-031 floor.
 - `lib/services/webview.dart` — Added `trackingProtectionEnabled` to
   `WebViewConfig`, shim injection. Added `letterboxEnabled` /
   `spoofWindowWidth` / `spoofWindowHeight` / `fingerprintResetNonce` to
@@ -1035,7 +1440,8 @@ in `kExportedAppPrefs` is needed.
   what remains on the screen is grouped under Content / Behaviour /
   Network headings. Protected content moved earlier to the permissions
   screen (ETP-023).
-- `tool/dump_shim_js.dart` — Two pinned-seed fixtures.
+- `lib/js/anti_fingerprinting.js` — the shim, run by the Node tiers with two
+  pinned seeds.
 - `test/web_view_model_test.dart` — Round-trip + default tests for the
   new field.
 
@@ -1049,7 +1455,6 @@ in `kExportedAppPrefs` is needed.
 fvm flutter test test/anti_fingerprinting_shim_test.dart
 fvm flutter test test/web_view_model_test.dart
 fvm flutter test test/site_privacy_screen_test.dart
-fvm flutter test test/js_fixtures_drift_test.dart
 ```
 
 ### jsdom behavioural

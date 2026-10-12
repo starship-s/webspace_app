@@ -1,14 +1,13 @@
-import 'package:webspace/web_view_model.dart';
+import 'package:webspace/settings/external_links.dart';
+import 'package:webspace/services/url_host.dart';
 
-/// The outcome of a navigation-interception decision.
 enum NavigationDecision {
   /// Let the navigation proceed in the current webview (same-domain, or
   /// inline/about/captcha special cases that don't count as cross-domain).
   allow,
 
-  /// Cancel the navigation without any UI side-effect — the
-  /// `blockAutoRedirects` setting swallowed a script-initiated redirect
-  /// that had no user gesture.
+  /// Cancel the navigation without any UI side-effect: a cross-domain
+  /// navigation with no user gesture, which no site may make (NESTED-004).
   blockSilent,
 
   /// Cancel the navigation and don't open a nested webview because the
@@ -22,10 +21,29 @@ enum NavigationDecision {
 
   /// Cancel the navigation and hand the URL to the system's default
   /// browser (or whichever app handles http/https). Selected when the
-  /// site has `externalLinksInBrowser` on and the cross-domain target is
+  /// site's `externalLinkMode` is `browser` and the cross-domain target is
   /// not covered by the site's domain claims — the user asked for links
   /// outside this site to leave WebSpace entirely.
   blockOpenExternal,
+
+  /// Cancel the navigation and open nothing. Selected when the site's
+  /// `externalLinkMode` is `block` and the cross-domain target is not
+  /// covered by the site's domain claims — the user asked that the site
+  /// never take them anywhere else (issue #629).
+  blockOutbound,
+}
+
+/// The decision for a cross-domain navigation that survived the gesture and
+/// background checks: a claimed target stays in the app, anything else goes
+/// where the site's [mode] sends it (NESTED-009).
+NavigationDecision _leaveDecision(ExternalLinkMode mode,
+    {required bool claimed}) {
+  if (claimed) return NavigationDecision.blockOpenNested;
+  return switch (mode) {
+    ExternalLinkMode.inApp => NavigationDecision.blockOpenNested,
+    ExternalLinkMode.browser => NavigationDecision.blockOpenExternal,
+    ExternalLinkMode.block => NavigationDecision.blockOutbound,
+  };
 }
 
 /// How the caller should update its stored `lastSameDomainGestureTime`
@@ -43,6 +61,15 @@ enum GestureStateUpdate {
   consume,
 }
 
+extension GestureStateUpdateApply on GestureStateUpdate? {
+  /// The caller's stored same-domain gesture time after this update.
+  DateTime? applyTo(DateTime? last, {required DateTime now}) => switch (this) {
+        GestureStateUpdate.record => now,
+        GestureStateUpdate.consume => null,
+        null => last,
+      };
+}
+
 class NavigationDecisionResult {
   final NavigationDecision decision;
 
@@ -50,7 +77,16 @@ class NavigationDecisionResult {
   /// `lastSameDomainGestureTime` variable. `null` means "leave it alone".
   final GestureStateUpdate? gestureUpdate;
 
-  const NavigationDecisionResult(this.decision, [this.gestureUpdate]);
+  /// Whether a cross-domain decision carried an effective user gesture: the
+  /// navigation's own, or one propagated from a recent same-domain tap.
+  /// Outbound routing (LIR-014) acts only on navigations the user caused.
+  final bool hadGesture;
+
+  const NavigationDecisionResult(
+    this.decision, {
+    this.gestureUpdate,
+    this.hadGesture = false,
+  });
 }
 
 /// State owned by the onUrlChanged call site. Immutable; the engine returns
@@ -121,6 +157,9 @@ class OnUrlChangedHandled {
   final OnUrlChangedState state;
   final GestureStateUpdate? gestureUpdate;
 
+  /// See [NavigationDecisionResult.hadGesture].
+  final bool hadGesture;
+
   const OnUrlChangedHandled({
     required this.decision,
     required this.navigateBackTo,
@@ -128,6 +167,7 @@ class OnUrlChangedHandled {
     this.launchExternalUrl,
     required this.state,
     required this.gestureUpdate,
+    this.hadGesture = false,
   });
 }
 
@@ -139,18 +179,44 @@ class OnUrlChangedHandled {
 /// repeated redirects.
 const _gesturePropagationWindowSeconds = 10;
 
-/// Logic for cross-domain navigation interception, extracted from
-/// `WebViewModel.getWebView`'s `shouldOverrideUrlLoading` / `onUrlChanged`
-/// closures and from the matching inline copy in
-/// `test/nested_webview_navigation_test.dart`'s `NavigationTestHarness`
-/// (which previously carried a comment saying it "replicates the exact
-/// logic from WebViewModel.getWebView"). Both sites now delegate here
-/// so the rule can't drift.
-///
+/// What a navigation the user asked for does once its [NavigationDecision]
+/// is made, in the order every way of opening a URL applies it: a link in the
+/// page and an address typed in the URL bar alike.
+enum NavigationStep {
+  /// It loads where it is.
+  loadHere,
+
+  /// It is dropped: no gesture, or a site in the background.
+  drop,
+
+  /// A hosted or foreign tab's link back into its owner's domain opens as the
+  /// owner's child tab instead (S6 of the web search design).
+  returnToOwner,
+
+  /// Routing gets it first (LIR-014, LIR-032); what routing leaves, the
+  /// decision does itself: a nested screen, the system browser, or nothing.
+  route,
+}
+
 /// The engine is stateless. Gesture state lives on the caller as a
 /// mutable `DateTime?`; the engine reads it as an input and returns an
 /// optional update descriptor the caller applies after the call.
 class NavigationDecisionEngine {
+  /// The step [decision] leads to. [returnsToOwner] is whether the URL is in
+  /// the owner's domain while the slot runs a hosted or foreign tab.
+  static NavigationStep stepFor(
+    NavigationDecision decision, {
+    required bool returnsToOwner,
+  }) =>
+      switch (decision) {
+        NavigationDecision.allow => NavigationStep.loadHere,
+        NavigationDecision.blockSilent ||
+        NavigationDecision.blockSuppressed =>
+          NavigationStep.drop,
+        _ when returnsToOwner => NavigationStep.returnToOwner,
+        _ => NavigationStep.route,
+      };
+
   /// Decision for `shouldOverrideUrlLoading`. Semantics mirror the
   /// production callback exactly:
   ///
@@ -161,9 +227,11 @@ class NavigationDecisionEngine {
   ///     `hasGesture` is true so any cross-domain redirect within the
   ///     next 10 seconds can inherit it.
   ///   * cross-domain — consumes any pending gesture, then:
-  ///       * `blockAutoRedirects && !effectiveGesture` → [blockSilent]
+  ///       * `!effectiveGesture` → [blockSilent]
   ///       * `!isSiteActive` → [blockSuppressed]
-  ///       * otherwise → [blockOpenNested]
+  ///       * a target [matchesSiteClaim] covers → [blockOpenNested]
+  ///       * otherwise by [externalLinkMode]: [blockOpenNested],
+  ///         [blockOpenExternal] or [blockOutbound]
   ///
   /// [isSiteActive] should be `true` when the site has no isActive
   /// callback (the production default).
@@ -171,11 +239,10 @@ class NavigationDecisionEngine {
     required String targetUrl,
     required String initUrl,
     required bool hasGesture,
-    required bool blockAutoRedirects,
     required bool isSiteActive,
     required DateTime? lastSameDomainGestureTime,
     required DateTime now,
-    bool externalLinksInBrowser = false,
+    ExternalLinkMode externalLinkMode = ExternalLinkMode.inApp,
     bool Function(String url)? matchesSiteClaim,
   }) {
     if (targetUrl == 'about:blank' || targetUrl == 'about:srcdoc') {
@@ -191,7 +258,7 @@ class NavigationDecisionEngine {
     if (targetDomain == baseDomain) {
       return NavigationDecisionResult(
         NavigationDecision.allow,
-        hasGesture ? GestureStateUpdate.record : null,
+        gestureUpdate: hasGesture ? GestureStateUpdate.record : null,
       );
     }
 
@@ -205,23 +272,28 @@ class NavigationDecisionEngine {
       gestureUpdate = GestureStateUpdate.consume;
     }
 
-    if (blockAutoRedirects && !effectiveGesture) {
-      return NavigationDecisionResult(NavigationDecision.blockSilent, gestureUpdate);
+    if (!effectiveGesture) {
+      return NavigationDecisionResult(NavigationDecision.blockSilent,
+          gestureUpdate: gestureUpdate, hadGesture: effectiveGesture);
     }
     if (!isSiteActive) {
-      return NavigationDecisionResult(NavigationDecision.blockSuppressed, gestureUpdate);
+      return NavigationDecisionResult(NavigationDecision.blockSuppressed,
+          gestureUpdate: gestureUpdate, hadGesture: effectiveGesture);
     }
-    if (externalLinksInBrowser && !(matchesSiteClaim?.call(targetUrl) ?? false)) {
-      return NavigationDecisionResult(NavigationDecision.blockOpenExternal, gestureUpdate);
-    }
-    return NavigationDecisionResult(NavigationDecision.blockOpenNested, gestureUpdate);
+    return NavigationDecisionResult(
+      _leaveDecision(externalLinkMode,
+          claimed: matchesSiteClaim?.call(targetUrl) ?? false),
+      gestureUpdate: gestureUpdate,
+      hadGesture: effectiveGesture,
+    );
   }
 
   /// Decision for `onUrlChanged` — detects server-side 3xx redirects that
   /// bypassed `shouldOverrideUrlLoading`. Caller interpretation:
   ///
-  ///   * [allow] — no-op; URL is same-domain, an inline/about URI, or
-  ///     a recognized captcha challenge; update `currentUrl` as normal.
+  ///   * [allow] — no-op; URL is same-domain, an inline/about URI, or a
+  ///     recognized captcha challenge that already cleared the gesture
+  ///     check; update `currentUrl` as normal.
   ///   * [blockSilent] — caller navigates the webview back to the last
   ///     same-domain URL and does nothing else.
   ///   * [blockSuppressed] — caller navigates back; the nested webview
@@ -229,18 +301,24 @@ class NavigationDecisionEngine {
   ///     entry.
   ///   * [blockOpenNested] — caller navigates back and opens the target
   ///     URL in an InAppBrowser nested webview.
+  ///   * [blockOpenExternal] — caller navigates back and hands the target
+  ///     URL to the system browser.
+  ///   * [blockOutbound] — caller navigates back and opens nothing.
   ///
   /// [isCaptchaChallenge] is injected so the engine doesn't duplicate
-  /// the captcha domain list from `WebViewFactory`.
+  /// the captcha domain list from `WebViewFactory`. It is consulted only
+  /// after the gesture verdict: a challenge flow that
+  /// the user reached must complete in the parent webview rather than a
+  /// nested one, but a URL merely *shaped* like a challenge must not buy a
+  /// gesture-less cross-origin navigation.
   static NavigationDecisionResult decideOnUrlChanged({
     required String newUrl,
     required String initUrl,
-    required bool blockAutoRedirects,
     required bool isSiteActive,
     required DateTime? lastSameDomainGestureTime,
     required DateTime now,
     required bool Function(String url) isCaptchaChallenge,
-    bool externalLinksInBrowser = false,
+    ExternalLinkMode externalLinkMode = ExternalLinkMode.inApp,
     bool Function(String url)? matchesSiteClaim,
   }) {
     final scheme = Uri.tryParse(newUrl)?.scheme ?? '';
@@ -251,9 +329,6 @@ class NavigationDecisionEngine {
     final targetDomain = getNormalizedDomain(newUrl);
     final baseDomain = getNormalizedDomain(initUrl);
     if (targetDomain == baseDomain) {
-      return const NavigationDecisionResult(NavigationDecision.allow);
-    }
-    if (isCaptchaChallenge(newUrl)) {
       return const NavigationDecisionResult(NavigationDecision.allow);
     }
 
@@ -267,16 +342,29 @@ class NavigationDecisionEngine {
       gestureUpdate = GestureStateUpdate.consume;
     }
 
-    if (blockAutoRedirects && !hasRecentGesture) {
-      return NavigationDecisionResult(NavigationDecision.blockSilent, gestureUpdate);
+    if (!hasRecentGesture) {
+      return NavigationDecisionResult(NavigationDecision.blockSilent,
+          gestureUpdate: gestureUpdate, hadGesture: hasRecentGesture);
+    }
+    // Only rescues a navigation the checks above already let through. Ahead
+    // of them it was a bypass: `isCaptchaChallenge` matches a URL *shape*,
+    // and any page can send itself to an attacker origin carrying that shape
+    // with no gesture, which then renders in place, inside the site's own
+    // container, and commits as `currentUrl`.
+    if (isCaptchaChallenge(newUrl)) {
+      return NavigationDecisionResult(NavigationDecision.allow,
+          gestureUpdate: gestureUpdate, hadGesture: hasRecentGesture);
     }
     if (!isSiteActive) {
-      return NavigationDecisionResult(NavigationDecision.blockSuppressed, gestureUpdate);
+      return NavigationDecisionResult(NavigationDecision.blockSuppressed,
+          gestureUpdate: gestureUpdate, hadGesture: hasRecentGesture);
     }
-    if (externalLinksInBrowser && !(matchesSiteClaim?.call(newUrl) ?? false)) {
-      return NavigationDecisionResult(NavigationDecision.blockOpenExternal, gestureUpdate);
-    }
-    return NavigationDecisionResult(NavigationDecision.blockOpenNested, gestureUpdate);
+    return NavigationDecisionResult(
+      _leaveDecision(externalLinkMode,
+          claimed: matchesSiteClaim?.call(newUrl) ?? false),
+      gestureUpdate: gestureUpdate,
+      hadGesture: hasRecentGesture,
+    );
   }
 
   /// Full onUrlChanged flow: runs [decideOnUrlChanged] against the caller's
@@ -299,13 +387,12 @@ class NavigationDecisionEngine {
   static OnUrlChangedHandled handleOnUrlChanged({
     required String newUrl,
     required String initUrl,
-    required bool blockAutoRedirects,
     required bool isSiteActive,
     required DateTime? lastSameDomainGestureTime,
     required DateTime now,
     required bool Function(String url) isCaptchaChallenge,
     required OnUrlChangedState state,
-    bool externalLinksInBrowser = false,
+    ExternalLinkMode externalLinkMode = ExternalLinkMode.inApp,
     bool Function(String url)? matchesSiteClaim,
   }) {
     final initDomain = getNormalizedDomain(initUrl);
@@ -315,12 +402,11 @@ class NavigationDecisionEngine {
       final result = decideOnUrlChanged(
         newUrl: newUrl,
         initUrl: initUrl,
-        blockAutoRedirects: blockAutoRedirects,
         isSiteActive: isSiteActive,
         lastSameDomainGestureTime: lastSameDomainGestureTime,
         now: now,
         isCaptchaChallenge: isCaptchaChallenge,
-        externalLinksInBrowser: externalLinksInBrowser,
+        externalLinkMode: externalLinkMode,
         matchesSiteClaim: matchesSiteClaim,
       );
       if (result.decision != NavigationDecision.allow) {
@@ -336,6 +422,7 @@ class NavigationDecisionEngine {
           launchExternalUrl: launchExternalUrl,
           state: state.copyWith(redirectHandled: true),
           gestureUpdate: result.gestureUpdate,
+          hadGesture: result.hadGesture,
         );
       }
       // decision == allow; fall through to the commit path below.

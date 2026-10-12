@@ -11,7 +11,9 @@ void main() {
     final webviewSource = File('lib/services/webview.dart').readAsStringSync();
     expect(
       webviewSource,
-      contains('..thirdPartyCookiesEnabled = config.thirdPartyCookiesEnabled'),
+      contains(
+        '..thirdPartyCookiesEnabled = posture.container.thirdPartyCookies',
+      ),
     );
   });
 }

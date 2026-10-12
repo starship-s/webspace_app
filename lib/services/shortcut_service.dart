@@ -1,6 +1,8 @@
 import 'package:webspace/platform/host_platform.dart';
 import 'dart:typed_data';
 import 'package:flutter/services.dart';
+import 'package:webspace/services/startup_restore_engine.dart'
+    show TileUpdate;
 
 /// One site as it crosses the platform-channel boundary into the iOS App
 /// Intents picker (HS-007). `iconUrl` is reserved for future favicon syncing
@@ -39,30 +41,48 @@ class ShortcutLaunch {
   const ShortcutLaunch({required this.siteId, this.url});
 }
 
+enum PinShortcutResult {
+  /// The system pin dialog opened (Android), or Shortcuts.app did (iOS/macOS).
+  requested,
+
+  /// Android: the site's tile was already pinned. A disabled copy (a tile
+  /// restored from a device backup, or one disabled at delete time) has just
+  /// been re-enabled, so no dialog follows (HS-015).
+  alreadyPinned,
+
+  failed;
+
+  static PinShortcutResult fromChannel(Object? raw) {
+    if (raw == true) return requested;
+    if (raw == 'alreadyPinned') return alreadyPinned;
+    return failed;
+  }
+}
+
 class ShortcutService {
   static const _channel = MethodChannel('org.codeberg.theoden8.webspace/shortcuts');
 
   /// Request a pinned home screen shortcut for a site.
   ///
   /// Android: hands the request to `ShortcutManagerCompat.requestPinShortcut`
-  /// and returns whether the system dialog opened. iOS 16+: opens the
+  /// after re-enabling any disabled tile under the same id. iOS 16+: opens the
   /// Shortcuts app — the caller is responsible for showing the
-  /// instructional dialog (HS-008) before invoking. Returns false on
-  /// platforms without either path.
+  /// instructional dialog (HS-008) before invoking. [PinShortcutResult.failed]
+  /// on platforms without either path.
   ///
   /// [iconBytes] is a ready-to-use raster PNG (the caller rasterizes the
   /// favicon, including SVG, before invoking — Android's BitmapFactory can't
   /// decode SVG). When present the native side uses it directly; [iconUrl] is
   /// only a fallback the native side downloads if no bytes were supplied. With
   /// neither, the shortcut uses the WebSpace app icon.
-  static Future<bool> pinShortcut({
+  static Future<PinShortcutResult> pinShortcut({
     required String siteId,
     required String label,
     Uint8List? iconBytes,
     String? iconUrl,
   }) async {
     if (!hostIsAndroid && !hostIsIOS && !hostIsMacOS) {
-      return false;
+      return PinShortcutResult.failed;
     }
     try {
       final result = await _channel.invokeMethod('pinShortcut', {
@@ -71,11 +91,11 @@ class ShortcutService {
         'iconBytes': iconBytes,
         'iconUrl': iconUrl,
       });
-      return result == true;
+      return PinShortcutResult.fromChannel(result);
     } on PlatformException {
-      return false;
+      return PinShortcutResult.failed;
     } on MissingPluginException {
-      return false;
+      return PinShortcutResult.failed;
     }
   }
 
@@ -131,7 +151,9 @@ class ShortcutService {
     }
   }
 
-  /// Get the set of siteIds that currently have a pinned home shortcut.
+  /// Get the set of siteIds that currently have an enabled pinned home
+  /// shortcut. A disabled tile is left out: it opens nothing, and counting it
+  /// would hide the menu item that re-enables it (HS-015).
   /// Android-only — iOS has no public API to enumerate home-screen tiles, so
   /// this always returns an empty set on iOS.
   static Future<Set<String>> getPinnedSiteIds() async {
@@ -144,6 +166,25 @@ class ShortcutService {
       return const <String>{};
     } on PlatformException {
       return const <String>{};
+    }
+  }
+
+  /// Rewrite the label, and the icon where one is given, of pinned tiles
+  /// (Android only, HS-016). False when nothing was written: off Android, on
+  /// a channel error, or when the launcher rate-limits the call, so the
+  /// caller retries on its next sync.
+  static Future<bool> updateTiles(List<TileUpdate> updates) async {
+    if (!hostIsAndroid) return false;
+    try {
+      final result = await _channel.invokeMethod('updateShortcuts', {
+        'tiles': [
+          for (final u in updates)
+            {'siteId': u.tile, 'label': u.label, 'iconBytes': u.icon},
+        ],
+      });
+      return result == true;
+    } on PlatformException {
+      return false;
     }
   }
 

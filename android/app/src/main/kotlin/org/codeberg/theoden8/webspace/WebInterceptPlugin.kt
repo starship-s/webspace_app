@@ -4,6 +4,7 @@ import android.app.Activity
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.WebResourceResponse
+import com.pichillilorenzo.flutter_inappwebview_android.InAppWebViewFlutterPlugin
 import com.pichillilorenzo.flutter_inappwebview_android.content_blocker.ContentBlocker
 import com.pichillilorenzo.flutter_inappwebview_android.content_blocker.ContentBlockerAction
 import com.pichillilorenzo.flutter_inappwebview_android.content_blocker.ContentBlockerHandler
@@ -11,16 +12,24 @@ import com.pichillilorenzo.flutter_inappwebview_android.content_blocker.ContentB
 import com.pichillilorenzo.flutter_inappwebview_android.types.WebResourceRequestExt
 import com.pichillilorenzo.flutter_inappwebview_android.webview.in_app_webview.InAppWebView
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.MethodCall
 import io.flutter.plugin.common.MethodChannel
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.io.FileInputStream
-import java.util.Collections
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
+import java.io.FileNotFoundException
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.regex.PatternSyntaxException
 
-class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterEngine) {
+/**
+ * [activity] is null in an engine the notification worker started with no
+ * activity (NOTIF-016): there the only webviews are headless ones, which the
+ * flutter_inappwebview plugin holds outside any view tree.
+ */
+class WebInterceptPlugin(
+    private val activity: Activity?,
+    private val flutterEngine: FlutterEngine,
+) {
     private val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
     private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
 
@@ -29,43 +38,16 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
     private val dnsBlocklist = DnsHostBlocklist()
 
     // ABP rules are owned end-to-end by the native adblock-rust engine
-    // (see setAdblockEngineRules). The interceptor consults it for every
+    // (see setAdblockEngine). The interceptor consults it for every
     // request that wasn't already blocked by the DNS host-only fast path.
 
-    // LocalCDN: regex patterns matching CDN URLs. Each pattern must expose
-    // groups 1/2/3 = library/version/file (matching the Dart _cdnPatterns table).
-    private val cdnPatterns = mutableListOf<Regex>()
-    // LocalCDN: cacheKey ("lib/ver/file") -> absolute file path on disk.
-    private val cdnCacheIndex = mutableMapOf<String, String>()
+    private val cdnTables = LocalCdnTables()
 
-    // Per-site pending block events. Stored as a per-host map keyed by
-    // host so repeated requests for the same host (the dominant pattern
-    // on real pages — a CDN domain serving 30+ assets) collapse into one
-    // log entry with a `count` aggregate. Without this dedup, a typical
-    // page enqueued 200+ HashMap allocations on the WebView thread per
-    // load, pinned the synchronized list contention, and pumped 200+
-    // events through the Flutter MethodChannel codec on each drain.
-    private val pendingBlockEvents = ConcurrentHashMap<String, MutableMap<String, BlockEventEntry>>()
-    private val blockSignalPending = ConcurrentHashMap<String, AtomicBoolean>()
-
-    // Per-site pending LocalCDN replacement events. Events carry the cache key
-    // that was served; Dart turns each into a recordReplacement(siteId) call.
-    private val pendingCdnEvents = ConcurrentHashMap<String, MutableList<Map<String, Any>>>()
-    private val cdnSignalPending = ConcurrentHashMap<String, AtomicBoolean>()
-
-    // Diagnostic kill-switch for the LocalCDN serve path inside
-    // FastSubresourceInterceptor.checkUrl. Originally added when we
-    // suspected LocalCDN's FileInputStream-backed WebResourceResponse
-    // was a candidate for a chromium dangling-raw_ptr crash on
-    // Chrome_IOThread. Symbolicated minidump analysis later traced the
-    // dangle to chromium's own `PartitionAllocUnretainedDanglingPtr`
-    // self-test (a feature-gated debug check enabled on AOSP userdebug
-    // builds, disabled in production Stable WebView), unrelated to
-    // LocalCDN. Re-enabled.
-    //
-    // The flag is kept as plumbing so we can re-disable from a single
-    // line if a real LocalCDN-specific crash surfaces in the future.
-    private val localCdnDisabled = AtomicBoolean(false)
+    // Repeat requests for one host (a CDN domain serving 30+ assets) collapse
+    // into one counted record, so a page load costs one channel round trip
+    // per batch instead of one per request.
+    private val blockEvents = SiteEventInbox<BlockEvent>(wakeDart("blockEventsReady"))
+    private val cdnEvents = SiteEventInbox<CdnEvent>(wakeDart("cdnEventsReady"))
 
     init {
         channel.setMethodCallHandler { call, result ->
@@ -102,27 +84,36 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
                         result.error("INVALID_ARGS", "domains blob required", null)
                     }
                 }
-                "setAdblockEngineRules" -> {
-                    // Phase 9: Dart pushes the concatenated filter-list
-                    // text once when the user flips the engine toggle.
-                    // Empty string = engine off → tear down + revert
-                    // to host-only fast path. Non-empty = parse on the
-                    // Rust side and keep the handle for per-request
-                    // checkUrl calls in FastSubresourceInterceptor.
-                    val rulesText = call.argument<String>("rulesText") ?: ""
+                "setAdblockEngine" -> {
+                    // Dart pushes the engine it built, serialized, at launch
+                    // and on every rebuild, or the rules text when the blob
+                    // did not hydrate; empty turns it off and reverts to the
+                    // host-only fast path. Built off the main thread, where
+                    // Dart itself runs; Dart awaits the reply, so no page
+                    // loads before the engine is in.
+                    val blob = call.argument<ByteArray>("blob")
+                    val rulesText = call.argument<String>("rulesText")
                     val enableUboResources =
                         call.argument<Boolean>("enableUboResources") ?: true
-                    AdblockEngineNative.setRules(rulesText, enableUboResources)
-                    // host-decision cache keys on host only, but the
-                    // engine answers per (url, source, type). Hits
-                    // that previously read ALLOWED from the cache
-                    // would shadow the engine — clear so the engine
-                    // gets to vote.
-                    clearAllHostDecisionCaches()
-                    result.success(mapOf(
-                        "supported" to AdblockEngineNative.supported,
-                        "active" to AdblockEngineNative.active,
-                    ))
+                    engineBuilds.execute {
+                        if (blob != null) {
+                            AdblockEngineNative.setEngine(blob, enableUboResources)
+                        } else {
+                            AdblockEngineNative.setRules(rulesText ?: "", enableUboResources)
+                        }
+                        mainHandler.post {
+                            // host-decision cache keys on host only, but the
+                            // engine answers per (url, source, type). Hits
+                            // that previously read ALLOWED from the cache
+                            // would shadow the engine — clear so the engine
+                            // gets to vote.
+                            clearAllHostDecisionCaches()
+                            result.success(mapOf(
+                                "supported" to AdblockEngineNative.supported,
+                                "active" to AdblockEngineNative.active,
+                            ))
+                        }
+                    }
                 }
                 "isAdblockEngineSupported" -> {
                     // Diagnostic for the Dart-side UI: lets the toggle
@@ -133,53 +124,59 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
                 "setCdnPatterns" -> {
                     val patterns = call.argument<List<String>>("patterns")
                     if (patterns != null) {
-                        synchronized(cdnPatterns) {
-                            cdnPatterns.clear()
-                            for (p in patterns) {
-                                try {
-                                    cdnPatterns.add(Regex(p))
-                                } catch (_: Exception) {
-                                    // Skip malformed patterns (Java/Dart regex dialects differ)
-                                }
+                        // Java and Dart regex dialects differ; a pattern only
+                        // Dart accepts is skipped rather than failing the set.
+                        val compiled = patterns.mapNotNull { p ->
+                            try {
+                                Regex(p)
+                            } catch (_: PatternSyntaxException) {
+                                null
                             }
                         }
-                        result.success(cdnPatterns.size)
+                        cdnTables.patterns = compiled
+                        result.success(compiled.size)
                     } else {
                         result.error("INVALID_ARGS", "patterns list required", null)
                     }
                 }
                 "setCdnCacheIndex" -> {
-                    @Suppress("UNCHECKED_CAST")
                     val index = call.argument<Map<String, String>>("index")
                     if (index != null) {
-                        synchronized(cdnCacheIndex) {
-                            cdnCacheIndex.clear()
-                            cdnCacheIndex.putAll(index)
-                        }
-                        result.success(cdnCacheIndex.size)
+                        cdnTables.index = index.toMap()
+                        result.success(index.size)
                     } else {
                         result.error("INVALID_ARGS", "index map required", null)
                     }
                 }
                 "attachToWebViews" -> {
                     val siteId = call.argument<String>("siteId")
-                    val count = attachToAllWebViews(siteId)
+                    val dnsLevel = call.argument<Int>("dnsLevel")
+                    val localCdn = call.argument<Boolean>("localCdn")
+                    val count = attachToAllWebViews(siteId, dnsLevel, localCdn)
                     result.success(count)
                 }
-                "fetchBlockEvents" -> {
+                "attachToHeadless" -> {
+                    val headlessId = call.argument<String>("headlessId")
                     val siteId = call.argument<String>("siteId")
-                    if (siteId == null) {
-                        result.error("INVALID_ARGS", "siteId required", null)
+                    val dnsLevel = call.argument<Int>("dnsLevel")
+                    val localCdn = call.argument<Boolean>("localCdn")
+                    val webView = headlessId?.let { headlessWebView(it) }
+                    if (webView == null || siteId == null) {
+                        result.success(false)
                     } else {
-                        result.success(drainBlockEvents(siteId))
+                        if (dnsLevel != null) siteDnsLevel[siteId] = dnsLevel
+                        if (localCdn != null) siteLocalCdn[siteId] = localCdn
+                        siteIdMap[webView] = siteId
+                        attachInterceptor(webView, siteId)
+                        result.success(true)
                     }
                 }
-                "fetchCdnEvents" -> {
-                    val siteId = call.argument<String>("siteId")
-                    if (siteId == null) {
-                        result.error("INVALID_ARGS", "siteId required", null)
-                    } else {
-                        result.success(drainCdnEvents(siteId))
+                "fetchBlockEvents" -> drain(call, result) { siteId ->
+                    blockEvents.take(siteId).map { (event, count) -> event.toChannel(count) }
+                }
+                "fetchCdnEvents" -> drain(call, result) { siteId ->
+                    cdnEvents.take(siteId).flatMap { (event, count) ->
+                        List(count) { event.toChannel() }
                     }
                 }
                 else -> result.notImplemented()
@@ -187,98 +184,26 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
         }
     }
 
-    private fun drainCdnEvents(siteId: String): List<Map<String, Any>> {
-        val list = pendingCdnEvents[siteId] ?: return emptyList()
-        synchronized(list) {
-            val snapshot = ArrayList(list)
-            list.clear()
-            return snapshot
+    private fun drain(
+        call: MethodCall,
+        result: MethodChannel.Result,
+        take: (siteId: String) -> List<Map<String, Any>>,
+    ) {
+        val siteId = call.argument<String>("siteId")
+        if (siteId == null) {
+            result.error("INVALID_ARGS", "siteId required", null)
+        } else {
+            result.success(take(siteId))
         }
     }
 
-    /// Drain all pending block events for a site. The map is consumed
-    /// (cleared) under lock and returned as a list of `{host, blocked,
-    /// source, count}` records. A repeat host that fired N times since
-    /// the previous drain shows up as a single record with `count = N`.
-    /// Dart applies the counts to the per-site totals while only adding
-    /// one DnsLogEntry per record.
-    private fun drainBlockEvents(siteId: String): List<Map<String, Any>> {
-        val map = pendingBlockEvents[siteId] ?: return emptyList()
-        synchronized(map) {
-            if (map.isEmpty()) return emptyList()
-            val snapshot = ArrayList<Map<String, Any>>(map.size)
-            for ((host, entry) in map) {
-                val event = HashMap<String, Any>(4)
-                event["host"] = host
-                event["blocked"] = entry.blocked
-                if (entry.source != null) event["source"] = entry.source!!
-                event["count"] = entry.count
-                snapshot.add(event)
-            }
-            map.clear()
-            return snapshot
-        }
-    }
-
-    /// Records a block event (allowed or blocked, source-tagged) and
-    /// signals Dart once per batch. Repeat hosts in the same drain
-    /// window only bump the `count` field on the existing entry — no
-    /// new HashMap allocation, no extra mainHandler.post.
-    private fun recordBlockEvent(siteId: String, host: String, blocked: Boolean, source: String?) {
-        val map = pendingBlockEvents.computeIfAbsent(siteId) {
-            Collections.synchronizedMap(LinkedHashMap())
-        }
-        val isNew: Boolean
-        synchronized(map) {
-            val existing = map[host]
-            if (existing != null) {
-                existing.count++
-                isNew = false
-            } else {
-                map[host] = BlockEventEntry(blocked, source, 1)
-                isNew = true
-            }
-        }
-
-        // Signal Dart only when a new host appears, OR when no signal is
-        // pending (Dart will eventually drain). Bumping a count on an
-        // already-pending host doesn't need a fresh wakeup.
-        if (!isNew) return
-
-        val signaled = blockSignalPending.computeIfAbsent(siteId) { AtomicBoolean(false) }
-        if (signaled.compareAndSet(false, true)) {
-            mainHandler.post {
-                channel.invokeMethod("blockEventsReady", siteId, object : MethodChannel.Result {
-                    override fun success(result: Any?) { signaled.set(false) }
-                    override fun error(code: String, message: String?, details: Any?) { signaled.set(false) }
-                    override fun notImplemented() { signaled.set(false) }
-                })
-            }
-        }
-    }
-
-    /// Mutable count carrier. The map of these is the source of truth
-    /// while events are pending; on drain we atomically swap the map
-    /// contents and translate each entry to a serializable `Map<String, Any>`.
-    private class BlockEventEntry(val blocked: Boolean, val source: String?, var count: Int)
-
-    /// Records that a CDN request was replaced with a cached resource for
-    /// this site. Signal batching mirrors the DNS path.
-    private fun recordCdnEvent(siteId: String, cacheKey: String, url: String) {
-        val list = pendingCdnEvents.computeIfAbsent(siteId) {
-            Collections.synchronizedList(mutableListOf())
-        }
-        list.add(mapOf("cacheKey" to cacheKey, "url" to url))
-
-        val signaled = cdnSignalPending.computeIfAbsent(siteId) { AtomicBoolean(false) }
-        if (signaled.compareAndSet(false, true)) {
-            mainHandler.post {
-                channel.invokeMethod("cdnEventsReady", siteId, object : MethodChannel.Result {
-                    override fun success(result: Any?) { signaled.set(false) }
-                    override fun error(code: String, message: String?, details: Any?) { signaled.set(false) }
-                    override fun notImplemented() { signaled.set(false) }
-                })
-            }
+    private fun wakeDart(method: String): (String, () -> Unit) -> Unit = { siteId, answered ->
+        mainHandler.post {
+            channel.invokeMethod(method, siteId, object : MethodChannel.Result {
+                override fun success(result: Any?) = answered()
+                override fun error(code: String, message: String?, details: Any?) = answered()
+                override fun notImplemented() = answered()
+            })
         }
     }
 
@@ -290,10 +215,14 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
         }
     }
 
-    private fun attachToAllWebViews(newSiteId: String?): Int {
-        val rootView = activity.window.decorView.rootView
-        val webViews = mutableListOf<InAppWebView>()
-        findInAppWebViews(rootView, webViews)
+    private fun attachToAllWebViews(
+        newSiteId: String?,
+        dnsLevel: Int? = null,
+        localCdn: Boolean? = null
+    ): Int {
+        if (newSiteId != null && dnsLevel != null) siteDnsLevel[newSiteId] = dnsLevel
+        if (newSiteId != null && localCdn != null) siteLocalCdn[newSiteId] = localCdn
+        val webViews = collectWebViews()
         val alreadyAttached = webViews.count {
             it.contentBlockerHandler is FastSubresourceInterceptor
         }
@@ -329,40 +258,85 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
         }
 
         for (webView in webViews) {
-            val isNew = webView.contentBlockerHandler !is FastSubresourceInterceptor
-            if (isNew && newSiteId != null) {
+            val existing = webView.contentBlockerHandler as? FastSubresourceInterceptor
+            if (existing == null && newSiteId != null) {
                 siteIdMap[webView] = newSiteId
             }
-            if (isNew) {
-                val siteId = siteIdMap[webView] ?: "unknown"
-                // Always attach the interceptor. The kill-switch
-                // (localCdnDisabled) governs only the LocalCDN
-                // FileInputStream serve path inside checkUrl — it does
-                // not gate DNS or ABP blocking, which must stay active
-                // so users don't have a window where their blocklists
-                // silently stop protecting sub-resource fetches.
-                webView.contentBlockerHandler = FastSubresourceInterceptor(
-                    dnsBlocklist = dnsBlocklist,
-                    cdnPatterns = cdnPatterns,
-                    cdnCacheIndex = cdnCacheIndex,
-                    localCdnDisabled = localCdnDisabled,
-                    onBlockChecked = { host, blocked, source ->
-                        recordBlockEvent(siteId, host, blocked, source)
-                    },
-                    onCdnReplaced = { cacheKey, url -> recordCdnEvent(siteId, cacheKey, url) },
-                    onLog = { tag, message -> log(tag, message) }
-                )
-                log("WebIntercept",
-                    "Attached interceptor: siteId=$siteId dns=${dnsBlocklist.size} " +
-                    "cdnPatterns=${cdnPatterns.size} " +
-                    "cdnCache=${cdnCacheIndex.size} " +
-                    "localCdnDisabled=${localCdnDisabled.get()}")
+            val siteId = siteIdMap[webView] ?: "unknown"
+            if (existing != null) {
+                // Already attached: the settings edit only moves the level.
+                // The host cache holds masks, not decisions, so it survives.
+                existing.dnsLevel = levelFor(siteId)
+                existing.localCdnEnabled = localCdnFor(siteId)
+                continue
             }
+            attachInterceptor(webView, siteId)
         }
         return webViews.size
     }
 
+    /// A site's own level, remembered across re-attach so a call that names
+    /// no level (the LocalCDN kill switch re-attaching everything) can't
+    /// silently promote a site back to full blocking. Unknown sites fail
+    /// closed at the strongest level.
+    private fun levelFor(siteId: String) =
+        siteDnsLevel[siteId] ?: DnsHostBlocklist.MAX_LEVEL
+
+    /// Unknown sites keep the pre-per-site behaviour: serve the cache.
+    private fun localCdnFor(siteId: String) = siteLocalCdn[siteId] ?: true
+
+    private fun attachInterceptor(webView: InAppWebView, siteId: String) {
+        val level = levelFor(siteId)
+        val cdn = localCdnFor(siteId)
+        webView.contentBlockerHandler = FastSubresourceInterceptor(
+            dnsBlocklist = dnsBlocklist,
+            dnsLevel = level,
+            localCdnEnabled = cdn,
+            cdnTables = cdnTables,
+            onBlockChecked = { blockEvents.record(siteId, it) },
+            onCdnReplaced = { cdnEvents.record(siteId, it) },
+            onLog = { tag, message -> log(tag, message) }
+        )
+        log("WebIntercept",
+            "Attached interceptor: siteId=$siteId dnsLevel=$level localCdn=$cdn " +
+            "dns=${dnsBlocklist.size} " +
+            "cdnPatterns=${cdnTables.patterns.size} " +
+            "cdnCache=${cdnTables.index.size}")
+    }
+
+    private fun inAppWebViewPlugin(): InAppWebViewFlutterPlugin? =
+        flutterEngine.plugins.get(InAppWebViewFlutterPlugin::class.java)
+            as? InAppWebViewFlutterPlugin
+
+    private fun headlessWebView(id: String): InAppWebView? =
+        inAppWebViewPlugin()?.headlessInAppWebViewManager?.webViews?.get(id)
+            ?.flutterWebView?.webView
+
+    /// Every webview this engine runs: those in the activity's view tree,
+    /// and the headless ones, which are in no tree while no activity is.
+    private fun collectWebViews(): MutableList<InAppWebView> {
+        val webViews = mutableListOf<InAppWebView>()
+        activity?.window?.decorView?.rootView?.let { findInAppWebViews(it, webViews) }
+        val headless = inAppWebViewPlugin()?.headlessInAppWebViewManager?.webViews?.values
+        if (headless != null) {
+            for (h in headless) {
+                val w = h?.flutterWebView?.webView ?: continue
+                if (w !in webViews) webViews.add(w)
+            }
+        }
+        return webViews
+    }
+
     private val siteIdMap = HashMap<InAppWebView, String>()
+
+    /// Last DNS severity level Dart reported for each site. Read on every
+    /// attach so an interceptor created by a call that names no level still
+    /// gets the site's own posture.
+    private val siteDnsLevel = HashMap<String, Int>()
+
+    /// Last per-site LocalCDN decision Dart reported (LCDN-007), read on every
+    /// attach like [siteDnsLevel]. Main thread only.
+    private val siteLocalCdn = HashMap<String, Boolean>()
 
     /// Exponential backoff: 50, 100, 200, 400, 800 ms. The platform-
     /// view materialisation lag is usually 1-2 frames; this gives us
@@ -382,9 +356,7 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
         }
         val delayMs = attachRetryDelaysMs[attempt - 1].toLong()
         mainHandler.postDelayed({
-            val rootView = activity.window.decorView.rootView
-            val webViews = mutableListOf<InAppWebView>()
-            findInAppWebViews(rootView, webViews)
+            val webViews = collectWebViews()
             if (webViews.isEmpty()) {
                 log("WebIntercept",
                     "attach retry $attempt for siteId=$siteId: still found=0, " +
@@ -418,9 +390,7 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
     /// `dnsBlocklist` swaps in the new set so the interceptor sees the
     /// new contents on the next cache miss; this call ensures there IS a miss.
     private fun clearAllHostDecisionCaches() {
-        val rootView = activity.window.decorView.rootView
-        val webViews = mutableListOf<InAppWebView>()
-        findInAppWebViews(rootView, webViews)
+        val webViews = collectWebViews()
         var cleared = 0
         for (webView in webViews) {
             (webView.contentBlockerHandler as? FastSubresourceInterceptor)?.let {
@@ -435,7 +405,48 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
 
     companion object {
         const val CHANNEL = "org.codeberg.theoden8.webspace/web_intercept"
+
+        // At most one thread for the process, so engine pushes apply in the
+        // order they were sent whichever engine sent them; it exits when idle,
+        // so a background wake's engine leaves no thread behind.
+        private val engineBuilds = java.util.concurrent.ThreadPoolExecutor(
+            0, 1, 30L, java.util.concurrent.TimeUnit.SECONDS,
+            java.util.concurrent.LinkedBlockingQueue(),
+        ) { r -> Thread(r, "adblock-engine-build").apply { isDaemon = true } }
     }
+}
+
+/// What LocalCDN can serve, written by the plugin on the main thread and read
+/// by every interceptor on chromium IO threads. Dart replaces each table
+/// whole, so each is an immutable snapshot behind a volatile reference: a
+/// reader sees the old table or the new one, never one half-applied.
+class LocalCdnTables {
+    /// CDN URL patterns, each exposing groups 1/2/3 = library/version/file
+    /// (matching the Dart _cdnPatterns table).
+    @Volatile
+    var patterns: List<Regex> = emptyList()
+
+    /// Cache key (`lib/ver/file`) to the absolute path of the cached copy.
+    @Volatile
+    var index: Map<String, String> = emptyMap()
+}
+
+/// One sub-resource verdict. The verdict is part of the identity: the engine
+/// decides per URL, so one host is often allowed for its page assets and
+/// blocked for its ad paths in the same drain window.
+data class BlockEvent(val host: String, val blocked: Boolean, val source: String?) {
+    /// The `{host, blocked, source?, count}` row `WebInterceptNative.applyBlockEvents` reads.
+    fun toChannel(count: Int): Map<String, Any> = buildMap {
+        put("host", host)
+        put("blocked", blocked)
+        if (source != null) put("source", source)
+        put("count", count)
+    }
+}
+
+/// One CDN request served from the cache instead of the network.
+data class CdnEvent(val cacheKey: String, val url: String) {
+    fun toChannel(): Map<String, Any> = mapOf("cacheKey" to cacheKey, "url" to url)
 }
 
 /// Native ContentBlockerHandler that handles DNS host-only blocking, the
@@ -464,44 +475,48 @@ class WebInterceptPlugin(private val activity: Activity, flutterEngine: FlutterE
 ///   type), not just the host; the engine has its own internal caching.
 class FastSubresourceInterceptor(
     private val dnsBlocklist: DnsHostBlocklist,
-    private val cdnPatterns: MutableList<Regex>,
-    private val cdnCacheIndex: MutableMap<String, String>,
-    private val localCdnDisabled: AtomicBoolean,
-    private val onBlockChecked: (String, Boolean, String?) -> Unit,
-    private val onCdnReplaced: (String, String) -> Unit,
+    dnsLevel: Int = DnsHostBlocklist.MAX_LEVEL,
+    localCdnEnabled: Boolean = true,
+    private val cdnTables: LocalCdnTables,
+    private val onBlockChecked: (BlockEvent) -> Unit,
+    private val onCdnReplaced: (CdnEvent) -> Unit,
     private val onLog: (String, String) -> Unit = { _, _ -> }
 ) : ContentBlockerHandler() {
 
-    private var checkCount = 0
+    /// Severity level this site blocks at; 0 when it has DNS blocking off.
+    /// The blocklist is app-wide, so this is the only place an Android
+    /// sub-resource learns the site's own DNS posture. Volatile because a
+    /// settings edit moves it on the main thread while chromium IO threads
+    /// are reading it.
+    @Volatile
+    var dnsLevel: Int = dnsLevel
+
+    /// Whether this site serves CDN sub-resources from the app-wide cache
+    /// (LCDN-007). Volatile for the same reason as [dnsLevel].
+    @Volatile
+    var localCdnEnabled: Boolean = localCdnEnabled
+
+    private val checkCount = AtomicInteger()
+
+    @Volatile
     private var loggedNoCache = false
-    private var loggedLocalCdnDisabled = false
 
-    /// Per-instance host classification cache. Capacity 1024 covers a
-    /// typical busy page (≤ a few hundred unique hosts) plus headroom;
-    /// once full, FIFO eviction keeps memory bounded. Storing
-    /// `Decision` (an enum) instead of raw `String?` for the source
-    /// avoids re-classifying on dedup'd repeats.
-    private val hostDecision = LinkedHashMap<String, Decision>(256, 0.75f, false)
-    private val hostDecisionCap = 1024
-
-    /// Guards every access to [hostDecision]. `checkUrl` runs on chromium's
-    /// background sub-resource IO threads (several concurrently per page), so
-    /// the read, the FIFO-eviction write, and [clearHostDecisionCache] must
-    /// serialise on one monitor. The old `@Synchronized` on clear only locked
-    /// `this` while the reads/writes were lock-free — concurrent structural
-    /// mutation of a LinkedHashMap can throw ConcurrentModificationException
-    /// or, on resize, spin the IO thread. Same bug class as the adblock UAF.
-    private val hostDecisionLock = Any()
+    /// Per-instance host level-mask cache, read and written by chromium's
+    /// concurrent sub-resource IO threads (BUG-007). Capacity 1024 covers a
+    /// typical busy page (a few hundred unique hosts) plus headroom; past it
+    /// the oldest entry goes. Caches which levels name the host rather than a
+    /// blocked/allowed decision, so [dnsLevel] can move without the cached
+    /// answers going stale.
+    private val hostDecision = Guarded(object : LinkedHashMap<String, Int>(256, 0.75f, false) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Int>) =
+            size > HOST_DECISION_CAP
+    })
 
     /// Drop every cached host classification. Called by
     /// [WebInterceptPlugin.clearAllHostDecisionCaches] when the
     /// blocked-domains set is replaced — see comment there for the
     /// race this avoids.
-    fun clearHostDecisionCache() {
-        synchronized(hostDecisionLock) {
-            hostDecision.clear()
-        }
-    }
+    fun clearHostDecisionCache() = hostDecision.with { clear() }
 
     init {
         // Dummy rule so the Java guard `ruleList.size() > 0` passes
@@ -510,30 +525,39 @@ class FastSubresourceInterceptor(
         ruleList.add(ContentBlocker(trigger, action))
     }
 
-    private enum class Decision { ALLOWED, BLOCKED_DNS, BLOCKED_ABP }
+    private enum class Decision(val blocked: Boolean, val source: String?) {
+        ALLOWED(false, null),
+        BLOCKED_DNS(true, "dns"),
+        BLOCKED_ABP(true, "abp"),
+    }
 
     override fun checkUrl(
         webView: InAppWebView,
         request: WebResourceRequestExt
     ): WebResourceResponse? {
-        val url = request.url ?: return null
+        // Normalize once, at the funnel: the engine, the LocalCDN patterns
+        // and the DNS set all have to see the same hostname, and only the
+        // DNS side goes through extractHost.
+        val rawUrl = request.url ?: return null
+        val url = stripRootDot(rawUrl)
         val host = extractHost(url) ?: return null
         if (host.isEmpty()) return null
 
-        checkCount++
-        val verbose = checkCount <= 10 || checkCount % 100 == 0
+        val check = checkCount.incrementAndGet()
+        val verbose = check <= 10 || check % 100 == 0
         if (verbose) {
-            onLog("WebIntercept", "checkUrl #$checkCount host=$host url=$url")
+            onLog("WebIntercept", "checkUrl #$check host=$host url=$url")
         }
 
-        // 1. Look up the cached DNS host-only classification. On miss,
-        // walk the DNS set and cache. The dominant cost the cache
-        // saves is the suffix walk — `tracker.example.com` resolved
-        // once doesn't need to look up `tracker.example.com`,
-        // `example.com`, then fail again on every subsequent fetch.
-        var decision = synchronized(hostDecisionLock) { hostDecision[host] }
-        val cached = decision != null
-        if (decision == null) {
+        // 1. Look up the cached DNS level mask for this host. On miss, walk
+        // the groups and cache. The dominant cost the cache saves is the
+        // suffix walk — `tracker.example.com` resolved once doesn't need to
+        // look up `tracker.example.com`, `example.com`, then fail again on
+        // every subsequent fetch. The site's level bit-tests the cached mask
+        // rather than being baked into it.
+        var mask = hostDecision.with { get(host) }
+        val cached = mask != null
+        if (mask == null) {
             // Fail-closed: if the blocklist build is still in flight, wait for
             // it rather than evaluate against an incomplete set and let a
             // tracker through. Runs on a WebView request thread (not the UI
@@ -544,17 +568,18 @@ class FastSubresourceInterceptor(
                     "DNS blocklist not ready after ${DNS_READY_TIMEOUT_MS}ms — " +
                     "allowing $host (safety valve)")
             }
-            decision = if (dnsBlocklist.isBlocked(host)) {
-                Decision.BLOCKED_DNS
-            } else {
-                Decision.ALLOWED
-            }
-            putHostDecision(host, decision)
+            val walked = dnsBlocklist.maskOf(host)
+            hostDecision.with { put(host, walked) }
+            mask = walked
         }
+        val level = dnsLevel
+        val blockedByDns = level in 1..DnsHostBlocklist.MAX_LEVEL &&
+            mask and DnsHostBlocklist.levelBit(level) != 0
+        var decision = if (blockedByDns) Decision.BLOCKED_DNS else Decision.ALLOWED
         if (verbose) {
             onLog("WebIntercept",
-                "  host-only decision=$decision (cached=$cached, " +
-                "dnsSetSize=${dnsBlocklist.size})")
+                "  host-only decision=$decision (mask=$mask level=$level " +
+                "cached=$cached, dnsSetSize=${dnsBlocklist.size})")
         }
 
         // 1b. When the DNS host-only check let it through, consult the
@@ -572,26 +597,20 @@ class FastSubresourceInterceptor(
             // for $domain= matching. Both casings to survive header
             // normalization quirks across chromium versions.
             val headers = request.headers ?: emptyMap()
-            val sourceUrl = headers["Referer"] ?: headers["referer"] ?: ""
+            val sourceUrl = stripRootDot(headers["Referer"] ?: headers["referer"] ?: "")
             val requestType = mapResourceType(request)
             if (AdblockEngineNative.checkUrl(url, sourceUrl, requestType)) {
                 decision = Decision.BLOCKED_ABP
-                if (checkCount <= 10 || checkCount % 100 == 0) {
+                if (verbose) {
                     onLog("WebIntercept",
                         "engine blocked sub-resource: host=$host source=$sourceUrl type=$requestType")
                 }
             }
         }
 
-        // Always report — the WebInterceptPlugin layer dedupes at the
-        // pending-drain level, collapsing repeat requests for the same
-        // host into a single Dart-side log entry while still summing
-        // the count toward the per-site totals.
-        when (decision) {
-            Decision.BLOCKED_DNS -> onBlockChecked(host, true, "dns")
-            Decision.BLOCKED_ABP -> onBlockChecked(host, true, "abp")
-            Decision.ALLOWED -> onBlockChecked(host, false, null)
-        }
+        // Always report: the plugin's inbox counts repeats, so a host that
+        // fires a hundred times costs one Dart-side record per verdict.
+        onBlockChecked(BlockEvent(host, decision.blocked, decision.source))
 
         // 2. Domain blocking response. Use an EMPTY ByteArrayInputStream
         // for the response body, NOT null. Returning a `WebResourceResponse(
@@ -603,7 +622,7 @@ class FastSubresourceInterceptor(
         // candidate for the dangling-raw_ptr SIGTRAP at
         // `partition_alloc_support.cc:770`. An empty stream gives chromium
         // a real (zero-byte) object with no null dereference.
-        if (decision == Decision.BLOCKED_DNS || decision == Decision.BLOCKED_ABP) {
+        if (decision.blocked) {
             // ABP-only: try to serve the uBO redirect body if the
             // matched rule was a `$redirect=`. Falls through to the
             // empty-body response when:
@@ -617,7 +636,7 @@ class FastSubresourceInterceptor(
             // shims, AdSense neutered scripts, etc.).
             if (decision == Decision.BLOCKED_ABP && AdblockEngineNative.active) {
                 val headers = request.headers ?: emptyMap()
-                val sourceUrl = headers["Referer"] ?: headers["referer"] ?: ""
+                val sourceUrl = stripRootDot(headers["Referer"] ?: headers["referer"] ?: "")
                 val requestType = mapResourceType(request)
                 val dataUrl = AdblockEngineNative.redirectFor(
                     url, sourceUrl, requestType)
@@ -637,48 +656,25 @@ class FastSubresourceInterceptor(
                 "text/plain", "utf-8", ByteArrayInputStream(EMPTY_BODY))
         }
 
-        // 3. LocalCDN — gated by the diagnostic kill-switch. Builds a
-        // WebResourceResponse with a FileInputStream that chromium's IO
-        // thread reads async; if the request lifecycle ends before
-        // chromium consumes the stream, that's the candidate origin
-        // for the System WebView dangling-raw_ptr crash on
-        // Chrome_IOThread (`partition_alloc_support.cc:770`).
-        if (localCdnDisabled.get()) {
-            if (!loggedLocalCdnDisabled) {
-                loggedLocalCdnDisabled = true
+        // 3. LocalCDN.
+        return localCdnResponse(url)
+    }
+
+    /// The cached copy of a CDN sub-resource, or null to let the request
+    /// through: [localCdnEnabled] is this site's own choice (LCDN-007).
+    internal fun localCdnResponse(url: String): WebResourceResponse? {
+        if (!localCdnEnabled) return null
+        val patterns = cdnTables.patterns
+        val index = cdnTables.index
+        if (patterns.isEmpty() || index.isEmpty()) {
+            if (!loggedNoCache) {
+                loggedNoCache = true
                 onLog("WebIntercept",
-                    "LocalCDN serve disabled (DNS + ABP blocking remain active)")
+                    "LocalCDN inert: patterns=${patterns.size} cache=${index.size}")
             }
             return null
         }
-        if (cdnPatterns.isNotEmpty() && cdnCacheIndex.isNotEmpty()) {
-            val response = tryServeCdn(url)
-            if (response != null) return response
-        } else if (!loggedNoCache) {
-            loggedNoCache = true
-            onLog("WebIntercept",
-                "LocalCDN inert: patterns=${cdnPatterns.size} cache=${cdnCacheIndex.size}")
-        }
-
-        return null
-    }
-
-    private fun putHostDecision(host: String, decision: Decision) {
-        synchronized(hostDecisionLock) {
-            if (hostDecision.size >= hostDecisionCap) {
-                val it = hostDecision.entries.iterator()
-                if (it.hasNext()) {
-                    it.next()
-                    it.remove()
-                }
-            }
-            hostDecision[host] = decision
-        }
-    }
-
-    private fun tryServeCdn(url: String): WebResourceResponse? {
-        val patternsSnapshot = synchronized(cdnPatterns) { cdnPatterns.toList() }
-        for (pattern in patternsSnapshot) {
+        for (pattern in patterns) {
             val match = pattern.find(url) ?: continue
             if (match.groupValues.size < 4) continue
             val lib = match.groupValues[1].lowercase()
@@ -686,7 +682,7 @@ class FastSubresourceInterceptor(
             val file = match.groupValues[3]
             if (lib.isEmpty() || ver.isEmpty() || file.isEmpty()) continue
             val cacheKey = "$lib/$ver/$file"
-            val filePath = synchronized(cdnCacheIndex) { cdnCacheIndex[cacheKey] }
+            val filePath = index[cacheKey]
             if (filePath == null) {
                 onLog("WebIntercept", "CDN match but no cache entry: key=$cacheKey url=$url")
                 continue
@@ -698,10 +694,10 @@ class FastSubresourceInterceptor(
             }
             return try {
                 val stream = FileInputStream(f)
-                onCdnReplaced(cacheKey, url)
+                onCdnReplaced(CdnEvent(cacheKey, url))
                 onLog("LocalCDN", "Replaced: $url -> $cacheKey")
                 WebResourceResponse(contentTypeFor(file), "utf-8", stream)
-            } catch (e: Exception) {
+            } catch (e: FileNotFoundException) {
                 onLog("WebIntercept", "CDN serve failed: key=$cacheKey err=${e.message}")
                 null
             }
@@ -810,6 +806,8 @@ class FastSubresourceInterceptor(
         // against a wedged build, never hit in normal operation.
         const val DNS_READY_TIMEOUT_MS = 15_000L
 
+        private const val HOST_DECISION_CAP = 1024
+
         /// Shared empty-body buffer for blocked-request responses.
         /// Reused across calls so we don't allocate a fresh byte array
         /// per blocked sub-resource (Reddit page loads alone fire
@@ -817,7 +815,7 @@ class FastSubresourceInterceptor(
         /// because chromium consumes/closes it.
         private val EMPTY_BODY = ByteArray(0)
 
-        private val contentTypes = linkedMapOf(
+        private val contentTypes = mapOf(
             ".js" to "application/javascript",
             ".mjs" to "application/javascript",
             ".css" to "text/css",
@@ -846,11 +844,42 @@ class FastSubresourceInterceptor(
         /// strings, malformed userinfo, etc.) — each throw allocates a
         /// stack trace and pays for `Throwable.fillInStackTrace`. This
         /// hand-rolled extractor uses three index scans + one substring,
-        /// no exceptions.
+        /// no exceptions. A single trailing root dot is dropped:
+        /// chromium keeps the FQDN form (`tracker.example.com.`) in the
+        /// URL and DNS resolves it identically, but blocklist and
+        /// filter-list hostnames are written without it.
         @JvmStatic
         fun extractHost(url: String): String? {
+            val b = hostBounds(url)
+            if (b < 0L) return null
+            return slice(url, (b ushr 32).toInt(), (b and 0xFFFFFFFFL).toInt())
+        }
+
+        /// Drop the host's root dot inside a whole URL, leaving the rest
+        /// byte-identical. The adblock engine parses the URL itself
+        /// rather than taking [extractHost]'s output, so without this
+        /// `$domain=` and host-anchored rules would still be matched
+        /// against the FQDN form that [extractHost] already folds away.
+        /// Returns [url] itself when there is nothing to drop.
+        @JvmStatic
+        fun stripRootDot(url: String): String {
+            val b = hostBounds(url)
+            if (b < 0L) return url
+            val hostStart = (b ushr 32).toInt()
+            val hostEnd = (b and 0xFFFFFFFFL).toInt()
+            if (hostEnd <= hostStart || url[hostEnd - 1] != '.') return url
+            return url.substring(0, hostEnd - 1) + url.substring(hostEnd)
+        }
+
+        /// Locate the host inside `scheme://[userinfo@]host[:port]/...`:
+        /// start index in the high 32 bits, exclusive end (before any
+        /// root-dot normalization) in the low 32. -1 when the URL has no
+        /// `://` authority or an IPv6 literal is unterminated. Packed
+        /// rather than returned as a Pair so the per-request hot path
+        /// allocates nothing.
+        private fun hostBounds(url: String): Long {
             val schemeEnd = url.indexOf("://")
-            if (schemeEnd < 0) return null
+            if (schemeEnd < 0) return -1L
             val start = schemeEnd + 3
             val len = url.length
             var end = len
@@ -870,10 +899,10 @@ class FastSubresourceInterceptor(
             if (hostStart < end && url[hostStart].code == 0x5B) {
                 for (j in hostStart until end) {
                     if (url[j].code == 0x5D) {
-                        return slice(url, hostStart, j + 1)
+                        return (hostStart.toLong() shl 32) or (j + 1).toLong()
                     }
                 }
-                return null
+                return -1L
             }
             // Strip :port — first ':' between hostStart and end.
             var hostEnd = end
@@ -883,20 +912,25 @@ class FastSubresourceInterceptor(
                     break
                 }
             }
-            return slice(url, hostStart, hostEnd)
+            return (hostStart.toLong() shl 32) or hostEnd.toLong()
         }
 
         private fun slice(url: String, start: Int, end: Int): String {
-            if (start >= end) return ""
+            // One dot only: `example.com..` is not a valid FQDN form, so it
+            // stays unmatched rather than folding onto `example.com`.
+            // Bracketed IPv6 literals end in ']' and are untouched.
+            var stop = end
+            if (stop > start && url[stop - 1] == '.') stop--
+            if (start >= stop) return ""
             var hasUpper = false
-            for (j in start until end) {
+            for (j in start until stop) {
                 val c = url[j].code
                 if (c in 0x41..0x5A) {
                     hasUpper = true
                     break
                 }
             }
-            val s = url.substring(start, end)
+            val s = url.substring(start, stop)
             return if (hasUpper) s.lowercase() else s
         }
     }

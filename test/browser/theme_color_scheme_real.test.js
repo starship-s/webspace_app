@@ -1,6 +1,5 @@
 // Tier 2 — real-Chromium tests for the theme/color-scheme shim
-// (lib/services/theme_color_scheme_shim.dart, dumped to
-// test/js_fixtures/theme_color_scheme/*.js).
+// (lib/js/theme_color_scheme.js).
 //
 // jsdom's matchMedia stub returns {matches:false} for everything, so
 // the Tier 1 tests can only assert the shim's wrapper logic.
@@ -19,13 +18,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const {
-  setupBrowser, requireBrowser, readFixture,
-} = require('./helpers/launch');
+const { setupBrowser, requireBrowser, pageJs } = require('./helpers/launch');
 
-const LIGHT = readFixture('theme_color_scheme/light.js');
-const DARK = readFixture('theme_color_scheme/dark.js');
-const SYSTEM = readFixture('theme_color_scheme/system.js');
+const LIGHT = pageJs('theme_color_scheme', { theme: 'light' });
+const DARK = pageJs('theme_color_scheme', { theme: 'dark' });
+const SYSTEM = pageJs('theme_color_scheme', { theme: 'system' });
 
 const browser = setupBrowser();
 
@@ -200,4 +197,32 @@ test('iframe contentWindow inherits the matchMedia override', async (t) => {
     assert.equal(typeof r, 'boolean',
       'iframe matchMedia must be callable; escape behaviour is engine-dependent');
   });
+});
+
+test('injected at DOCUMENT_START it applies without throwing', async (t) => {
+  // How the app actually injects it (setThemePreference registers an
+  // AT_DOCUMENT_START user script), and where it used to die: the parser
+  // has made <html> but not <head>, so `document.head.appendChild` threw
+  // "Cannot read properties of null" on every page load and took the rest
+  // of the shim — the queued theme-change listener replay — with it.
+  if (!requireBrowser(browser, t)) return;
+  const page = await browser.browser.newPage();
+  const errors = [];
+  page.on('pageerror', (e) => errors.push(e.message));
+  try {
+    await page.evaluateOnNewDocument(DARK);
+    await page.goto('data:text/html,<html><body>x</body></html>',
+      { waitUntil: 'load' });
+    const r = await page.evaluate(() => ({
+      meta: (document.querySelector('meta[name="color-scheme"]') || {}).content,
+      style: document.documentElement.style.colorScheme,
+      dark: matchMedia('(prefers-color-scheme: dark)').matches,
+    }));
+    assert.deepEqual(errors, []);
+    assert.equal(r.dark, true);
+    assert.equal(r.style, 'dark');
+    assert.equal(r.meta, 'dark', 'the meta must land once <head> exists');
+  } finally {
+    await page.close();
+  }
 });

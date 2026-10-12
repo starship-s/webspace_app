@@ -14,12 +14,16 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:webspace/l10n/gen/app_localizations.dart';
 import 'package:webspace/theme/accent_theme.dart';
 import 'package:webspace/theme/design_tokens.dart';
+import 'package:webspace/settings/proxy.dart';
 import 'package:webspace/widgets/hint_button.dart';
+import 'package:webspace/widgets/proxy_auth_section.dart';
+import 'package:webspace/widgets/proxy_test_tile.dart';
 import 'package:webspace/widgets/tab_bar_corner_button.dart';
+import 'package:webspace/widgets/unproxied_block.dart';
 import 'package:webspace/widgets/url_bar.dart';
+import 'helpers/localized.dart';
 
 /// Narrow is a small phone in portrait; wide is a tablet pane. Both are real
 /// places this chrome renders.
@@ -56,6 +60,29 @@ final Map<String, Widget Function()> _subjects = {
         onDragUpdate: (_) {},
         onDragEnd: () {},
       ),
+  'proxy-auth (empty)': () => ProxyAuthSection(
+        usernameController: TextEditingController(),
+        passwordController: TextEditingController(),
+      ),
+  // Expanded, because a stored credential opens the fold: the two text
+  // fields and the reveal button are what has to fit.
+  'proxy-auth (filled)': () => ProxyAuthSection(
+        usernameController: TextEditingController(text: 'proxy-user'),
+        passwordController: TextEditingController(text: 'hunter2'),
+      ),
+  // Three buttons and four paragraphs on one surface: the cell that fails
+  // first is 320pt at 2.0, which is also the one a user in that setting sees.
+  'unproxied-block': () => UnproxiedNavigationBlock(
+        siteName: 'Acme Bank',
+        blockedUrl: 'https://tracker.example.org/a/b',
+        onGoBack: () {},
+        onOpenProxySettings: () {},
+      ),
+  'proxy-test': () => ProxyTestTile(
+        settings: () =>
+            UserProxySettings(type: ProxyType.SOCKS5, address: '127.0.0.1:1080'),
+        target: Uri.parse('https://example.org/'),
+      ),
 };
 
 void _ignore(String _) {}
@@ -66,11 +93,8 @@ Widget _host({
   required double width,
   required double textScale,
 }) {
-  return MaterialApp(
-    localizationsDelegates: AppLocalizations.localizationsDelegates,
-    supportedLocales: AppLocalizations.supportedLocales,
-    theme: ThemeData(colorScheme: buildAccentColorScheme(accentBlue, brightness)),
-    home: MediaQuery(
+  return localizedApp(
+    MediaQuery(
       data: MediaQueryData(
         size: Size(width, 800),
         textScaler: TextScaler.linear(textScale),
@@ -81,6 +105,9 @@ Widget _host({
         ),
       ),
     ),
+    theme: ThemeData(
+        colorScheme:
+            buildAccentColorScheme(accentBlue, brightness: brightness)),
   );
 }
 
@@ -162,7 +189,7 @@ void main() {
     // AnimatedScale is a paint transform, so the laid-out box does not change
     // and reading the size would prove nothing. The scale itself is the token
     // reaching the screen.
-    double scaleWhen(bool dragging) {
+    double scaleWhen({required bool dragging}) {
       return tester
           .widget<AnimatedScale>(find.byType(AnimatedScale))
           .scale;
@@ -182,7 +209,8 @@ void main() {
         textScale: 1.0,
       ));
       await tester.pumpAndSettle();
-      expect(scaleWhen(dragging), dragging ? FloatingButton.dragScale : 1.0);
+      expect(scaleWhen(dragging: dragging),
+          dragging ? FloatingButton.dragScale : 1.0);
     }
   });
 }

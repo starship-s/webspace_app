@@ -24,7 +24,10 @@ class IoFileStore implements FileStore {
     return _dir = Directory('${root.path}/$directoryName');
   }
 
-  File _file(Directory dir, String name) => File('${dir.path}/$name');
+  File _file(Directory dir, {required String name}) {
+    checkFileStoreName(name);
+    return File('${dir.path}/$name');
+  }
 
   @override
   Future<void> ensure() async {
@@ -34,40 +37,49 @@ class IoFileStore implements FileStore {
 
   @override
   Future<bool> exists(String name) async =>
-      _file(await _directory(), name).exists();
+      _file(await _directory(), name: name).exists();
 
   @override
   Future<String?> readText(String name) async {
-    final file = _file(await _directory(), name);
+    final file = _file(await _directory(), name: name);
     if (!await file.exists()) return null;
     return file.readAsString();
   }
 
   @override
-  Future<void> writeText(String name, String contents) async {
+  Future<void> writeText(String name, {required String contents}) async {
     final dir = await _directory();
     if (!await dir.exists()) await dir.create(recursive: true);
-    await _file(dir, name).writeAsString(contents);
+    await _file(dir, name: name).writeAsString(contents);
   }
 
   @override
   Future<Uint8List?> readBytes(String name) async {
-    final file = _file(await _directory(), name);
+    final file = _file(await _directory(), name: name);
     if (!await file.exists()) return null;
     return file.readAsBytes();
   }
 
   @override
-  Future<void> writeBytes(String name, List<int> bytes) async {
+  Future<void> writeBytes(String name, {required List<int> bytes}) async {
     final dir = await _directory();
     if (!await dir.exists()) await dir.create(recursive: true);
-    await _file(dir, name).writeAsBytes(bytes);
+    await _file(dir, name: name).writeAsBytes(bytes);
   }
 
   @override
   Future<void> delete(String name) async {
-    final file = _file(await _directory(), name);
+    final file = _file(await _directory(), name: name);
     if (await file.exists()) await file.delete();
+  }
+
+  /// Size and modification time, the make-style test: a rewrite lands at a
+  /// later mtime even when the size happens to match.
+  @override
+  Future<String?> stamp(String name) async {
+    final stat = await _file(await _directory(), name: name).stat();
+    if (stat.type == FileSystemEntityType.notFound) return null;
+    return '${stat.size}:${stat.modified.microsecondsSinceEpoch}';
   }
 
   @override

@@ -1,6 +1,7 @@
 import 'package:flutter_inappwebview/flutter_inappwebview.dart' as inapp;
 import 'package:webspace/services/log_service.dart';
-import 'package:webspace/services/webview.dart';
+import 'package:webspace/services/cookie_manager.dart';
+import 'package:webspace/services/webview_controller.dart';
 
 /// Per-site cookie operations that target the bound WebView's container
 /// via the WebSpace fork's `inapp.CookieManager`.
@@ -53,12 +54,8 @@ class ContainerCookieManager {
               ))
           .toList(growable: false);
     } catch (e) {
-      LogService.instance.log(
-        'ContainerCookieManager',
-        'getCookies($siteId, ${url.host}) failed: $e',
-        level: LogLevel.error,
-        sensitivity: LogSensitivity.sensitive,
-      );
+      LogTag.containerCookieManager.error(
+          'getCookies($siteId, ${url.host}) failed: $e', sensitive: true);
       return const [];
     }
   }
@@ -87,13 +84,9 @@ class ContainerCookieManager {
         webViewController: controller.nativeController,
       );
     } catch (e) {
-      LogService.instance.log(
-        'ContainerCookieManager',
-        'deleteCookie($name@${domain ?? url.host}, siteId=$siteId) '
-            'failed: $e',
-        level: LogLevel.error,
-        sensitivity: LogSensitivity.sensitive,
-      );
+      LogTag.containerCookieManager.error(
+          'deleteCookie($name@${domain ?? url.host}, siteId=$siteId) '
+          'failed: $e', sensitive: true);
     }
   }
 }

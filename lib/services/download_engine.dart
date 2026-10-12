@@ -4,11 +4,9 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'package:webspace/platform/host_platform.dart';
-import 'package:webspace/services/download_client.dart';
 import 'package:webspace/services/outbound_http.dart';
 import 'package:webspace/settings/proxy.dart';
 
-/// Result of a successful download fetch.
 class DownloadResult {
   final Uint8List bytes;
   final String filename;
@@ -21,7 +19,6 @@ class DownloadResult {
   });
 }
 
-/// Thrown when a download cannot be completed.
 class DownloadException implements Exception {
   final String message;
   DownloadException(this.message);
@@ -47,6 +44,9 @@ class DownloadEngine {
   /// guard, not a product policy — it sits far above any realistic file.
   static const int defaultMaxBytes = 2 * 1024 * 1024 * 1024;
 
+  /// Redirect hops followed before the download is refused.
+  static const int maxRedirects = 5;
+
   final http.Client _client;
   final OutboundClient? _outboundResult;
   final int _maxBytes;
@@ -58,7 +58,7 @@ class DownloadEngine {
   })  : _client = client ?? _defaultClient(proxy),
         _maxBytes = maxBytes,
         _outboundResult = client == null && proxy != null
-            ? outboundHttp.clientFor(resolveEffectiveProxy(proxy))
+            ? outboundHttp.clientFor(resolveEffectiveProxy(proxy, siteId: null))
             : null;
 
   /// Default HTTP client with gzip auto-decompression DISABLED so the
@@ -75,7 +75,7 @@ class DownloadEngine {
   /// request — see [_blockedClient] / [fetch].
   static http.Client _defaultClient(UserProxySettings? proxy) {
     if (proxy != null) {
-      final resolved = resolveEffectiveProxy(proxy);
+      final resolved = resolveEffectiveProxy(proxy, siteId: null);
       if (resolved.type != ProxyType.DEFAULT) {
         final result = outboundHttp.clientFor(resolved);
         if (result is OutboundClientReady) return result.client;
@@ -84,7 +84,7 @@ class DownloadEngine {
         }
       }
     }
-    return createDirectDownloadClient();
+    return hostDirectDownloadClient();
   }
 
   /// RFC 6265 `Cookie:` header value from an ordered list of name/value
@@ -109,28 +109,53 @@ class DownloadEngine {
     final s = (suggested ?? '').trim();
     if (s.isNotEmpty) return _sanitize(s);
 
-    try {
-      final uri = Uri.parse(url);
-      for (int i = uri.pathSegments.length - 1; i >= 0; i--) {
-        final seg = uri.pathSegments[i];
-        if (seg.trim().isEmpty) continue;
-        final decoded = Uri.decodeComponent(seg);
-        if (decoded.trim().isNotEmpty) return _sanitize(decoded);
+    final segments = Uri.tryParse(url)?.pathSegments ?? const <String>[];
+    for (final seg in segments.reversed) {
+      if (seg.trim().isEmpty) continue;
+      final String decoded;
+      try {
+        decoded = Uri.decodeComponent(seg);
+      } on ArgumentError {
+        // How the SDK reports a malformed %-escape.
+        continue;
       }
-    } catch (_) {}
+      if (decoded.trim().isNotEmpty) return _sanitize(decoded);
+    }
 
     final ext = _extensionForMime(mimeType);
     return 'download${ext ?? ''}';
   }
 
+  /// Drain [response] so its connection returns to the pool. Its status has
+  /// already decided what happens next, so a failure here changes nothing.
+  static Future<void> _discard(http.StreamedResponse response) async {
+    try {
+      await response.stream.drain<void>();
+    } on Exception {
+      // Nothing to report; see above.
+    }
+  }
+
+  /// Fetch [url], following up to [maxRedirects] redirects by hand.
+  ///
+  /// `dart:io` copies every header of the previous request onto a
+  /// `Location` target with no origin comparison, so an authenticated
+  /// download that 302s to another host would carry the site's session
+  /// cookie (HttpOnly included), `referer` and UA there (DL-007). Each hop
+  /// instead recomputes the cookie header: through [cookieHeaderFor] (the
+  /// site's jar, asked for the new URL) when the caller supplies it,
+  /// otherwise [cookieHeader] only while the hop stays on the first URL's
+  /// origin. The referer is dropped on an origin change, and an https to
+  /// http hop is refused outright.
   Future<DownloadResult> fetch({
     required String url,
     String? cookieHeader,
+    Future<String?> Function(Uri url)? cookieHeaderFor,
     String? userAgent,
     String? referer,
     String? suggestedFilename,
     String? mimeTypeHint,
-    void Function(int bytesDone, int? bytesTotal)? onProgress,
+    void Function(int bytesDone, {required int? bytesTotal})? onProgress,
   }) async {
     final outboundResult = _outboundResult;
     if (outboundResult is OutboundClientBlocked) {
@@ -140,55 +165,78 @@ class DownloadEngine {
     if (client is _BlockedHttpClient) {
       throw DownloadException(client.reason);
     }
-    final Uri uri;
-    try {
-      uri = Uri.parse(url);
-    } catch (_) {
-      throw DownloadException('Invalid URL: $url');
-    }
+    final uri = Uri.tryParse(url);
+    if (uri == null) throw DownloadException('Invalid URL: $url');
     if (uri.scheme != 'http' && uri.scheme != 'https') {
       throw DownloadException('Unsupported scheme: ${uri.scheme}');
     }
 
-    final request = http.Request('GET', uri);
-    if (cookieHeader != null && cookieHeader.isNotEmpty) {
-      request.headers['cookie'] = cookieHeader;
-    }
-    if (userAgent != null && userAgent.isNotEmpty) {
-      request.headers['user-agent'] = userAgent;
-    }
     // Many download servers use Referer for hotlink protection; without
     // one they may 302 to an error page or stream HTML with no
     // Content-Length, which makes the progress ring spin indeterminately.
     // Only forward http(s) referers so we don't leak data: / file: URLs.
-    if (referer != null &&
-        (referer.startsWith('http://') || referer.startsWith('https://'))) {
-      request.headers['referer'] = referer;
-    }
-
-    final http.StreamedResponse response;
-    try {
-      response = await _client.send(request);
-    } catch (e) {
-      throw DownloadException('Network error: $e');
+    var hopReferer = referer != null &&
+            (referer.startsWith('http://') || referer.startsWith('https://'))
+        ? referer
+        : null;
+    var current = uri;
+    var hops = 0;
+    http.StreamedResponse response;
+    while (true) {
+      final request = http.Request('GET', current)..followRedirects = false;
+      final String? cookie;
+      if (hops == 0) {
+        cookie = cookieHeader;
+      } else if (cookieHeaderFor != null) {
+        cookie = await cookieHeaderFor(current);
+      } else {
+        cookie = _sameOrigin(current, b: uri) ? cookieHeader : null;
+      }
+      if (cookie != null && cookie.isNotEmpty) {
+        request.headers['cookie'] = cookie;
+      }
+      if (userAgent != null && userAgent.isNotEmpty) {
+        request.headers['user-agent'] = userAgent;
+      }
+      if (hopReferer != null) {
+        request.headers['referer'] = hopReferer;
+      }
+      try {
+        response = await _client.send(request);
+      } catch (e) {
+        throw DownloadException('Network error: $e');
+      }
+      if (!_isRedirect(response.statusCode)) break;
+      final location = response.headers['location'];
+      await _discard(response);
+      if (location == null || location.isEmpty) {
+        throw DownloadException('HTTP ${response.statusCode}');
+      }
+      if (++hops > maxRedirects) {
+        throw DownloadException('Too many redirects');
+      }
+      final next = current.resolve(location);
+      if (next.scheme != 'http' && next.scheme != 'https') {
+        throw DownloadException('Unsupported scheme: ${next.scheme}');
+      }
+      if (current.scheme == 'https' && next.scheme == 'http') {
+        throw DownloadException('Redirect downgrades https to http');
+      }
+      if (!_sameOrigin(next, b: current)) hopReferer = null;
+      current = next;
     }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      // Drain the body so the connection can be returned to the pool.
-      try {
-        await response.stream.drain<void>();
-      } catch (_) {}
+      await _discard(response);
       throw DownloadException('HTTP ${response.statusCode}');
     }
 
     final total = response.contentLength;
     if (total != null && total > _maxBytes) {
-      try {
-        await response.stream.drain<void>();
-      } catch (_) {}
+      await _discard(response);
       throw DownloadException('Download exceeds size limit');
     }
-    onProgress?.call(0, total);
+    onProgress?.call(0, bytesTotal: total);
 
     final chunks = <List<int>>[];
     var done = 0;
@@ -199,7 +247,7 @@ class DownloadEngine {
           throw DownloadException('Download exceeds size limit');
         }
         chunks.add(chunk);
-        onProgress?.call(done, total);
+        onProgress?.call(done, bytesTotal: total);
       }
     } on DownloadException {
       rethrow;
@@ -224,8 +272,11 @@ class DownloadEngine {
     final Uint8List bytes;
     try {
       bytes = switch (encoding) {
-        'gzip' || 'x-gzip' => _inflateBounded(hostGzipDecoder, bytesReceived),
-        'deflate' => _inflateBounded(hostZlibDecoder, bytesReceived),
+        'gzip' ||
+        'x-gzip' =>
+          _inflateBounded(hostGzipDecoder, compressed: bytesReceived),
+        'deflate' =>
+          _inflateBounded(hostZlibDecoder, compressed: bytesReceived),
         _ => bytesReceived,
       };
     } on FormatException catch (e) {
@@ -246,11 +297,18 @@ class DownloadEngine {
     );
   }
 
+  static bool _isRedirect(int status) =>
+      status == 301 || status == 302 || status == 303 || status == 307 ||
+      status == 308;
+
+  static bool _sameOrigin(Uri a, {required Uri b}) =>
+      a.scheme == b.scheme && a.host == b.host && a.port == b.port;
+
   /// Inflate [compressed] through [codec] in chunks, aborting the moment the
   /// running output exceeds [_maxBytes] so a decompression bomb never fully
   /// materializes. Throws [DownloadException] on overflow.
-  Uint8List _inflateBounded(Converter<List<int>, List<int>> codec,
-      Uint8List compressed) {
+  Uint8List _inflateBounded(Converter<List<int>, List<int>> codec, {
+      required Uint8List compressed}) {
     final out = BytesBuilder(copy: false);
     var total = 0;
     var overflow = false;

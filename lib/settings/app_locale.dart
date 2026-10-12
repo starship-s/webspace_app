@@ -15,8 +15,7 @@ const Map<String, String> kLanguageNativeNames = {
   'nl': 'Nederlands',
   'cs': 'Čeština',
   'ko': '한국어',
-  'zh': '中文',
-  'zh_Hant': '繁體中文',
+  'zh': '繁體中文',
   'sv': 'Svenska',
   'da': 'Dansk',
   'nb': 'Norsk bokmål',
@@ -101,7 +100,6 @@ Locale? localeFromTag(String tag) {
   return Locale(parts[0], second);
 }
 
-/// Display label for a locale tag in the picker.
 String languageLabelForTag(String tag) => kLanguageNativeNames[tag] ?? tag;
 
 /// Resolve the device's preferred locales against the [supported] set, falling
@@ -111,7 +109,7 @@ String languageLabelForTag(String tag) => kLanguageNativeNames[tag] ?? tag;
 /// universal fallback. Matching is tried most- to least-specific:
 /// exact (language+script+country) -> language+script -> language.
 Locale resolveSupportedLocale(
-    List<Locale>? preferred, Iterable<Locale> supported) {
+    List<Locale>? preferred, {required Iterable<Locale> supported}) {
   if (preferred != null) {
     for (final pref in preferred) {
       for (final s in supported) {

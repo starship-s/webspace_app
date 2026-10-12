@@ -1,21 +1,17 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:webspace/services/webview.dart';
+import 'package:webspace/services/html_import_storage.dart';
+import 'package:webspace/services/file_import_document.dart';
 
 /// Tests for the file-import-sites feature.
 ///
 /// The main import flow (_importHtmlFile) depends on FilePicker (platform
 /// plugin) so cannot be unit-tested directly.  These tests verify the
 /// filename-to-name derivation logic and the result map contract that
-/// AddSiteScreen returns to _addSite().
+/// AddSiteScreen returns to SiteEditingController.addSite().
 
 void main() {
   group('Filename to site name', () {
-    // Mirrors the logic in _importHtmlFile:
-    // nameWithoutExt = fileName.replaceAll(RegExp(r'\.(html?|htm)$', caseSensitive: false), '');
-    String nameFromFile(String fileName) {
-      return fileName.replaceAll(
-          RegExp(r'\.(html?|htm)$', caseSensitive: false), '');
-    }
+    String nameFromFile(String fileName) => importedFileSite(fileName).name;
 
     test('strips .html extension', () {
       expect(nameFromFile('my-page.html'), 'my-page');
@@ -82,8 +78,7 @@ void main() {
     });
 
     test('url for imported file uses file:/// scheme (three slashes)', () {
-      final fileName = 'report.html';
-      final url = 'file:///$fileName';
+      final url = importedFileSite('report.html').url;
 
       // Three-slash form: empty authority, real path. The two-slash
       // form `file://report.html` parses with `report.html` as the
@@ -129,6 +124,45 @@ void main() {
 
       expect(html, isNot(contains('<script>.html')));
       expect(html, contains('&lt;script&gt;.html'));
+    });
+  });
+
+  group('Import document stands in for the synthetic URL (IMPORT-005)', () {
+    test('only a file import has one', () {
+      expect(
+        FileImportDocument.of(
+            initialUrl: 'https://example.com', initialHtml: '<p>cached</p>'),
+        isNull,
+      );
+      expect(FileImportDocument.of(initialUrl: 'file:///a.html'), isNotNull);
+    });
+
+    test('renders the stored import', () {
+      final doc = FileImportDocument.of(
+          initialUrl: 'file:///a.html', initialHtml: '<p>mine</p>')!;
+      expect(doc.html, '<p>mine</p>');
+      expect(doc.url, 'file:///a.html');
+    });
+
+    test('renders the unavailable page when the import is missing', () {
+      final doc = FileImportDocument.of(initialUrl: 'file:///a.html')!;
+      expect(doc.html, buildFileImportFallbackHtml('file:///a.html'));
+    });
+
+    test('a load of its own URL renders it, fragment or not', () {
+      final doc = FileImportDocument.of(initialUrl: 'file:///a.html#top')!;
+      expect(doc.isLoadOf('file:///a.html'), isTrue);
+      expect(doc.isLoadOf('file:///a.html#other'), isTrue);
+      expect(doc.isLoadOf('file:///b.html'), isFalse);
+      expect(doc.isLoadOf('https://example.com/a.html'), isFalse);
+      expect(doc.isLoadOf('about:blank'), isFalse);
+    });
+
+    test('reload re-renders on WebKit and stays native on Chromium', () {
+      // WebKit's reload re-requests file:///<name> and fails without an
+      // onLoadStop, stranding the refresh indicator and loading bar.
+      expect(FileImportDocument.rendersOnReload(isAndroid: false), isTrue);
+      expect(FileImportDocument.rendersOnReload(isAndroid: true), isFalse);
     });
   });
 

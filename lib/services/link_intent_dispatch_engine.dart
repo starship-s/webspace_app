@@ -7,7 +7,10 @@
 library;
 
 import 'package:webspace/services/link_routing_service.dart';
-import 'package:webspace/web_view_model.dart' show getBaseDomain, getNormalizedDomain;
+import 'package:webspace/services/navigation_decision_engine.dart'
+    show NavigationDecision;
+import 'package:webspace/services/outbound_preference.dart';
+import 'package:webspace/services/url_host.dart';
 
 /// What the OS handed us. `webspace://open?url=...` URLs are unwrapped to
 /// `InboundUrl` before dispatch; `text/html` shares (Android) and HTML
@@ -40,6 +43,12 @@ class InboundHtml extends InboundPayload {
     this.sourceUri,
   });
 }
+
+/// Where a URL opened in a chosen site came from. A share arrives from outside
+/// the app, so it gets the LIR-011 reset and resumes the site's tab (TAB-004).
+/// A search is the user typing inside the app (LIR-030), as they would into
+/// the engine's own search box: no reset, and a new tab when tabs are on.
+enum InboundOrigin { share, search }
 
 /// Subset of [WebViewModel] the engine needs. Adapter lives at the call
 /// site so the engine has zero dependency on Flutter.
@@ -78,22 +87,52 @@ class DispatchOpenInMain extends DispatchAction {
   final bool disposeBeforeLoad;
   final bool wipeContainer;
   final bool clearInMemoryCookies;
+
+  /// Load [url] in a new tab of the site instead of its active one (LIR-030,
+  /// TAB-005). Only a search sets it, and only while tabs are on.
+  final bool newTab;
+
   const DispatchOpenInMain({
     required this.siteId,
     required this.url,
     required this.disposeBeforeLoad,
     required this.wipeContainer,
     required this.clearInMemoryCookies,
+    this.newTab = false,
   });
 }
 
 /// Open [url] in a nested in-app webview carrying the chosen site's
 /// privacy settings. Used for cross-domain shares (LIR-011) so a site's
-/// main session is not clobbered.
+/// main session is not clobbered, and for outbound routing (LIR-015).
 class DispatchOpenNested extends DispatchAction {
   final String siteId;
   final String url;
-  const DispatchOpenNested({required this.siteId, required this.url});
+
+  /// The screen opens over a site the user is browsing (outbound routing),
+  /// so the executor leaves the webspace alone rather than switching to one
+  /// that shows [siteId].
+  final bool sourceIsParent;
+
+  const DispatchOpenNested({
+    required this.siteId,
+    required this.url,
+    this.sourceIsParent = false,
+  });
+}
+
+/// A link into one of the user's sites, where the site on screen has tabs:
+/// open it as a child tab of the tab it came from, run as [siteId] (LIR-032).
+class DispatchOpenInTab extends DispatchAction {
+  final String siteId;
+  final String url;
+  const DispatchOpenInTab({required this.siteId, required this.url});
+}
+
+/// Outbound routing named no destination for a `blockOpenNested` decision:
+/// open the nested screen with the source's own posture, as without routing.
+class DispatchNestedFallback extends DispatchAction {
+  const DispatchNestedFallback();
 }
 
 /// Create a brand-new site rooted at [home] (the stripped path) with
@@ -130,10 +169,22 @@ class DispatchShowPicker extends DispatchAction {
   final List<String> winnerSiteIds;
   final bool offerBind;
   final bool offerCreate;
+
+  /// Set for an outbound picker (LIR-016): the site whose link is being
+  /// routed. It gets the remember checkbox and an "Open without routing" row,
+  /// which nests the link with the source's own posture.
+  final String? source;
+
+  /// The pick opens a tab run as the chosen site rather than a nested screen
+  /// (LIR-032). Only set with [source].
+  final bool asTab;
+
   const DispatchShowPicker({
     required this.winnerSiteIds,
     required this.offerBind,
     required this.offerCreate,
+    this.source,
+    this.asTab = false,
   });
 }
 
@@ -177,9 +228,10 @@ class LinkIntentDispatchEngine {
     if (target == null) {
       return const DispatchUnsupported('non-http(s) target or empty host');
     }
-    final match = LinkRoutingService.resolve(target, sites);
+    final match = LinkRoutingService.resolve(target, sites: sites);
     if (match is RoutingSingle) {
-      return _openInExisting(match.site as DispatchableSite, target);
+      return _openInExisting(match.site as DispatchableSite,
+          inbound: target, origin: InboundOrigin.share, tabsEnabled: false);
     }
     return DispatchShowPicker(
       winnerSiteIds: match is RoutingAmbiguous
@@ -192,13 +244,246 @@ class LinkIntentDispatchEngine {
     );
   }
 
-  /// User picked an "Open in [site]" row from the picker.
+  /// Whether routing takes a link [source]'s own webview is about to launch
+  /// under [decision] (LIR-014). Null means it does not, and the webview's
+  /// own launch runs: routing is off for the source (it is an option of the
+  /// in-app external-link mode only), the kiosk shell is locked (KIOSK-002),
+  /// the decision is not a nested launch, or [dispatchOutbound] names no
+  /// destination. [candidates] is read only once the cheap gates pass.
+  static DispatchAction? routeOutbound({
+    required String url,
+    required NavigationDecision decision,
+    required bool routeOutboundLinks,
+    required bool kioskLocked,
+    required bool hadGesture,
+    required bool containersActive,
+    required DispatchableSite source,
+    required List<OutboundPreference> sourcePrefs,
+    required List<DispatchableSite> Function() candidates,
+  }) {
+    if (!routeOutboundLinks || kioskLocked) return null;
+    if (decision != NavigationDecision.blockOpenNested) return null;
+    final target = Uri.tryParse(url);
+    if (target == null) return null;
+    final action = dispatchOutbound(
+      targetUrl: target,
+      source: source,
+      sourcePrefs: sourcePrefs,
+      candidates: candidates(),
+      hadGesture: hadGesture,
+      containersActive: containersActive,
+    );
+    return action is DispatchNestedFallback ? null : action;
+  }
+
+  /// A link [source] would nest, where the owner has tabs: when one of the
+  /// user's sites can run it as a tab ([hosts], already limited to the sites
+  /// that may host in the owner's tree), it opens as a tab instead of a
+  /// nested screen (LIR-032). [routeOutboundLinks] is the source's routing switch,
+  /// and it decides the container (LIR-034): on, the tab runs as the site the
+  /// link leads to, asking when several can; off, as [source] itself, anchored
+  /// in the link's domain. Null keeps today's path. [urlNavigationDomain] is
+  /// the link's `getNormalizedDomain`, which a host's navigation domain must
+  /// equal.
+  static DispatchAction? routeToTab({
+    required Uri url,
+    required String urlNavigationDomain,
+    required bool tabsEnabled,
+    required bool routeOutboundLinks,
+    required bool containersActive,
+    required bool kioskLocked,
+    required bool hadGesture,
+    required DispatchableSite source,
+    required List<OutboundPreference> sourcePrefs,
+    required List<DispatchableSite> Function() hosts,
+  }) {
+    if (!tabsEnabled || !containersActive || kioskLocked || !hadGesture) {
+      return null;
+    }
+    if (url.scheme != 'http' && url.scheme != 'https' || url.host.isEmpty) {
+      return null;
+    }
+    final able = _tabHosts(urlNavigationDomain,
+        sourceSiteId: source.siteId, hosts: hosts());
+    if (able.isEmpty) return null;
+    if (!routeOutboundLinks) {
+      return DispatchOpenInTab(siteId: source.siteId, url: url.toString());
+    }
+    final sites = _tabHostChoice(url,
+        sourceSiteId: source.siteId, sourcePrefs: sourcePrefs, able: able);
+    return sites.length == 1
+        ? DispatchOpenInTab(siteId: sites.single.siteId, url: url.toString())
+        : DispatchShowPicker(
+            winnerSiteIds: [for (final s in sites) s.siteId],
+            offerBind: false,
+            offerCreate: false,
+            source: source.siteId,
+            asTab: true,
+          );
+  }
+
+  /// The site a tab opened from a link runs as now (LIR-034), for a tab whose
+  /// [opener]'s routing switch may have changed since: the site [routeToTab]
+  /// would open its [homeUrl] as. With routing off, or with no site of the
+  /// user's left that can run the link, that is the opener. When several
+  /// sites can, [current] is kept if it is one of them, since the user picked
+  /// it, else the tab stays with the opener rather than being put in one of
+  /// them silently.
+  static String linkTabRunsAs({
+    required Uri homeUrl,
+    required String homeNavigationDomain,
+    required bool routeOutboundLinks,
+    required bool containersActive,
+    required DispatchableSite opener,
+    required List<OutboundPreference> openerPrefs,
+    required List<DispatchableSite> Function() hosts,
+    required String current,
+  }) {
+    if (!routeOutboundLinks || !containersActive) return opener.siteId;
+    final able = _tabHosts(homeNavigationDomain,
+        sourceSiteId: opener.siteId, hosts: hosts());
+    if (able.isEmpty) return opener.siteId;
+    final sites = _tabHostChoice(homeUrl,
+        sourceSiteId: opener.siteId, sourcePrefs: openerPrefs, able: able);
+    if (sites.length == 1) return sites.single.siteId;
+    return sites.any((s) => s.siteId == current) ? current : opener.siteId;
+  }
+
+  static List<DispatchableSite> _tabHosts(
+    String navigationDomain, {
+    required String sourceSiteId,
+    required List<DispatchableSite> hosts,
+  }) =>
+      [
+        for (final h in hosts)
+          if (h.siteId != sourceSiteId && h.navigationDomain == navigationDomain)
+            h,
+      ];
+
+  /// The sites a link is for, chosen as LIR-014 chooses: the source's
+  /// preferences first, then claim specificity. More than one means ask.
+  static List<RoutableSite> _tabHostChoice(
+    Uri url, {
+    required String sourceSiteId,
+    required List<OutboundPreference> sourcePrefs,
+    required List<DispatchableSite> able,
+  }) {
+    final resolution = LinkRoutingService.resolveOutbound(url,
+        sourceSiteId: sourceSiteId, sourcePrefs: sourcePrefs, candidates: able);
+    return switch (resolution) {
+      OutboundByPreference(:final site) ||
+      OutboundByClaims(match: RoutingSingle(:final site)) =>
+        [site],
+      OutboundByClaims(match: RoutingAmbiguous(:final sites)) => sites,
+      // A host with claims of its own that leave this host out still runs
+      // its navigation domain.
+      OutboundByClaims(match: RoutingNone()) || OutboundSelfMatch() => able,
+    };
+  }
+
+  /// A link the source site opens, which the navigation engine decided to
+  /// nest (LIR-014, LIR-015). The caller has already checked
+  /// `routeOutboundLinks`. Routing needs a gesture and the container engine;
+  /// without either, or when nothing but the source claims the link, the
+  /// link nests with the source's own posture.
+  static DispatchAction dispatchOutbound({
+    required Uri targetUrl,
+    required DispatchableSite source,
+    required List<OutboundPreference> sourcePrefs,
+    required List<DispatchableSite> candidates,
+    required bool hadGesture,
+    required bool containersActive,
+  }) {
+    const unrouted = DispatchNestedFallback();
+    if (!hadGesture || !containersActive) return unrouted;
+    final resolution = LinkRoutingService.resolveOutbound(
+      targetUrl,
+      sourceSiteId: source.siteId,
+      sourcePrefs: sourcePrefs,
+      candidates: candidates,
+    );
+    switch (resolution) {
+      case OutboundByPreference(:final site):
+      case OutboundByClaims(match: RoutingSingle(:final site)):
+        return openOutbound(url: targetUrl, site: site);
+      case OutboundByClaims(match: RoutingAmbiguous(:final sites)):
+        return DispatchShowPicker(
+          winnerSiteIds:
+              sites.map((s) => s.siteId).toList(growable: false),
+          offerBind: false,
+          offerCreate: false,
+          source: source.siteId,
+        );
+      case OutboundByClaims(match: RoutingNone()):
+      case OutboundSelfMatch():
+        return unrouted;
+    }
+  }
+
+  /// A routed outbound link, or the user's pick from the outbound picker: a
+  /// nested screen with [site]'s posture over the source, never a webspace
+  /// switch and never the destination's main webview (LIR-015).
+  static DispatchOpenNested openOutbound({
+    required Uri url,
+    required RoutableSite site,
+  }) =>
+      DispatchOpenNested(
+        siteId: site.siteId,
+        url: url.toString(),
+        sourceIsParent: true,
+      );
+
+  /// The user picked [site] in the outbound picker (LIR-016): the routed
+  /// open, and with [remember] the source's preference list grown by
+  /// [preferencesToRemember]. `preferences` is null when the list does not
+  /// change, so the caller persists only on a change.
+  static ({List<OutboundPreference>? preferences, DispatchOpenNested action})
+      pickOutbound({
+    required Uri url,
+    required RoutableSite site,
+    required bool remember,
+    required List<OutboundPreference> existing,
+  }) {
+    final additions = remember
+        ? preferencesToRemember(
+            url: url,
+            targetSiteId: site.siteId,
+            existing: existing,
+          )
+        : const <OutboundPreference>[];
+    return (
+      preferences: additions.isEmpty ? null : [...existing, ...additions],
+      action: openOutbound(url: url, site: site),
+    );
+  }
+
+  /// The preferences a remembered outbound pick adds to the source
+  /// (LIR-016): one per claim of [url] the source does not hold yet, whatever
+  /// that claim's current target.
+  static List<OutboundPreference> preferencesToRemember({
+    required Uri url,
+    required String targetSiteId,
+    required List<OutboundPreference> existing,
+  }) {
+    final held = {for (final p in existing) p.claim};
+    return [
+      for (final claim in LinkRoutingService.claimsToAdoptUrl(url))
+        if (held.add(claim))
+          OutboundPreference(claim: claim, targetSiteId: targetSiteId),
+    ];
+  }
+
+  /// User picked an "Open in [site]" row from the picker, or web search runs
+  /// in [site] (LIR-030, [InboundOrigin.search]).
   static DispatchAction openInChosen({
     required Uri inbound,
     required DispatchableSite site,
+    InboundOrigin origin = InboundOrigin.share,
+    bool tabsEnabled = false,
   }) {
     final target = _normalizeInbound(inbound) ?? inbound;
-    return _openInExisting(site, target);
+    return _openInExisting(site,
+        inbound: target, origin: origin, tabsEnabled: tabsEnabled);
   }
 
   /// User picked "Send [host] (and subdomains) to [site]". The returned
@@ -219,7 +504,8 @@ class LinkIntentDispatchEngine {
       // still produces an out-of-domain share → nested webview. This is
       // by design (LIR-011): claims drive routing of *future* arrivals;
       // the current arrival respects the existing site's session.
-      followUp: _openInExisting(site, target),
+      followUp: _openInExisting(site,
+          inbound: target, origin: InboundOrigin.share, tabsEnabled: false),
     );
   }
 
@@ -261,15 +547,27 @@ class LinkIntentDispatchEngine {
   }
 
   static DispatchAction _openInExisting(
-    DispatchableSite site,
-    Uri inbound,
-  ) {
+    DispatchableSite site, {
+    required Uri inbound,
+    required InboundOrigin origin,
+    required bool tabsEnabled,
+  }) {
     final inDomain =
         getNormalizedDomain(inbound.toString()) == site.navigationDomain;
     if (!inDomain) {
       return DispatchOpenNested(
         siteId: site.siteId,
         url: inbound.toString(),
+      );
+    }
+    if (origin == InboundOrigin.search) {
+      return DispatchOpenInMain(
+        siteId: site.siteId,
+        url: inbound.toString(),
+        disposeBeforeLoad: false,
+        wipeContainer: false,
+        clearInMemoryCookies: false,
+        newTab: tabsEnabled,
       );
     }
     final reset = site.incognito || site.alwaysOpenHome;

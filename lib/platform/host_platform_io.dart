@@ -1,9 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io' as io;
-
 import 'dart:typed_data';
 
-import 'package:path_provider/path_provider.dart' as pp;
+import 'package:http/http.dart' as http;
+import 'package:http/io_client.dart';
 
 bool get hostIsAndroid => io.Platform.isAndroid;
 bool get hostIsIOS => io.Platform.isIOS;
@@ -17,37 +18,37 @@ String get hostOperatingSystemVersion => io.Platform.operatingSystemVersion;
 
 /// Write [bytes] to [path]. Unavailable on web; callers there must route
 /// through the browser's own download path instead.
-Future<void> hostWriteBytes(String path, List<int> bytes) =>
+Future<void> hostWriteBytes(String path, {required List<int> bytes}) =>
     io.File(path).writeAsBytes(bytes);
+
+/// [host]'s numeric addresses. Throws [io.SocketException] when the name
+/// does not resolve, which a caller judging the destination reads as "no
+/// answer" rather than "public".
+Future<List<String>?> hostLookupAddresses(String host) async =>
+    [for (final address in await io.InternetAddress.lookup(host)) address.address];
 
 /// True when [host] resolves. Used as a cheap online check.
 Future<bool> hostCanResolve(String host,
     {Duration timeout = const Duration(seconds: 3)}) async {
   try {
-    final result = await io.InternetAddress.lookup(host).timeout(timeout);
-    return result.isNotEmpty && result.first.rawAddress.isNotEmpty;
-  } catch (_) {
+    final addresses = await hostLookupAddresses(host).timeout(timeout);
+    return addresses != null && addresses.isNotEmpty;
+  } on io.SocketException {
+    return false;
+  } on TimeoutException {
     return false;
   }
 }
 
-/// Read a cache file from the app documents directory, or null when absent.
-Future<String?> hostReadDocumentText(String name) async {
-  final dir = await pp.getApplicationDocumentsDirectory();
-  final file = io.File('${dir.path}/$name');
-  if (!await file.exists()) return null;
-  return file.readAsString();
-}
-
-Future<void> hostWriteDocumentText(String name, String contents) async {
-  final dir = await pp.getApplicationDocumentsDirectory();
-  await io.File('${dir.path}/$name').writeAsString(contents);
-}
+/// Direct (unproxied) client for downloads, with gzip auto-decompression
+/// disabled so the server's Content-Length survives to the caller.
+http.Client hostDirectDownloadClient() =>
+    IOClient(io.HttpClient()..autoUncompress = false);
 
 /// Read an absolute path chosen by the OS file picker.
 Future<Uint8List> hostReadFileBytes(String path) => io.File(path).readAsBytes();
 
-Future<void> hostWriteFileBytes(String path, List<int> bytes) =>
+Future<void> hostWriteFileBytes(String path, {required List<int> bytes}) =>
     io.File(path).writeAsBytes(bytes);
 
 Future<bool> hostFileExists(String path) => io.File(path).exists();
@@ -73,10 +74,6 @@ Future<void> hostDeleteDirectory(String path) async {
   if (await dir.exists()) await dir.delete(recursive: true);
 }
 
-/// Absolute path of the app documents directory.
-Future<String> hostDocumentsPath() async =>
-    (await pp.getApplicationDocumentsDirectory()).path;
-
 /// The platform's gzip / zlib decoders, as plain converters so callers keep
 /// their own bounded-inflation guards.
 Converter<List<int>, List<int>> get hostGzipDecoder => io.gzip.decoder;
@@ -86,32 +83,8 @@ Converter<List<int>, List<int>> get hostGzipEncoder => io.gzip.encoder;
 /// Synchronous read, for the compute-isolate parse paths that take a path.
 String hostReadFileTextSync(String path) => io.File(path).readAsStringSync();
 
-Future<void> hostWriteFileText(String path, String contents) =>
+Future<void> hostWriteFileText(String path, {required String contents}) =>
     io.File(path).writeAsString(contents);
-
-/// Best-effort bounded GET: returns null on any non-200, timeout, or a body
-/// that exceeds [maxBytes]. Moved here verbatim from MediaSessionService so
-/// the artwork fetch keeps its caps and its direct (unproxied) client.
-Future<Uint8List?> hostFetchBounded(Uri uri, int maxBytes,
-    {Duration timeout = const Duration(seconds: 5)}) async {
-  io.HttpClient? client;
-  try {
-    client = io.HttpClient()..connectionTimeout = timeout;
-    final req = await client.getUrl(uri).timeout(timeout);
-    final resp = await req.close().timeout(timeout);
-    if (resp.statusCode != 200) return null;
-    final builder = BytesBuilder(copy: false);
-    await for (final chunk in resp.timeout(timeout)) {
-      builder.add(chunk);
-      if (builder.length > maxBytes) return null;
-    }
-    return builder.takeBytes();
-  } catch (_) {
-    return null;
-  } finally {
-    client?.close(force: true);
-  }
-}
 
 Future<String> hostReadFileText(String path) => io.File(path).readAsString();
 

@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/startup_restore_engine.dart';
 import 'package:webspace/web_view_model.dart';
@@ -5,66 +7,6 @@ import 'package:webspace/web_view_model.dart';
 WebViewModel _site(String url) => WebViewModel(initUrl: url);
 
 void main() {
-  group('StartupRestoreEngine.resolveLaunchTarget', () {
-    test('returns null when no shortcut intent was passed', () {
-      final models = [_site('https://example.com'), _site('https://other.com')];
-      expect(
-        StartupRestoreEngine.resolveLaunchTarget(
-          shortcutSiteId: null,
-          models: models,
-        ),
-        isNull,
-      );
-    });
-
-    test('returns the index of the matching siteId', () {
-      final a = _site('https://a.com');
-      final b = _site('https://b.com');
-      expect(
-        StartupRestoreEngine.resolveLaunchTarget(
-          shortcutSiteId: b.siteId,
-          models: [a, b],
-        ),
-        1,
-      );
-    });
-
-    test('returns null when the shortcut siteId no longer exists', () {
-      final models = [_site('https://a.com'), _site('https://b.com')];
-      expect(
-        StartupRestoreEngine.resolveLaunchTarget(
-          shortcutSiteId: 'deleted-site-id',
-          models: models,
-        ),
-        isNull,
-      );
-    });
-
-    test('returns null when the model list is empty', () {
-      expect(
-        StartupRestoreEngine.resolveLaunchTarget(
-          shortcutSiteId: 'any-id',
-          models: const [],
-        ),
-        isNull,
-      );
-    });
-
-    test('returns the first match if siteIds collide (defensive)', () {
-      final a = _site('https://a.com');
-      final b = _site('https://b.com');
-      // siteIds are random UUIDs in production; this tests indexWhere
-      // semantics in case a hand-edited backup ever produces a collision.
-      expect(
-        StartupRestoreEngine.resolveLaunchTarget(
-          shortcutSiteId: a.siteId,
-          models: [a, b],
-        ),
-        0,
-      );
-    });
-  });
-
   group('StartupRestoreEngine.resolveLaunch', () {
     test('no intent -> LaunchNone', () {
       final r = StartupRestoreEngine.resolveLaunch(
@@ -87,6 +29,18 @@ void main() {
       );
       expect(r, isA<LaunchOpenSite>());
       expect((r as LaunchOpenSite).index, 1);
+    });
+
+    test('the first match wins if siteIds collide (hand-edited backup)', () {
+      final a = WebViewModel(initUrl: 'https://a.com', siteId: 'dup');
+      final b = WebViewModel(initUrl: 'https://b.com', siteId: 'dup');
+      final r = StartupRestoreEngine.resolveLaunch(
+        shortcutSiteId: 'dup',
+        shortcutUrl: 'https://b.com',
+        models: [a, b],
+        rememberedRemap: const {},
+      );
+      expect((r as LaunchOpenSite).index, 0);
     });
 
     test('siteId gone but remembered remap resolves -> LaunchOpenSite', () {
@@ -240,30 +194,38 @@ void main() {
   });
 
   group('ShortcutTombstones.add (iOS HS-011)', () {
-    Map<String, String> tomb(String id, String url) =>
+    Map<String, String> tomb(String id, {required String url}) =>
         {'siteId': id, 'label': id, 'url': url};
 
     test('appends a new tombstone', () {
       final next = ShortcutTombstones.add(
         tombstones: const [],
-        entry: tomb('s1', 'https://a.com'),
+        entry: tomb('s1', url: 'https://a.com'),
       );
-      expect(next, [tomb('s1', 'https://a.com')]);
+      expect(next, [tomb('s1', url: 'https://a.com')]);
     });
 
     test('de-dupes by siteId and moves the entry to the most-recent end', () {
       final next = ShortcutTombstones.add(
-        tombstones: [tomb('s1', 'https://old.com'), tomb('s2', 'https://b.com')],
-        entry: tomb('s1', 'https://new.com'),
+        tombstones: [
+          tomb('s1', url: 'https://old.com'),
+          tomb('s2', url: 'https://b.com')
+        ],
+        entry: tomb('s1', url: 'https://new.com'),
       );
-      expect(next, [tomb('s2', 'https://b.com'), tomb('s1', 'https://new.com')]);
+      expect(next, [
+        tomb('s2', url: 'https://b.com'),
+        tomb('s1', url: 'https://new.com')
+      ]);
     });
 
     test('caps the list, evicting the oldest', () {
-      final start = [for (var i = 0; i < 3; i++) tomb('s$i', 'https://$i.com')];
+      final start = [
+        for (var i = 0; i < 3; i++) tomb('s$i', url: 'https://$i.com')
+      ];
       final next = ShortcutTombstones.add(
         tombstones: start,
-        entry: tomb('s3', 'https://3.com'),
+        entry: tomb('s3', url: 'https://3.com'),
         cap: 3,
       );
       expect(next.map((t) => t['siteId']), ['s1', 's2', 's3']);
@@ -271,18 +233,18 @@ void main() {
 
     test('ignores an entry with an empty siteId', () {
       final next = ShortcutTombstones.add(
-        tombstones: [tomb('s1', 'https://a.com')],
-        entry: tomb('', 'https://x.com'),
+        tombstones: [tomb('s1', url: 'https://a.com')],
+        entry: tomb('', url: 'https://x.com'),
       );
-      expect(next, [tomb('s1', 'https://a.com')]);
+      expect(next, [tomb('s1', url: 'https://a.com')]);
     });
 
     test('pruneLive drops tombstones whose id is now live', () {
       final next = ShortcutTombstones.pruneLive(
-        [tomb('s1', 'https://a.com'), tomb('s2', 'https://b.com')],
-        {'s1'},
+        [tomb('s1', url: 'https://a.com'), tomb('s2', url: 'https://b.com')],
+        liveSiteIds: {'s1'},
       );
-      expect(next, [tomb('s2', 'https://b.com')]);
+      expect(next, [tomb('s2', url: 'https://b.com')]);
     });
   });
 
@@ -369,6 +331,124 @@ void main() {
     });
   });
 
+  group('ShortcutPinState.sitesOfTiles (HS-016)', () {
+    test('a tile opens its own site, else the site it was rebound to', () {
+      final a = WebViewModel(initUrl: 'https://a.com', siteId: 'a');
+      final b = WebViewModel(initUrl: 'https://b.com', siteId: 'b');
+      expect(
+        ShortcutPinState.sitesOfTiles(
+          pinnedSiteIds: {'a', 'gone'},
+          rememberedRemap: const {'gone': 'b'},
+          models: [a, b],
+        ),
+        {'a': a, 'gone': b},
+      );
+    });
+
+    test('the own site wins over a rebind, as a tap resolves it', () {
+      final a = WebViewModel(initUrl: 'https://a.com', siteId: 'a');
+      final b = WebViewModel(initUrl: 'https://b.com', siteId: 'b');
+      expect(
+        ShortcutPinState.sitesOfTiles(
+          pinnedSiteIds: {'a'},
+          rememberedRemap: const {'a': 'b'},
+          models: [a, b],
+        ),
+        {'a': a},
+      );
+    });
+
+    test('leaves out a tile that opens no site', () {
+      expect(
+        ShortcutPinState.sitesOfTiles(
+          pinnedSiteIds: {'gone'},
+          rememberedRemap: const {'gone': 'also-gone'},
+          models: [WebViewModel(initUrl: 'https://a.com', siteId: 'a')],
+        ),
+        isEmpty,
+      );
+    });
+
+    test('leaves out an archive-tier site (ARCH-006)', () {
+      final archived = WebViewModel(initUrl: 'https://a.com', siteId: 'a')
+        ..isArchiveTier = true;
+      expect(
+        ShortcutPinState.sitesOfTiles(
+          pinnedSiteIds: {'a'},
+          rememberedRemap: const {},
+          models: [archived],
+        ),
+        isEmpty,
+      );
+    });
+  });
+
+  group('ShortcutPinState.staleTiles (HS-016)', () {
+    final png1 = Uint8List.fromList([1, 2, 3]);
+    final png2 = Uint8List.fromList([4, 5, 6]);
+
+    test('a tile never written this launch is rewritten', () {
+      final plan = ShortcutPinState.staleTiles(
+        want: {'a': (label: 'Mail', icon: png1)},
+        shown: const {},
+      );
+      expect(plan.updates, [(tile: 'a', label: 'Mail', icon: png1)]);
+      expect(plan.shown, {'a': (label: 'Mail', icon: png1)});
+    });
+
+    test('a matching tile is left alone', () {
+      final plan = ShortcutPinState.staleTiles(
+        want: {'a': (label: 'Mail', icon: Uint8List.fromList([1, 2, 3]))},
+        shown: {'a': (label: 'Mail', icon: png1)},
+      );
+      expect(plan.updates, isEmpty);
+    });
+
+    test('a rename rewrites the label and keeps the icon', () {
+      final plan = ShortcutPinState.staleTiles(
+        want: {'a': (label: 'Inbox', icon: png1)},
+        shown: {'a': (label: 'Mail', icon: png1)},
+      );
+      expect(plan.updates, [(tile: 'a', label: 'Inbox', icon: null)]);
+      expect(plan.shown['a'], (label: 'Inbox', icon: png1));
+    });
+
+    test('a new icon is sent', () {
+      final plan = ShortcutPinState.staleTiles(
+        want: {'a': (label: 'Mail', icon: png2)},
+        shown: {'a': (label: 'Mail', icon: png1)},
+      );
+      expect(plan.updates, [(tile: 'a', label: 'Mail', icon: png2)]);
+    });
+
+    test('an icon not known yet never replaces the one a tile has', () {
+      final plan = ShortcutPinState.staleTiles(
+        want: {'a': (label: 'Mail', icon: null)},
+        shown: {'a': (label: 'Mail', icon: png1)},
+      );
+      expect(plan.updates, isEmpty);
+
+      final renamed = ShortcutPinState.staleTiles(
+        want: {'a': (label: 'Inbox', icon: null)},
+        shown: {'a': (label: 'Mail', icon: png1)},
+      );
+      expect(renamed.updates, [(tile: 'a', label: 'Inbox', icon: null)]);
+      expect(renamed.shown['a'], (label: 'Inbox', icon: png1));
+    });
+
+    test('a tile not wanted keeps its record', () {
+      final plan = ShortcutPinState.staleTiles(
+        want: {'a': (label: 'Inbox', icon: null)},
+        shown: {
+          'a': (label: 'Mail', icon: null),
+          'b': (label: 'News', icon: png2),
+        },
+      );
+      expect(plan.updates.map((u) => u.tile), ['a']);
+      expect(plan.shown['b'], (label: 'News', icon: png2));
+    });
+  });
+
   group('StartupRestoreEngine.shouldEnterFullscreen (FS-008)', () {
     test('direct entry from shortcut or notification enters fullscreen', () {
       expect(
@@ -422,6 +502,52 @@ void main() {
           directEntry: false,
           fullscreenOnShortcut: false,
           perSiteFullscreenMode: true,
+        ),
+        isTrue,
+      );
+    });
+  });
+
+  group('StartupRestoreEngine.shouldActivateAfterRestore (NAV-012)', () {
+    test('a plain launch with nothing opened yet still lands home', () {
+      expect(
+        StartupRestoreEngine.shouldActivateAfterRestore(
+          indexToRestore: null,
+          activatedDuringRestore: false,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a site opened while the restore awaited is not closed again', () {
+      // The reported drop: GitHub tapped on the home grid during the proxy
+      // router's attribution pass, then the restore's closing activation of
+      // the plain launch's null target sent the user back home.
+      expect(
+        StartupRestoreEngine.shouldActivateAfterRestore(
+          indexToRestore: null,
+          activatedDuringRestore: true,
+        ),
+        isFalse,
+      );
+    });
+
+    test('a shortcut target is applied when nothing was opened', () {
+      expect(
+        StartupRestoreEngine.shouldActivateAfterRestore(
+          indexToRestore: 3,
+          activatedDuringRestore: false,
+        ),
+        isTrue,
+      );
+    });
+
+    test('a shortcut target is applied even after a tap during the restore',
+        () {
+      expect(
+        StartupRestoreEngine.shouldActivateAfterRestore(
+          indexToRestore: 0,
+          activatedDuringRestore: true,
         ),
         isTrue,
       );

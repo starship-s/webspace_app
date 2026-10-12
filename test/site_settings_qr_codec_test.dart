@@ -1,5 +1,5 @@
 import 'dart:convert';
-import 'dart:io' show gzip;
+import 'dart:io' show File, gzip;
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/site_settings_qr_codec.dart';
@@ -24,8 +24,8 @@ void main() {
         contentBlockEnabled: false,
         trackingProtectionEnabled: false,
         localCdnEnabled: false,
-        blockAutoRedirects: false,
         fullscreenMode: true,
+        blockScreenshots: true,
         htmlCachingEnabled: true,
         notificationsEnabled: true,
         locationMode: LocationMode.spoof,
@@ -51,7 +51,7 @@ void main() {
 
       final hydrated = WebViewModel.fromJson(
         SiteSettingsQrCodec.hydrateForFromJson(decoded!),
-        null,
+        stateSetterF: null,
       );
 
       expect(hydrated.initUrl, source.initUrl);
@@ -69,8 +69,8 @@ void main() {
       expect(hydrated.trackingProtectionEnabled,
           source.trackingProtectionEnabled);
       expect(hydrated.localCdnEnabled, source.localCdnEnabled);
-      expect(hydrated.blockAutoRedirects, source.blockAutoRedirects);
       expect(hydrated.fullscreenMode, source.fullscreenMode);
+      expect(hydrated.blockScreenshots, source.blockScreenshots);
       expect(hydrated.htmlCachingEnabled, source.htmlCachingEnabled);
       expect(hydrated.notificationsEnabled, source.notificationsEnabled);
       expect(hydrated.locationMode, source.locationMode);
@@ -97,7 +97,7 @@ void main() {
         'initUrl': 'https://example.com',
       });
       expect(encoded, startsWith('webspace://qr/site/v1/'));
-      expect(SiteSettingsQrCodec.looksLikeQrPayload(encoded), isTrue);
+      expect(SiteSettingsQrCodec.decode(encoded), isNotNull);
     });
 
     test('proxy password and secure cookies never appear in encoded output',
@@ -213,35 +213,41 @@ void main() {
           SiteSettingsQrCodec.decode('webspace://qr/site/v999/$body'), isNull);
     });
 
-    test('looksLikeQrPayload is strict about the prefix', () {
-      expect(
-          SiteSettingsQrCodec.looksLikeQrPayload(
-              'webspace://qr/site/v1/abc'),
-          isTrue);
-      expect(
-          SiteSettingsQrCodec.looksLikeQrPayload('https://example.com'),
-          isFalse);
-      expect(SiteSettingsQrCodec.looksLikeQrPayload(''), isFalse);
+    test('decode refuses anything outside the QR prefix', () {
+      expect(SiteSettingsQrCodec.decode('https://example.com'), isNull);
+      expect(SiteSettingsQrCodec.decode(''), isNull);
     });
 
     test('every WebViewModel.toJson key is classified', () {
       // Drift guard: when a new per-site field is added to WebViewModel,
       // the dev MUST decide whether it rides a shared QR. This test fails
-      // if a `toJson` key isn't in either set.
-      final fullToJson = WebViewModel(
-        initUrl: 'https://example.com',
-        spoofLatitude: 1.0,
-        spoofLongitude: 1.0,
-        spoofTimezone: 'UTC',
-        spoofTimezoneFromLocation: true,
-      ).toJson();
+      // if a `toJson` key isn't in either set. A default model omits every
+      // field that sits at its default, so the backup-compat superset (every
+      // key a release has written, set to non-default values) is what makes
+      // those fields reach the check.
+      final superset = jsonDecode(
+        File('tool/backup_compat/superset.json').readAsStringSync(),
+      ) as Map<String, dynamic>;
+      final keys = <String>{
+        ...WebViewModel(
+          initUrl: 'https://example.com',
+          spoofLatitude: 1.0,
+          spoofLongitude: 1.0,
+          spoofTimezone: 'UTC',
+          spoofTimezoneFromLocation: true,
+        ).toJson().keys,
+        for (final site in superset['sites'] as List)
+          ...WebViewModel.fromJson(site as Map<String, dynamic>,
+                  stateSetterF: null)
+              .toJson()
+              .keys,
+      };
 
       final classified = {
         ...SiteSettingsQrCodec.includedKeys,
         ...SiteSettingsQrCodec.excludedKeys,
       };
-      final unknown =
-          fullToJson.keys.where((k) => !classified.contains(k)).toList();
+      final unknown = keys.where((k) => !classified.contains(k)).toList();
 
       expect(unknown, isEmpty,
           reason:
@@ -325,6 +331,37 @@ void main() {
       // QR v40 binary mode at ECC-L holds 2,953 bytes. Even at ECC-H
       // (1,273 bytes) we leave plenty of headroom.
       expect(encoded.length, lessThan(900));
+    });
+
+    test('decode strips a hand-crafted proxy password', () {
+      // `includedKeys` whitelists top-level keys only, so a sender that does
+      // not use our encoder can nest a password inside `proxySettings` and
+      // `UserProxySettings.fromJson` would read it straight into the
+      // receiver's live credentials (PWD-005).
+      final hostile = {
+        'initUrl': 'https://example.com/',
+        'proxySettings': {
+          'type': ProxyType.SOCKS5.index,
+          'address': 'attacker.example:1080',
+          'username': 'u',
+          'password': 'hunter2',
+        },
+      };
+      final decoded = SiteSettingsQrCodec.decode(
+        SiteSettingsQrCodec.encode(hostile),
+      );
+
+      expect(decoded, isNotNull);
+      final proxy = decoded!['proxySettings'] as Map<String, dynamic>;
+      expect(proxy.containsKey('password'), isFalse);
+      expect(proxy['address'], equals('attacker.example:1080'));
+      expect(proxy['username'], equals('u'));
+      expect(
+        UserProxySettings.fromJson(proxy).password,
+        isNull,
+        reason: 'a hydrated model must not carry the sender\'s password',
+      );
+      expect(jsonEncode(decoded).contains('hunter2'), isFalse);
     });
   });
 }

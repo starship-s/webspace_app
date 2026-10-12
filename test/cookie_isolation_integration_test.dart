@@ -1,239 +1,17 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/cookie_isolation.dart';
-import 'package:webspace/services/cookie_secure_storage.dart';
-import 'package:webspace/services/site_activation_engine.dart';
-import 'package:webspace/services/webview.dart';
+import 'package:webspace/services/site_retention_priority.dart';
+import 'package:webspace/services/site_unload_engine.dart';
 import 'package:webspace/web_view_model.dart';
 
-/// In-memory cookie jar that models RFC 6265 domain-match semantics so the
-/// sibling-subdomain scenarios the real fix addresses can actually be
-/// exercised. Implements the real `CookieManager` interface so the engine
-/// under test is unaware that it's talking to a mock.
-///
-/// Cookies are stored as a flat list. `getCookies(url)` returns cookies
-/// whose Domain attribute matches per RFC 6265:
-///   - cookie.domain equals url.host (host-only), OR
-///   - cookie.domain is a parent of url.host (domain cookie — leading
-///     `.` is optional per modern browsers)
-/// plus path matching (cookie.path is a prefix of url.path).
-class MockCookieManager implements CookieManager {
-  final List<Cookie> _cookies = [];
-
-  /// All cookies in the jar (for assertions).
-  List<Cookie> get all => List.unmodifiable(_cookies);
-
-  /// Unique domains present in the jar.
-  Set<String> get domainsWithCookies => {
-        for (final c in _cookies)
-          if (c.domain != null) _canonical(c.domain!),
-      };
-
-  @override
-  Future<List<Cookie>> getCookies({required Uri url}) async {
-    final host = url.host.toLowerCase();
-    final path = url.path.isEmpty ? '/' : url.path;
-    return _cookies.where((c) {
-      if (!_domainMatches(c.domain, host)) return false;
-      if (!_pathMatches(c.path ?? '/', path)) return false;
-      return true;
-    }).toList();
-  }
-
-  @override
-  Future<List<Cookie>> getAllCookies({List<Uri>? candidateUrls}) async {
-    // The real iOS/macOS path ignores candidateUrls. On Android the wrapper
-    // aggregates per-URL; for tests the mock returns everything so we don't
-    // need to thread a platform switch through the tests.
-    return List.from(_cookies);
-  }
-
-  @override
-  Future<void> setCookie({
-    required Uri url,
-    required String name,
-    required String value,
-    String? domain,
-    String? path,
-    int? expiresDate,
-    bool? isSecure,
-    bool? isHttpOnly,
-  }) async {
-    final effectiveDomain = (domain ?? url.host).toLowerCase();
-    final effectivePath = path ?? '/';
-    _cookies.removeWhere((c) =>
-        c.name == name &&
-        _canonical(c.domain ?? '') == _canonical(effectiveDomain) &&
-        (c.path ?? '/') == effectivePath);
-    _cookies.add(Cookie(
-      name: name,
-      value: value,
-      domain: effectiveDomain,
-      path: effectivePath,
-      expiresDate: expiresDate,
-      isSecure: isSecure,
-      isHttpOnly: isHttpOnly,
-    ));
-  }
-
-  @override
-  Future<void> deleteCookie({
-    required Uri url,
-    required String name,
-    String? domain,
-    String? path,
-  }) async {
-    final effectiveDomain = (domain ?? url.host).toLowerCase();
-    final effectivePath = path ?? '/';
-    _cookies.removeWhere((c) =>
-        c.name == name &&
-        _canonical(c.domain ?? '') == _canonical(effectiveDomain) &&
-        (c.path ?? '/') == effectivePath);
-  }
-
-  @override
-  Future<void> deleteAllCookies() async {
-    _cookies.clear();
-  }
-
-  @override
-  Future<void> deleteAllCookiesForUrl(Uri url) async {
-    final cookies = await getCookies(url: url);
-    for (final c in cookies) {
-      await deleteCookie(url: url, name: c.name, domain: c.domain, path: c.path);
-    }
-  }
-
-  /// Strip a leading `.` so `.google.com` and `google.com` compare equal.
-  static String _canonical(String domain) {
-    var d = domain.trim().toLowerCase();
-    if (d.startsWith('.')) d = d.substring(1);
-    return d;
-  }
-
-  /// RFC 6265 §5.1.3 domain-match.
-  static bool _domainMatches(String? cookieDomain, String host) {
-    if (cookieDomain == null || cookieDomain.isEmpty) return false;
-    final d = _canonical(cookieDomain);
-    final h = host.toLowerCase();
-    if (d == h) return true;
-    if (h.endsWith('.$d')) return true;
-    return false;
-  }
-
-  /// RFC 6265 §5.1.4 path-match.
-  static bool _pathMatches(String cookiePath, String requestPath) {
-    if (cookiePath == requestPath) return true;
-    if (requestPath.startsWith(cookiePath)) {
-      if (cookiePath.endsWith('/')) return true;
-      final next = requestPath.length > cookiePath.length
-          ? requestPath[cookiePath.length]
-          : '';
-      if (next == '/') return true;
-    }
-    return false;
-  }
-
-  // CookieManager exposes a handful of other methods this mock doesn't need.
-  // Route unimplemented calls through noSuchMethod so the type-level
-  // `implements CookieManager` contract holds without us having to stub
-  // every member.
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
-
-/// Cookie manager that models ANDROID's URL-scoped native cookie API, unlike
-/// the permissive [MockCookieManager] whose `getAllCookies` returns the whole
-/// jar. On Android the wrapper aggregates `getCookies(url)` over a fixed set
-/// of candidate URLs (there is no "dump every cookie" primitive), so a cookie
-/// on a host that isn't reachable from any candidate URL is invisible to a
-/// capture — and `setCookie` drops a cookie whose Domain isn't a suffix of the
-/// request URL host. This makes the legacy engine's sibling-subdomain
-/// host-only-cookie loss observable in tests instead of hidden.
-///
-/// Legacy engine only: the container engine (the default for Android SW 110+,
-/// iOS 17+, macOS 14+, Linux WPE 2.40+ — i.e. most users) owns each site's
-/// cookies in a native per-site store and never runs this URL-scoped
-/// capture-nuke-restore, so it is not subject to this limitation.
-class AndroidScopedCookieManager extends MockCookieManager {
-  @override
-  Future<List<Cookie>> getAllCookies({List<Uri>? candidateUrls}) async {
-    if (candidateUrls == null || candidateUrls.isEmpty) {
-      return super.getAllCookies();
-    }
-    final seen = <String>{};
-    final result = <Cookie>[];
-    for (final url in candidateUrls) {
-      for (final c in await getCookies(url: url)) {
-        if (seen.add('${c.name}|${c.domain}|${c.path}')) result.add(c);
-      }
-    }
-    return result;
-  }
-
-  @override
-  Future<void> setCookie({
-    required Uri url,
-    required String name,
-    required String value,
-    String? domain,
-    String? path,
-    int? expiresDate,
-    bool? isSecure,
-    bool? isHttpOnly,
-  }) async {
-    // Android's CookieManager.setCookie stores against the URL and drops a
-    // cookie whose Domain attribute isn't the URL host or a parent of it.
-    if (domain != null && !MockCookieManager._domainMatches(domain, url.host.toLowerCase())) {
-      return;
-    }
-    await super.setCookie(
-      url: url,
-      name: name,
-      value: value,
-      domain: domain,
-      path: path,
-      expiresDate: expiresDate,
-      isSecure: isSecure,
-      isHttpOnly: isHttpOnly,
-    );
-  }
-}
-
-/// In-memory per-siteId cookie store implementing the real
-/// `CookieSecureStorage` interface. Only the methods the engine touches
-/// are meaningful; everything else routes through `noSuchMethod`.
-class MockCookieSecureStorage implements CookieSecureStorage {
-  final Map<String, List<Cookie>> _storage = {};
-
-  @override
-  Future<List<Cookie>> loadCookiesForSite(String siteId) async {
-    return List.from(_storage[siteId] ?? const []);
-  }
-
-  @override
-  Future<void> saveCookiesForSite(String siteId, List<Cookie> cookies) async {
-    if (cookies.isEmpty) {
-      _storage.remove(siteId);
-    } else {
-      _storage[siteId] = List.from(cookies);
-    }
-  }
-
-  @override
-  Future<void> removeOrphanedCookies(Set<String> activeSiteIds) async {
-    _storage.removeWhere((siteId, _) => !activeSiteIds.contains(siteId));
-  }
-
-  Map<String, List<Cookie>> get allStorage => Map.from(_storage);
-
-  @override
-  dynamic noSuchMethod(Invocation invocation) => super.noSuchMethod(invocation);
-}
+import 'helpers/mock_cookie_manager.dart';
+import 'helpers/site_list_state.dart';
+import 'package:webspace/services/cookie_manager.dart';
 
 /// Test harness for cookie isolation. Delegates cookie-jar management to
 /// the REAL [CookieIsolationEngine] — the tests exercise production code,
 /// not duplicated harness code.
-class CookieIsolationTestHarness {
+class CookieIsolationTestHarness with SiteListState implements ResidencyHost {
   final MockCookieManager cookieManager;
   final MockCookieSecureStorage storage = MockCookieSecureStorage();
   late final CookieIsolationEngine engine = CookieIsolationEngine(
@@ -243,12 +21,43 @@ class CookieIsolationTestHarness {
 
   CookieIsolationTestHarness({MockCookieManager? cookieManager})
       : cookieManager = cookieManager ?? MockCookieManager();
-  final List<WebViewModel> sites = [];
-  final Set<int> loadedIndices = {};
-  int? currentIndex;
 
-  /// Monotonic counter mirroring `_setCurrentIndexVersion` in
-  /// `_WebSpacePageState`. Every `switchToSite` call bumps it; the engine
+  @override
+  List<WebViewModel> get models => sites;
+
+  @override
+  CookieIsolationEngine get sharedJar => engine;
+
+  final List<WebViewModel> navStateCaptured = [];
+
+  @override
+  Future<void> captureNavState(WebViewModel model) async =>
+      navStateCaptured.add(model);
+
+  @override
+  void noteUnloaded(WebViewModel model, {required UnloadReason reason}) {}
+
+  @override
+  List<WebViewModel> identities({int? except}) => sites;
+
+  @override
+  SiteRetentionPriority priorityOf(int index) => index == currentIndex
+      ? SiteRetentionPriority.active
+      : SiteRetentionPriority.loaded;
+
+  @override
+  ProxyTopology get proxyTopology => ProxyTopology.of(
+      linux: false, android: false, routerActive: false,
+      sharesDefaultSession: (_) => false);
+
+  @override
+  bool get torAvailable => false;
+
+  /// Mirrors `SiteActivationController.unload`.
+  Future<void> unload(int index, {required UnloadReason reason}) =>
+      SiteUnloadEngine.unload(this, index: index, reason: reason);
+
+  /// Monotonic counter mirroring `SiteRuntime.activationVersion`. Every `switchToSite` call bumps it; the engine
   /// reads it via a closure so concurrent activations can bail.
   int version = 0;
 
@@ -260,26 +69,17 @@ class CookieIsolationTestHarness {
     ));
   }
 
-  /// Mirrors `_setCurrentIndex` in main.dart: bumps the version, unloads
-  /// any same-base-domain conflicting site, then delegates cookie restore
-  /// to the real engine. Both the conflict-finding and restore steps go
-  /// through the production engines so the harness can't drift from prod.
+  /// Mirrors `SiteActivationController.setCurrentIndex`: bumps the version, runs the
+  /// activation's residency plan, then delegates cookie restore to the real
+  /// engine, so the harness can't drift from prod.
   Future<void> switchToSite(int index) async {
     if (index < 0 || index >= sites.length) return;
     final v = ++version;
 
-    final conflictIndex = SiteActivationEngine.findDomainConflict(
-      targetIndex: index,
-      models: sites,
-      loadedIndices: loadedIndices,
-    );
-    if (conflictIndex != null) {
-      await engine.unloadSiteForDomainSwitch(
-        index: conflictIndex,
-        models: sites,
-        loadedIndices: loadedIndices,
-      );
-      if (v != version) return;
+    final plan = SiteUnloadEngine.plan(this, event: Activating(index));
+    if (!await SiteUnloadEngine.apply(this, plan: plan,
+        isStale: () => v != version)) {
+      return;
     }
 
     await engine.restoreCookiesForSite(
@@ -295,7 +95,7 @@ class CookieIsolationTestHarness {
     loadedIndices.add(index);
   }
 
-  /// Mirrors `_deleteSite` cookie/storage/state bookkeeping.
+  /// Mirrors `SiteEditingController.deleteSite` cookie/storage/state bookkeeping.
   Future<void> deleteSite(int index) async {
     final deletedModel = sites[index];
     await engine.preDeleteCookieCleanup(
@@ -305,26 +105,14 @@ class CookieIsolationTestHarness {
       loadedIndices: loadedIndices,
     );
 
-    sites.removeAt(index);
-    loadedIndices.remove(index);
-    loadedIndices.removeWhere((i) => i >= sites.length);
-    final shifted = loadedIndices.map((i) => i > index ? i - 1 : i).toSet();
-    loadedIndices
-      ..clear()
-      ..addAll(shifted);
-
-    if (currentIndex == index) {
-      currentIndex = null;
-    } else if (currentIndex != null && currentIndex! > index) {
-      currentIndex = currentIndex! - 1;
-    }
+    removeSiteAt(index);
 
     await storage.removeOrphanedCookies(
       sites.map((s) => s.siteId).toSet(),
     );
   }
 
-  /// Mirrors the startup GC in `_restoreAppState`: orphan sweep on
+  /// Mirrors the startup GC in `StartupController.restore`: orphan sweep on
   /// encrypted storage, then nuke the native cookie jar before first
   /// activation. Call this after seeding prior-session cookies to verify
   /// they don't leak into the next activated site.
@@ -357,18 +145,12 @@ class CookieIsolationTestHarness {
   /// leak scenario the fix targets.
   Future<void> simulateSitePurgedFromPriorSession(int index) async {
     final model = sites[index];
-    await storage.saveCookiesForSite(model.siteId, const []);
-    sites.removeAt(index);
-    loadedIndices.remove(index);
-    loadedIndices.removeWhere((i) => i >= sites.length);
-    final shifted = loadedIndices.map((i) => i > index ? i - 1 : i).toSet();
-    loadedIndices
-      ..clear()
-      ..addAll(shifted);
+    await storage.saveCookiesForSite(model.siteId, cookies: const []);
+    removeSiteAt(index);
   }
 
   /// Simulate a site receiving cookies (e.g., after login).
-  Future<void> simulateLogin(int index, List<Cookie> cookies) async {
+  Future<void> simulateLogin(int index, {required List<Cookie> cookies}) async {
     if (index < 0 || index >= sites.length) return;
     final model = sites[index];
     final url = Uri.parse(model.initUrl);
@@ -432,7 +214,7 @@ void main() {
       expect(harness.loadedIndices, contains(0));
 
       // Simulate login on site 0
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'user1_session', domain: 'github.com'),
         Cookie(name: 'user_id', value: '111', domain: 'github.com'),
       ]);
@@ -447,7 +229,7 @@ void main() {
       expect(harness.loadedIndices, containsAll([0, 2]));
 
       // Simulate login on site 2
-      await harness.simulateLogin(2, [
+      await harness.simulateLogin(2, cookies: [
         Cookie(name: 'gitlab_session', value: 'gitlab_abc', domain: 'gitlab.com'),
       ]);
 
@@ -482,7 +264,7 @@ void main() {
       expect(site2Saved[0].value, equals('gitlab_abc'));
 
       // Step 4: Login on site 1 (github user2)
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'session', value: 'user2_session', domain: 'github.com'),
         Cookie(name: 'user_id', value: '222', domain: 'github.com'),
       ]);
@@ -517,17 +299,17 @@ void main() {
 
       // Load all three sites
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'gh_session', value: 'gh123', domain: 'github.com'),
       ]);
 
       await harness.switchToSite(1);
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'gl_session', value: 'gl456', domain: 'gitlab.com'),
       ]);
 
       await harness.switchToSite(2);
-      await harness.simulateLogin(2, [
+      await harness.simulateLogin(2, cookies: [
         Cookie(name: 'bb_session', value: 'bb789', domain: 'bitbucket.org'),
       ]);
 
@@ -543,7 +325,7 @@ void main() {
       harness.addSite('https://gist.github.com', name: 'GitHub Gist');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'main_session', value: 'main123', domain: 'github.com'),
       ]);
 
@@ -570,7 +352,7 @@ void main() {
       ));
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'normal123', domain: 'github.com'),
       ]);
 
@@ -593,14 +375,14 @@ void main() {
 
       // Login to account 1
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'user', value: 'account1', domain: 'github.com'),
         Cookie(name: 'token', value: 'token_a1', domain: 'github.com'),
       ]);
 
       // Switch to account 2
       await harness.switchToSite(1);
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'user', value: 'account2', domain: 'github.com'),
         Cookie(name: 'token', value: 'token_a2', domain: 'github.com'),
       ]);
@@ -627,7 +409,7 @@ void main() {
 
       // Login to existing account
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'existing_session', domain: 'github.com'),
       ]);
 
@@ -660,13 +442,13 @@ void main() {
 
       // Load GitLab first
       await harness.switchToSite(2);
-      await harness.simulateLogin(2, [
+      await harness.simulateLogin(2, cookies: [
         Cookie(name: 'gitlab_auth', value: 'gl_token', domain: 'gitlab.com'),
       ]);
 
       // Load GitHub 1
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'github_auth', value: 'gh_user1', domain: 'github.com'),
       ]);
 
@@ -690,7 +472,7 @@ void main() {
       expect(gh1Saved.any((c) => c.value == 'gh_user1'), isTrue);
 
       // Login to GitHub 2
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'github_auth', value: 'gh_user2', domain: 'github.com'),
       ]);
 
@@ -698,6 +480,43 @@ void main() {
       var ghCookies = await harness.cookieManager.getCookies(url: Uri.parse('https://github.com'));
       expect(ghCookies.any((c) => c.value == 'gh_user2'), isTrue);
       expect(ghCookies.any((c) => c.value == 'gh_user1'), isFalse);
+    });
+  });
+
+  group('Unload (ISO-002)', () {
+    // Every activation empties the shared jar after saving it for the
+    // loaded sites only, so an unloaded site keeps what it set since its own
+    // activation only if its unload captured the jar first. The webspace
+    // switch once unloaded without that capture.
+    for (final reason in UnloadReason.values) {
+      test('a ${reason.label} unload keeps the session the site just set',
+          () async {
+        final harness = CookieIsolationTestHarness();
+        harness.addSite('https://github.com', name: 'GitHub');
+        harness.addSite('https://example.com', name: 'Example');
+        await harness.switchToSite(0);
+        await harness.simulateLogin(0, cookies: [
+          Cookie(name: 'session', value: 'fresh', domain: 'github.com'),
+        ]);
+
+        await harness.unload(0, reason: reason);
+        expect(harness.loadedIndices, isNot(contains(0)));
+        await harness.switchToSite(1);
+
+        final saved =
+            await harness.storage.loadCookiesForSite(harness.sites[0].siteId);
+        expect(saved.map((c) => c.value), contains('fresh'));
+      });
+    }
+
+    test('a domain-conflict unload keeps the back stack (PAUSE-007)',
+        () async {
+      final harness = CookieIsolationTestHarness();
+      harness.addSite('https://github.com/personal', name: 'Personal');
+      harness.addSite('https://github.com/work', name: 'Work');
+      await harness.switchToSite(0);
+      await harness.switchToSite(1);
+      expect(harness.navStateCaptured, [harness.sites[0]]);
     });
   });
 
@@ -712,7 +531,7 @@ void main() {
       harness.addSite('https://linkedin.com', name: 'LinkedIn');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'li_at', value: 'auth_token', domain: 'linkedin.com'),
         Cookie(name: 'JSESSIONID', value: 'session123', domain: 'linkedin.com'),
       ]);
@@ -722,7 +541,8 @@ void main() {
       expect(cookies, hasLength(2));
 
       final siteId = harness.sites[0].siteId;
-      await harness.storage.saveCookiesForSite(siteId, harness.sites[0].cookies);
+      await harness.storage
+          .saveCookiesForSite(siteId, cookies: harness.sites[0].cookies);
 
       // Delete the site
       await harness.deleteSite(0);
@@ -736,23 +556,40 @@ void main() {
       expect(stored, isEmpty);
     });
 
+    test('deleting a site keeps a loaded site after it loaded at its new index', () async {
+      harness.addSite('https://github.com', name: 'A');
+      harness.addSite('https://example.com', name: 'B');
+      harness.addSite('https://gitlab.com', name: 'C');
+      await harness.switchToSite(0);
+      await harness.switchToSite(2);
+      final c = harness.sites[2];
+
+      await harness.deleteSite(0);
+
+      expect(harness.sites.indexOf(c), 1);
+      expect(harness.loadedIndices, {1});
+      expect(harness.currentIndex, 1);
+    });
+
     test('deleting one of multiple same-domain sites preserves surviving site live session', () async {
       harness.addSite('https://github.com/personal', name: 'GitHub Personal');
       harness.addSite('https://github.com/work', name: 'GitHub Work');
 
       // Login to personal account
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'personal_session', domain: 'github.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[0].siteId, harness.sites[0].cookies);
+      await harness.storage.saveCookiesForSite(harness.sites[0].siteId,
+          cookies: harness.sites[0].cookies);
 
       // Switch to work account (unloads personal, restores work's)
       await harness.switchToSite(1);
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'session', value: 'work_session', domain: 'github.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[1].siteId, harness.sites[1].cookies);
+      await harness.storage.saveCookiesForSite(harness.sites[1].siteId,
+          cookies: harness.sites[1].cookies);
 
       final personalSiteId = harness.sites[0].siteId;
       final workSiteId = harness.sites[1].siteId;
@@ -781,10 +618,11 @@ void main() {
       harness.addSite('https://linkedin.com', name: 'LinkedIn');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'li_at', value: 'auth_token', domain: 'linkedin.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[0].siteId, harness.sites[0].cookies);
+      await harness.storage.saveCookiesForSite(harness.sites[0].siteId,
+          cookies: harness.sites[0].cookies);
 
       // Delete
       await harness.deleteSite(0);
@@ -806,15 +644,16 @@ void main() {
       harness.addSite('https://gitlab.com', name: 'GitLab');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'gh_session', value: 'gh123', domain: 'github.com'),
       ]);
 
       await harness.switchToSite(1);
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'gl_session', value: 'gl456', domain: 'gitlab.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[1].siteId, harness.sites[1].cookies);
+      await harness.storage.saveCookiesForSite(harness.sites[1].siteId,
+          cookies: harness.sites[1].cookies);
 
       final gitlabSiteId = harness.sites[1].siteId;
 
@@ -872,7 +711,7 @@ void main() {
 
       // Login to app 1
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'app1_session', domain: '192.168.1.1'),
       ]);
 
@@ -896,17 +735,17 @@ void main() {
       harness.addSite('http://10.0.0.1:3000', name: 'Server 3');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 's1', value: 'server1', domain: '192.168.1.1'),
       ]);
 
       await harness.switchToSite(1);
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 's2', value: 'server2', domain: '192.168.1.2'),
       ]);
 
       await harness.switchToSite(2);
-      await harness.simulateLogin(2, [
+      await harness.simulateLogin(2, cookies: [
         Cookie(name: 's3', value: 'server3', domain: '10.0.0.1'),
       ]);
 
@@ -920,12 +759,12 @@ void main() {
       harness.addSite('https://github.com', name: 'GitHub');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'local', value: 'local_session', domain: '192.168.1.1'),
       ]);
 
       await harness.switchToSite(1);
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'gh', value: 'github_session', domain: 'github.com'),
       ]);
 
@@ -960,7 +799,7 @@ void main() {
       harness.addSite('https://github.com', name: 'GitHub');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'gh_token', domain: 'github.com'),
       ]);
 
@@ -975,7 +814,7 @@ void main() {
       harness.addSite('https://github.com', name: 'GitHub');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'gh_token', domain: 'github.com'),
       ]);
 
@@ -998,7 +837,7 @@ void main() {
 
       // Login to user1
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'user1_token', domain: 'github.com'),
       ]);
 
@@ -1026,7 +865,7 @@ void main() {
       harness.addSite('https://gitlab.com', name: 'GitLab');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'gh', value: 'gh_token', domain: 'github.com'),
       ]);
 
@@ -1054,10 +893,11 @@ void main() {
       harness.addSite('https://github.com', name: 'GitHub');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'session', value: 'gh_token', domain: 'github.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[0].siteId, harness.sites[0].cookies);
+      await harness.storage.saveCookiesForSite(harness.sites[0].siteId,
+          cookies: harness.sites[0].cookies);
 
       harness.simulateAppRestart();
 
@@ -1070,7 +910,7 @@ void main() {
 
       // Pre-populate secure storage (as if saved before the restart)
       final siteId = harness.sites[0].siteId;
-      await harness.storage.saveCookiesForSite(siteId, [
+      await harness.storage.saveCookiesForSite(siteId, cookies: [
         Cookie(name: 'session', value: 'persisted_token', domain: 'github.com'),
       ]);
 
@@ -1092,10 +932,12 @@ void main() {
       harness.addSite('https://github.com/user2', name: 'GitHub User2');
 
       // Simulate cookies saved before restart
-      await harness.storage.saveCookiesForSite(harness.sites[0].siteId, [
+      await harness.storage
+          .saveCookiesForSite(harness.sites[0].siteId, cookies: [
         Cookie(name: 'session', value: 'user1_token', domain: 'github.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[1].siteId, [
+      await harness.storage
+          .saveCookiesForSite(harness.sites[1].siteId, cookies: [
         Cookie(name: 'session', value: 'user2_token', domain: 'github.com'),
       ]);
 
@@ -1124,10 +966,12 @@ void main() {
       harness.addSite('https://github.com', name: 'GitHub');
       harness.addSite('https://gitlab.com', name: 'GitLab');
 
-      await harness.storage.saveCookiesForSite(harness.sites[0].siteId, [
+      await harness.storage
+          .saveCookiesForSite(harness.sites[0].siteId, cookies: [
         Cookie(name: 'gh', value: 'gh_token', domain: 'github.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[1].siteId, [
+      await harness.storage
+          .saveCookiesForSite(harness.sites[1].siteId, cookies: [
         Cookie(name: 'gl', value: 'gl_token', domain: 'gitlab.com'),
       ]);
 
@@ -1293,7 +1137,7 @@ void main() {
       expect(gmailStored.any((c) => c.name == 'SSID' && c.value == 'google_sso'), isTrue,
           reason: 'precondition: Gmail\'s SSID captured on switch-away');
 
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'gh_session', value: 'gh_token', domain: 'github.com'),
       ]);
 
@@ -1318,7 +1162,7 @@ void main() {
   // behavior so a future "capture is complete" assumption is caught.
   //
   // This is a legacy-engine (fallback) limitation ONLY. The container engine
-  // — the default for Android SW 110+, iOS 17+, macOS 14+, Linux WPE 2.40+,
+  // — the default for Android `MULTI_PROFILE`, iOS 17+, macOS 14+, Linux WPE 2.40+,
   // i.e. most users — keeps each site's cookies in its own native store and
   // never runs this capture-nuke-restore, so it does not lose them.
   // ==========================================================================
@@ -1400,7 +1244,7 @@ void main() {
       harness.addSite('https://github.com', name: 'GitHub');
 
       await harness.switchToSite(0);
-      await harness.simulateLogin(0, [
+      await harness.simulateLogin(0, cookies: [
         Cookie(name: 'ex', value: 'ex_val', domain: 'example.com'),
       ]);
       final exampleSiteId = harness.sites[0].siteId;
@@ -1408,15 +1252,16 @@ void main() {
       // Persist GitHub's login directly to storage — mirrors what the
       // production `onCookiesChanged` handler would do on a real page load.
       await harness.switchToSite(1);
-      await harness.simulateLogin(1, [
+      await harness.simulateLogin(1, cookies: [
         Cookie(name: 'gh', value: 'gh_val', domain: 'github.com'),
       ]);
       final githubSiteId = harness.sites[1].siteId;
-      await harness.storage.saveCookiesForSite(githubSiteId, harness.sites[1].cookies);
+      await harness.storage
+          .saveCookiesForSite(githubSiteId, cookies: harness.sites[1].cookies);
 
       // Seed a stale entry to prove the orphan sweep actually runs on delete.
       const stale = 'stale-from-prior-session';
-      await harness.storage.saveCookiesForSite(stale, [
+      await harness.storage.saveCookiesForSite(stale, cookies: [
         Cookie(name: 'x', value: 'y', domain: 'deleted.example.com'),
       ]);
       expect(harness.storage.allStorage.keys,
@@ -1438,13 +1283,14 @@ void main() {
 
       // Seed a real entry for the live site (production's onCookiesChanged
       // handler would save after a page load).
-      await harness.storage.saveCookiesForSite(liveSiteId, [
+      await harness.storage.saveCookiesForSite(liveSiteId, cookies: [
         Cookie(name: 'live', value: 'v', domain: 'example.com'),
       ]);
 
       // Seed a stale entry as if a site was deleted in a prior session
       // without the orphan sweep ever running (pre-fix state).
-      await harness.storage.saveCookiesForSite('stale-site-id-from-prior-session', [
+      await harness.storage
+          .saveCookiesForSite('stale-site-id-from-prior-session', cookies: [
         Cookie(name: 'leftover', value: 'old', domain: 'deleted.example.com'),
       ]);
       expect(harness.storage.allStorage.keys,
@@ -1510,10 +1356,12 @@ void main() {
       harness.addSite('https://github.com', name: 'GitHub');
 
       // Seed per-site storage so each activation has something to restore.
-      await harness.storage.saveCookiesForSite(harness.sites[0].siteId, [
+      await harness.storage
+          .saveCookiesForSite(harness.sites[0].siteId, cookies: [
         Cookie(name: 'ex', value: 'example_persisted', domain: 'example.com'),
       ]);
-      await harness.storage.saveCookiesForSite(harness.sites[1].siteId, [
+      await harness.storage
+          .saveCookiesForSite(harness.sites[1].siteId, cookies: [
         Cookie(name: 'gh', value: 'github_persisted', domain: 'github.com'),
       ]);
 
@@ -1542,7 +1390,8 @@ void main() {
 
     test('current activation completes when version is stable', () async {
       harness.addSite('https://example.com', name: 'Example');
-      await harness.storage.saveCookiesForSite(harness.sites[0].siteId, [
+      await harness.storage
+          .saveCookiesForSite(harness.sites[0].siteId, cookies: [
         Cookie(name: 'ex', value: 'example_val', domain: 'example.com'),
       ]);
 
@@ -1569,42 +1418,70 @@ void main() {
     Cookie c(String? domain) => Cookie(name: 'x', value: 'y', domain: domain);
 
     test('exact match', () {
-      expect(cookieMatchesBaseDomain(c('google.com'), 'google.com'), isTrue);
+      expect(cookieMatchesBaseDomain(c('google.com'), baseDomain: 'google.com'),
+          isTrue);
     });
 
     test('subdomain match', () {
-      expect(cookieMatchesBaseDomain(c('mail.google.com'), 'google.com'), isTrue);
-      expect(cookieMatchesBaseDomain(c('accounts.google.com'), 'google.com'), isTrue);
+      expect(
+          cookieMatchesBaseDomain(c('mail.google.com'),
+              baseDomain: 'google.com'),
+          isTrue);
+      expect(
+          cookieMatchesBaseDomain(c('accounts.google.com'),
+              baseDomain: 'google.com'),
+          isTrue);
     });
 
     test('leading-dot domain match', () {
-      expect(cookieMatchesBaseDomain(c('.google.com'), 'google.com'), isTrue);
+      expect(
+          cookieMatchesBaseDomain(c('.google.com'), baseDomain: 'google.com'),
+          isTrue);
     });
 
     test('case-insensitive', () {
-      expect(cookieMatchesBaseDomain(c('Mail.GOOGLE.com'), 'GOOGLE.com'), isTrue);
+      expect(
+          cookieMatchesBaseDomain(c('Mail.GOOGLE.com'),
+              baseDomain: 'GOOGLE.com'),
+          isTrue);
     });
 
     test('no match on unrelated domain', () {
-      expect(cookieMatchesBaseDomain(c('googlethief.com'), 'google.com'), isFalse);
-      expect(cookieMatchesBaseDomain(c('evilgoogle.com'), 'google.com'), isFalse);
+      expect(
+          cookieMatchesBaseDomain(c('googlethief.com'),
+              baseDomain: 'google.com'),
+          isFalse);
+      expect(
+          cookieMatchesBaseDomain(c('evilgoogle.com'),
+              baseDomain: 'google.com'),
+          isFalse);
     });
 
     test('null / empty domain never matches', () {
-      expect(cookieMatchesBaseDomain(c(null), 'google.com'), isFalse);
-      expect(cookieMatchesBaseDomain(c(''), 'google.com'), isFalse);
-      expect(cookieMatchesBaseDomain(c('google.com'), ''), isFalse);
+      expect(
+          cookieMatchesBaseDomain(c(null), baseDomain: 'google.com'), isFalse);
+      expect(cookieMatchesBaseDomain(c(''), baseDomain: 'google.com'), isFalse);
+      expect(cookieMatchesBaseDomain(c('google.com'), baseDomain: ''), isFalse);
     });
 
     test('multi-part TLD', () {
-      expect(cookieMatchesBaseDomain(c('bbc.co.uk'), 'bbc.co.uk'), isTrue);
-      expect(cookieMatchesBaseDomain(c('news.bbc.co.uk'), 'bbc.co.uk'), isTrue);
-      expect(cookieMatchesBaseDomain(c('bbc.co.uk'), 'amazon.co.uk'), isFalse);
+      expect(cookieMatchesBaseDomain(c('bbc.co.uk'), baseDomain: 'bbc.co.uk'),
+          isTrue);
+      expect(
+          cookieMatchesBaseDomain(c('news.bbc.co.uk'), baseDomain: 'bbc.co.uk'),
+          isTrue);
+      expect(
+          cookieMatchesBaseDomain(c('bbc.co.uk'), baseDomain: 'amazon.co.uk'),
+          isFalse);
     });
 
     test('IP address', () {
-      expect(cookieMatchesBaseDomain(c('192.168.1.1'), '192.168.1.1'), isTrue);
-      expect(cookieMatchesBaseDomain(c('192.168.1.2'), '192.168.1.1'), isFalse);
+      expect(
+          cookieMatchesBaseDomain(c('192.168.1.1'), baseDomain: '192.168.1.1'),
+          isTrue);
+      expect(
+          cookieMatchesBaseDomain(c('192.168.1.2'), baseDomain: '192.168.1.1'),
+          isFalse);
     });
   });
 }

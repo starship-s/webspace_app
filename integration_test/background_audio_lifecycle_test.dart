@@ -33,16 +33,17 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webspace/main.dart' as app;
-import 'package:webspace/demo_data.dart';
+import 'package:webspace/settings/demo_mode.dart';
 import 'package:webspace/services/log_service.dart';
 import 'package:webspace/web_view_model.dart';
 import 'package:webspace/webspace_model.dart';
 import 'dart:convert';
 
 import 'fixtures/background_audio_fixture.dart';
+import 'fixture_server.dart';
 
 class _Beacon {
-  _Beacon(this.at, this.ticks, this.audioState);
+  _Beacon(this.at, {required this.ticks, required this.audioState});
   final DateTime at;
   final int ticks;
   final String audioState;
@@ -68,12 +69,12 @@ void main() {
   setUpAll(() async {
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     port = server.port;
-    server.listen((req) {
+    listenFixture(server, onEvent: (req) {
       if (req.uri.path == '/beacon') {
         beacons.add(_Beacon(
           DateTime.now(),
-          int.tryParse(req.uri.queryParameters['ticks'] ?? '') ?? -1,
-          req.uri.queryParameters['audio'] ?? '?',
+          ticks: int.tryParse(req.uri.queryParameters['ticks'] ?? '') ?? -1,
+          audioState: req.uri.queryParameters['audio'] ?? '?',
         ));
         req.response
           ..statusCode = 204

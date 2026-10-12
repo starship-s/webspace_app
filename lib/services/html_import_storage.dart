@@ -1,9 +1,20 @@
+import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:convert';
-import 'dart:typed_data';
 import 'package:webspace/services/file_store.dart';
+import 'package:webspace/services/keychain_aead.dart';
+import 'package:webspace/services/keystore.dart';
 import 'package:webspace/services/log_service.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
-import 'package:encrypt/encrypt.dart' as encrypt;
+import 'package:webspace/services/html_cache_service.dart';
+
+/// The site an imported HTML file becomes, named after the file without its
+/// extension. Three slashes (empty authority): `file://name.html` parses the
+/// name as the host, and Chromium rejects that as ERR_INVALID_URL whenever
+/// the stored HTML is unavailable.
+({String url, String name}) importedFileSite(String fileName) => (
+      url: 'file:///$fileName',
+      name: fileName.replaceAll(RegExp(r'\.html?$', caseSensitive: false), ''),
+    );
 
 /// Persistent AES-encrypted storage for user-imported HTML files.
 ///
@@ -24,15 +35,14 @@ class HtmlImportStorage {
   HtmlImportStorage({
     FlutterSecureStorage? secureStorage,
     FileStore? store,
-  })  : _secureStorage = secureStorage ?? const FlutterSecureStorage(),
+  })  : _secureStorage = secureStorage ?? Keystores.aeadKeys,
         _overrideStore = store;
 
   final FlutterSecureStorage _secureStorage;
   final FileStore? _overrideStore;
 
   FileStore? _store;
-  encrypt.Encrypter? _encrypter;
-  encrypt.IV? _iv;
+  KeychainAead? _aead;
 
   /// In-memory mirror used by [getHtmlSync] so [InAppWebViewInitialData]
   /// can be constructed without an awaited disk read at build time.
@@ -41,7 +51,8 @@ class HtmlImportStorage {
   Future<void> initialize() async {
     _store = _overrideStore ?? defaultFileStore(_storageDir);
 
-    await _initEncryption();
+    _aead = await KeychainAead.open(_secureStorage, keyName: _encryptionKeyKey,
+        logTag: LogTag.htmlImport);
 
     await _store!.ensure();
   }
@@ -61,45 +72,34 @@ class HtmlImportStorage {
     if (res != null) _memoryStore[siteId] = res.$2;
   }
 
-  Future<void> _initEncryption() async {
-    try {
-      String? keyBase64 = await _secureStorage.read(key: _encryptionKeyKey);
-
-      if (keyBase64 == null) {
-        final key = encrypt.Key.fromSecureRandom(32);
-        keyBase64 = base64.encode(key.bytes);
-        await _secureStorage.write(key: _encryptionKeyKey, value: keyBase64);
-        LogService.instance.log('HtmlImport', 'Generated new encryption key', level: LogLevel.info);
-      }
-
-      final keyBytes = base64.decode(keyBase64);
-      final key = encrypt.Key(Uint8List.fromList(keyBytes));
-      _iv = encrypt.IV(Uint8List.fromList(keyBytes.sublist(0, 16)));
-      _encrypter = encrypt.Encrypter(encrypt.AES(key, mode: encrypt.AESMode.cbc));
-
-      LogService.instance.log('HtmlImport', 'Encryption initialized');
-    } catch (e) {
-      LogService.instance.log('HtmlImport', 'Error initializing encryption: $e', level: LogLevel.error);
-    }
-  }
-
-  String? _encrypt(String plaintext) {
-    if (_encrypter == null || _iv == null) return null;
-    try {
-      return _encrypter!.encrypt(plaintext, iv: _iv).base64;
-    } catch (e) {
-      LogService.instance.log('HtmlImport', 'Encryption error: $e', level: LogLevel.error);
+  /// Decrypts a stored blob, reporting whether it was still in the AES-CBC
+  /// form imports used before GCM, so the caller can reseal it. Imports are
+  /// the user's only copy, so those blobs stay readable.
+  ({String plaintext, bool legacy})? _decrypt(String wire) {
+    final aead = _aead;
+    if (aead == null) return null;
+    final sealed = aead.unseal(wire);
+    if (sealed != null) return (plaintext: sealed, legacy: false);
+    final legacy = aead.unsealLegacyCbc(wire);
+    if (legacy == null) {
+      LogTag.htmlImport.error('Import does not decrypt');
       return null;
     }
+    return (plaintext: legacy, legacy: true);
   }
 
-  String? _decrypt(String ciphertext) {
-    if (_encrypter == null || _iv == null) return null;
+  /// Rewrites a legacy AES-CBC blob under GCM. Best-effort: a failure leaves
+  /// the readable legacy file in place.
+  Future<void> _upgradeBlob(String siteId, {required String plaintext}) async {
+    final store = _store;
+    final aead = _aead;
+    if (store == null || aead == null) return;
     try {
-      return _encrypter!.decrypt64(ciphertext, iv: _iv);
-    } catch (e) {
-      LogService.instance.log('HtmlImport', 'Decryption error: $e', level: LogLevel.error);
-      return null;
+      await store.writeText(_importFileName(siteId),
+          contents: aead.seal(plaintext));
+    } on Exception catch (e) {
+      LogTag.htmlImport.warning(
+          'Could not re-encrypt import for $siteId: $e', sensitive: true);
     }
   }
 
@@ -116,11 +116,14 @@ class HtmlImportStorage {
             final encrypted = await store.readText(name);
             final decrypted = encrypted == null ? null : _decrypt(encrypted);
             if (decrypted != null) {
-              final newlineIndex = decrypted.indexOf('\n');
+              final newlineIndex = decrypted.plaintext.indexOf('\n');
               if (newlineIndex != -1) {
                 final siteId = name.replaceAll('.enc', '');
-                final html = decrypted.substring(newlineIndex + 1);
+                final html = decrypted.plaintext.substring(newlineIndex + 1);
                 _memoryStore[siteId] = html;
+                if (decrypted.legacy) {
+                  await _upgradeBlob(siteId, plaintext: decrypted.plaintext);
+                }
               } else {
                 // Imports are the only copy of user-supplied data — never
                 // delete on parse failure. The fallback page renders if the
@@ -128,37 +131,29 @@ class HtmlImportStorage {
                 // the AES key is recoverable (e.g. flutter_secure_storage
                 // returns the original key on a later launch after a
                 // transient Android Keystore read failure).
-                LogService.instance.log(
-                  'HtmlImport',
-                  'Skipping invalid import file (kept on disk): $name',
-                  level: LogLevel.warning,
-                  sensitivity: LogSensitivity.sensitive,
-                );
+                LogTag.htmlImport.warning(
+                    'Skipping invalid import file (kept on disk): $name',
+                    sensitive: true);
                 skipped++;
               }
             } else {
-              LogService.instance.log(
-                'HtmlImport',
-                'Skipping undecryptable import file (kept on disk): $name',
-                level: LogLevel.warning,
-                sensitivity: LogSensitivity.sensitive,
-              );
+              LogTag.htmlImport.warning(
+                  'Skipping undecryptable import file (kept on disk): $name',
+                  sensitive: true);
               skipped++;
             }
-          } catch (e) {
-            LogService.instance.log(
-              'HtmlImport',
-              'Skipping unreadable import file (kept on disk): $name ($e)',
-              level: LogLevel.warning,
-              sensitivity: LogSensitivity.sensitive,
-            );
+          } on Exception catch (e) {
+            LogTag.htmlImport.warning(
+                'Skipping unreadable import file (kept on disk): $name ($e)',
+                sensitive: true);
             skipped++;
           }
         }
       }
-      LogService.instance.log('HtmlImport', 'Pre-loaded ${_memoryStore.length} imported pages (skipped $skipped unreadable file(s))');
-    } catch (e) {
-      LogService.instance.log('HtmlImport', 'Error pre-loading imports: $e', level: LogLevel.error);
+      LogTag.htmlImport.debug(
+          'Pre-loaded ${_memoryStore.length} imported pages (skipped $skipped unreadable file(s))');
+    } on Exception catch (e) {
+      LogTag.htmlImport.error('Error pre-loading imports: $e');
     }
   }
 
@@ -173,46 +168,36 @@ class HtmlImportStorage {
   /// the same 10 MB ceiling.
   static const int _maxHtmlSize = 10 * 1024 * 1024;
 
-  Future<void> saveHtml(String siteId, String html, String url) async {
+  Future<void> saveHtml(String siteId,
+      {required String html, required String url}) async {
     final store = _store;
-    if (store == null || _encrypter == null) return;
+    final aead = _aead;
+    if (store == null || aead == null) return;
 
     if (html.length > _maxHtmlSize) {
-      LogService.instance.log(
-        'HtmlImport',
-        'Skipping save for $siteId - HTML too large (${html.length} bytes > $_maxHtmlSize)',
-        level: LogLevel.warning,
-        sensitivity: LogSensitivity.sensitive,
-      );
+      LogTag.htmlImport.warning(
+          'Skipping save for $siteId - HTML too large (${html.length} bytes > $_maxHtmlSize)',
+          sensitive: true);
       return;
     }
 
     try {
-      final plaintext = '$url\n$html';
-      final encrypted = _encrypt(plaintext);
-      if (encrypted == null) return;
-
-      await store.writeText(_importFileName(siteId), encrypted);
+      await store.writeText(_importFileName(siteId),
+          contents: aead.seal('$url\n$html'));
       _memoryStore[siteId] = html;
 
-      LogService.instance.log(
-        'HtmlImport',
-        'Saved ${html.length} bytes for site $siteId (encrypted)',
-        sensitivity: LogSensitivity.sensitive,
-      );
-    } catch (e) {
-      LogService.instance.log(
-        'HtmlImport',
-        'Error saving HTML for $siteId: $e',
-        level: LogLevel.error,
-        sensitivity: LogSensitivity.sensitive,
-      );
+      LogTag.htmlImport.debug(
+          'Saved ${html.length} bytes for site $siteId (encrypted)',
+          sensitive: true);
+    } on Exception catch (e) {
+      LogTag.htmlImport
+          .error('Error saving HTML for $siteId: $e', sensitive: true);
     }
   }
 
   Future<(String, String)?> loadHtml(String siteId) async {
     final store = _store;
-    if (store == null || _encrypter == null) return null;
+    if (store == null || _aead == null) return null;
 
     try {
       final encrypted = await store.readText(_importFileName(siteId));
@@ -221,20 +206,20 @@ class HtmlImportStorage {
       final decrypted = _decrypt(encrypted);
       if (decrypted == null) return null;
 
-      final newlineIndex = decrypted.indexOf('\n');
+      final newlineIndex = decrypted.plaintext.indexOf('\n');
       if (newlineIndex == -1) return null;
 
-      final url = decrypted.substring(0, newlineIndex);
-      final html = decrypted.substring(newlineIndex + 1);
+      if (decrypted.legacy) {
+        await _upgradeBlob(siteId, plaintext: decrypted.plaintext);
+      }
+
+      final url = decrypted.plaintext.substring(0, newlineIndex);
+      final html = decrypted.plaintext.substring(newlineIndex + 1);
 
       return (url, html);
-    } catch (e) {
-      LogService.instance.log(
-        'HtmlImport',
-        'Error loading HTML for $siteId: $e',
-        level: LogLevel.error,
-        sensitivity: LogSensitivity.sensitive,
-      );
+    } on Exception catch (e) {
+      LogTag.htmlImport.error(
+          'Error loading HTML for $siteId: $e', sensitive: true);
       return null;
     }
   }
@@ -263,14 +248,55 @@ class HtmlImportStorage {
         if (!activeSiteIds.contains(siteId)) {
           await store.delete(name);
           _memoryStore.remove(siteId);
-          LogService.instance.log(
-            'HtmlImport',
-            'Removed orphaned import for $siteId',
-            level: LogLevel.info,
-            sensitivity: LogSensitivity.sensitive,
-          );
+          LogTag.htmlImport.info(
+              'Removed orphaned import for $siteId', sensitive: true);
         }
       }
+    }
+  }
+
+  /// One-shot migration: copy file-import HTML out of [HtmlCacheService]
+  /// into [HtmlImportStorage] before the cache wipes itself on app
+  /// upgrade. Called from [HtmlCacheService.initialize] via the
+  /// `beforeUpgradeWipe` hook — at that point the cache's encryption is
+  /// initialized with the still-current key so [loadHtml] can decrypt.
+  ///
+  /// On a fresh install the WebViewModels list is absent and this is a
+  /// no-op. On every subsequent upgrade once imports stop landing in the
+  /// cache (this version onward), the lookup finds nothing and returns
+  /// silently — keeping the call wired keeps the path safe against
+  /// future regressions without behavioral cost.
+  static Future<void> migrateFromCache() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final raw = prefs.getStringList('webViewModels');
+      if (raw == null || raw.isEmpty) return;
+
+      var migrated = 0;
+      for (final entry in raw) {
+        try {
+          final m = jsonDecode(entry) as Map<String, dynamic>;
+          final initUrl = m['initUrl'] as String? ?? '';
+          if (!initUrl.startsWith('file://')) continue;
+          final siteId = m['siteId'] as String?;
+          if (siteId == null || siteId.isEmpty) continue;
+
+          if (await HtmlImportStorage.instance.hasImport(siteId)) continue;
+          final cached = await HtmlCacheService.instance.loadHtml(siteId);
+          if (cached == null) continue;
+          await HtmlImportStorage.instance
+              .saveHtml(siteId, html: cached.$2, url: cached.$1);
+          migrated++;
+        } catch (_) {
+          // Skip malformed entries — the cache wipe is happening either way.
+        }
+      }
+      if (migrated > 0) {
+        LogTag.htmlImport.info(
+            'Migrated $migrated file-import page(s) from cache to import storage');
+      }
+    } catch (e) {
+      LogTag.htmlImport.error('File-import migration failed: $e');
     }
   }
 }

@@ -1,9 +1,9 @@
 # BUG-001: White/black screen after returning to or navigating a webview (Android)
 
-**Status:** open (recurring — each fix has closed one entry path; new paths keep surfacing)
-**Platform:** Android only (hybrid-composition `SurfaceView`)
+**Status:** open (recurring — each fix has closed one entry path; new paths keep surfacing). Attempt 13 offers texture mode as a developer-mode experiment; open until a device that went white confirms it.
+**Platform:** Android only (hybrid composition; texture mode behind the Texture page rendering experiment since Attempt 13)
 **Spec:** [openspec/specs/webview-pause-lifecycle/spec.md](../../openspec/specs/webview-pause-lifecycle/spec.md) — requirements `PAUSE-013`…`PAUSE-028`
-**Formal model:** [formal/kernel.tla](../../formal/kernel.tla) — `RepaintLiveness` ("every blank-surface attach is eventually repainted"). The `kernel_conflict.cfg` demonstrator is a back path that bypasses the chokepoint — i.e. this exact bug — and TLC rejects it with a counterexample.
+**Formal models:** [formal/kernel.tla](../../formal/kernel.tla), [formal/warmstart.tla](../../formal/warmstart.tla), [formal/reloadlatch.tla](../../formal/reloadlatch.tla) — `RepaintLiveness` ("every blank-surface attach is eventually repainted"). The `kernel_conflict.cfg` demonstrator is a back path that bypasses the chokepoint — i.e. this exact bug — and TLC rejects it with a counterexample.
 
 ## Symptom
 
@@ -14,10 +14,16 @@ user just sees a dead-looking screen after some navigation or app-lifecycle even
 
 ## Root mechanism (the invariant behind every instance)
 
-On Android the webview is a **hybrid-composition `SurfaceView`**. That surface can
+On Android the webview runs under **hybrid composition** (confirmed: the fork
+defaults `useHybridComposition` to `true`, which routes to
+`PlatformViewsService.initExpensiveAndroidView`, "always creates a 'Hybrid
+Composition (HC)' view"). The surface backing the composited result can
 **re-attach (or newly attach) without receiving a paint**. The renderer is healthy,
 so nothing emits an error event; the compositor just never draws onto the new
-surface until something forces a relayout.
+surface until something forces a relayout. The `WebView` itself is an ordinary
+Android view in the hierarchy, not a `SurfaceView`; the surface that presents a
+stale frame is Flutter's own `FlutterImageView` overlay, which shows the last
+image it acquired and does not repaint on its own (see open gap #12).
 
 Two colors, two sub-causes:
 
@@ -30,16 +36,33 @@ Two colors, two sub-causes:
 A dead *renderer* (the process was actually killed) is a **different** bug — covered
 by `PAUSE-013`/`PAUSE-014` (detect via JS probe → destroy-and-rebuild). A JS
 `offsetHeight` read relayouts *web content*, not the Android surface, so it can
-**never** fix the blank-surface case. The remedy is a native platform-view
-relayout plus invalidation — see `_nudgeSurfaceRepaint`, which calls the fork's
-geometry-free `requestRepaint()` operation across several frames. Recovery does
-not require changing the WebView's dimensions.
+**never** fix the blank-surface case. The merged fork requests a native platform-view
+relayout and invalidation through `WebViewController.requestRepaint()`. The native
+operation does not change the WebView's dimensions.
 
-**Why it keeps recurring:** the fix is always "nudge the surface," but the *trigger*
-is "a code path that mounts/re-attaches a surface." Every fix has wired the nudge
-into one more such path. The bug resurfaces whenever a **new** path reaches a blank
-surface without passing through an already-nudged chokepoint. This is whack-a-mole
-until a single chokepoint covers every surface (re)attach.
+**Why it can recur:** no Dart trigger proves that Android composition completed.
+The merged fork keeps the existing activation, resume, navigation, route-return,
+load and manual recovery triggers, and adds native repaint calls when the Android
+view attaches or becomes visible. Those hooks reduce dependence on Dart path
+coverage, but device validation is still needed to show every relevant reattach is
+covered and that composition succeeds.
+
+### Merged fork follow-on — geometry-free repaint and native lifecycle hooks
+
+The fork carried two repaint changes into the merged tree. The first adds
+`InAppWebViewController.requestRepaint()` and calls it from the coalesced
+six-pulse recovery funnel; the second calls the native operation after
+`onAttachedToWindow()` and when `onWindowVisibilityChanged()` reports
+`View.VISIBLE`. The app pins `flutter_inappwebview_android` to
+`starship-s/flutter_inappwebview` commit
+`57b322872bb1a84283b908a56ab21acafd7cb77e`, which includes both changes. The
+main and nested WebViews use the same Dart wrapper, and the engine has no
+repaint-only inset or padding state. These fork changes supersede the 1px inset
+mechanism described in the upstream attempt history below; they do not prove
+that every device's compositor will recover.
+
+Upstream's texture-rendering experiment remains available as a separate
+developer-mode diagnostic. It does not replace the fork's native repaint path.
 
 ## Fix attempts (chronological — each closed one path, none closed the class)
 
@@ -254,56 +277,174 @@ diagnostic exists to establish that from a log. The route-return nudge also assu
 embedder actually detaches the platform view under an opaque route; if a Flutter version keeps
 it attached, the nudge is a harmless no-op rather than a fix.
 
-### Attempt 11 — Geometry-free native relayout + invalidation (`PAUSE-027`)
-**Date:** 2026-08-14 · **Files:** pubspec.yaml, pubspec.lock, lib/services/webview.dart,
-lib/services/surface_repaint_engine.dart, lib/main.dart, lib/screens/inappbrowser.dart,
-test/surface_repaint_engine_test.dart, test/webview_pause_lifecycle_test.dart,
-test/js/surface_repaint_funnel.test.js, openspec/specs/webview-pause-lifecycle/spec.md
-**What it did:** Pinned the existing `flutter_inappwebview` overrides to the
-`starship-s/flutter_inappwebview` fork at commit
-`643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64`, which adds
-`InAppWebViewController.requestRepaint()`. The native operation calls
-`WebView.requestLayout()` and `postInvalidateOnAnimation()` without changing
-dimensions. WebSpace exposes it through `WebViewController.requestRepaint()`;
-the main and nested hosts keep every existing trigger funnel and the coalesced
-six-pulse/100 ms loop, but each active tick invokes the currently attached
-controller instead of `setState` or repaint-only padding.
-**Why:** The old right-edge and earlier bottom-edge 1 px nudges caused visible
-horizontal or vertical wobble. Steady and transient WebView constraints are now
-identical, so the repaint mechanism cannot move the page area while it recovers
-the same live blank-surface class.
-**Why partial:** The engine and structural tests prove pulse count, coalescing,
-abort behavior, trigger coverage, wrapper invocation, and the cross-file
-geometry invariant. They cannot reach Android SurfaceFlinger. A physical device
-must still confirm both that repeated recovery produces no horizontal/vertical
-wobble and that a blank surface after resume, attach, back navigation, memory
-pressure, or reload is actually painted by the native relayout plus invalidation.
+### Attempt 11 — Bounded commit window + a manual repaint in the menu (`PAUSE-027`/`028`)
+**Date:** 2026-09-02 · **Files:** lib/services/surface_repaint_engine.dart, lib/main.dart,
+lib/screens/inappbrowser.dart, lib/web_view_model.dart, formal/reloadlatch.tla (+ cfgs,
+check.sh), test/surface_repaint_engine_test.dart, test/js/surface_repaint_funnel.test.js,
+lib/l10n/app_*.arb, openspec/specs/webview-pause-lifecycle/spec.md
+**What it did:** Three things, one report.
+(a) **The commit latch is a window, not a ticket** (`PAUSE-027`). `noteCommitPending`
+arms; `noteLoadSettled` (was `consumeLoadSettled`) repaints while armed and no longer
+disarms; both hosts arm through one `_armCommitLatch` helper that restarts a 15s timer
+(`SurfaceRepaintEngine.commitWindow`) and closes the window with `closeCommitWindow`,
+cancelled in `dispose`.
+(b) **A Repaint Screen entry in the three-dot menu** (`PAUSE-028`) in both webview screens:
+`_probeRendererAndRecover` then `_nudgeSurfaceRepaint` on the main page, nudge only in the
+nested screen, each emitting `trigger=manual` / `trigger=manual-nested`. Gated on Android
+**and** on a new developer-mode flag unlocked by seven taps on a Version row in App Settings
+(`developer-tools` DEVTOOLS-010), so the diagnostic is reachable on a release build without
+sitting in the menu an ordinary user opens to refresh a page.
+(c) **The loading bar reflects the tap.** `userDrivenReload` marks the model loading
+before it awaits the HTTP-cache clear, and takes a re-entrancy guard so a double tap
+issues one reload instead of two.
+(d) **Every repaint reports itself** (`PAUSE-029`). The `SurfaceDiag` line moved from a
+handful of call sites into `_nudgeSurfaceRepaint(trigger)`, which took a required label:
+6 of 26 nudges had been reporting, so `back`, `activate`, `memory-pressure`, `goHome`,
+both fullscreen toggles and the whole nested screen were dark. Gated on developer mode
+(an ordinary session must not spend `LogService`'s 2000-entry ring on it) and collapsed
+through `RepaintLogThrottle`, since `didChangeMetrics` and the funnel's own coalescing
+fire the same trigger many times a second. `DiagSeed` and the in-process suite turn
+developer mode on, and the reload scenario now asserts the trace shows both halves of
+PAUSE-021 — a pixel verdict alone cannot tell a working funnel from a page that was
+merely fast.
+**Reproduced + proved (mechanism, not device):** `formal/reloadlatch.tla`. `Fix="oneshot"`
+(`reloadlatch_bug.cfg`) is the pre-fix latch and TLC returns the reported trace: two
+`Issue`s, the aborted load `Settle`s and consumes the latch, its nudge drains, the
+replacement `Settle`s onto a blank surface with `nudging = 0` and stutters blank forever —
+`RepaintLiveness` violated. `Fix="window"` (`reloadlatch.cfg`) makes it hold, and
+`reloadlatch_reach.cfg` proves the spent-latch state is reachable. Mirrored runnable in
+`test/surface_repaint_engine_test.dart` (`rapid-refresh ordering`), including the redirect
+chain and a FakeAsync case bounding the window, and gated in `surface_repaint_funnel.test.js`.
+**Why:** Reported as a **white** screen that **survives repeated refreshes** — "if I hit
+refresh often it's still there and I'm not sure I even see progress bar properly; hitting
+refresh again helps" — which is Attempt 9's trigger with Attempt 9's fix already in place.
+The trigger is confirmed by the reporter, as in Attempt 9. Attempt 9 assumed one issue
+produces one commit, so it spent the latch on the first settle. A user staring at a blank
+page does not refresh once and wait; they refresh again, and the second `reload()` lands
+inside the first document's lifetime. The aborted load settles first and spends the
+repaint on a document that is already discarded, then the replacement commits onto the
+blank surface with nothing armed — so *rapid* refreshing cannot clear the screen while a
+single, later refresh can, which is exactly the shape of the report. A redirect chain
+settling twice is the same defect with one tap. (b) exists because the reporter is the
+only observer of a path nobody enumerated (gap #9) and had no way to act on one: rotating
+the device is not discoverable, and refreshing — the thing users actually try — re-issues
+the load and can land blank again. It is gated because the population that can act on it is
+exactly the population reporting the bug, and everyone else would meet a control whose
+effect they cannot interpret. (c) is why the report says the progress bar is not
+obviously there: `userDrivenReload` awaits a platform HTTP-cache clear before `reload()`,
+and nothing renders during that round trip, so the tap reads as ignored and invites the
+rapid second tap that (a) is about.
+**Why partial:** Still per-path (gap #3) — this fixes the *latch* on the settle side, not
+the enumeration of triggers, and it inherits gap #6 whole: `onLoadingChanged(false)` is
+still load-stop, not the compositor's first frame. The 15s window is a *guess bounded by
+taste*: a commit landing later than it is uncovered, and the model encodes that premise
+rather than proving it (`CloseWindow` is enabled only when nothing is in flight). It also
+buys robustness with extra nudges — an unrelated navigation settling inside the window now
+repaints, which is harmless but is not free. (b) is the first thing here that can
+*falsify* the remedy rather than assume it (gaps #4/#5): if a user reports the menu action
+clearing the screen, the nudge demonstrably recomposites on that device; if they report it
+not clearing, every attempt since Attempt 2 rests on a false premise. Until such a report
+exists that remains untested, and (b) is a workaround, not a fix — a menu entry the user
+has to find is an admission the automatic coverage is still incomplete. The developer-mode
+gate sharpens that trade-off rather than resolving it: the diagnostic now reaches only users
+who were told how to unlock it, so the falsifying report needs someone to ask for it.
 
-### Attempt 12 — Native repaint at Android attach/visible lifecycle chokepoints (`PAUSE-028`)
-**Date:** 2026-08-25 · **Files:** pubspec.yaml, pubspec.lock,
-openspec/specs/webview-pause-lifecycle/spec.md
-**What it did:** Pinned `flutter_inappwebview_android` to the immutable
-`starship-s/flutter_inappwebview` commit
-`1a8ed58fddea13cb5f2799b4bf64c120917fc5c1`. At that commit,
-`InAppWebView.requestRepaint()` only calls `requestLayout()` and
-`postInvalidateOnAnimation()`. `onAttachedToWindow()` calls `super` first and
-then `requestRepaint()`; `onWindowVisibilityChanged(visibility)` preserves the
-existing background-audio semantics and calls `requestRepaint()` only when the
-actual argument is `View.VISIBLE`.
-**Why:** Attach and visible lifecycle callbacks are native WebView chokepoints,
-so the geometry-free layout/redraw request is no longer dependent only on which
-Dart navigation or lifecycle path happened to fire, or on its timing relative to
-surface re-attachment. The Dart-side coalesced repaint pulses and bounded
-warm-resume metrics coverage remain in place; the native hooks complement rather
-than replace them. `requestLayout()` requests a fresh native layout/redraw; it
-does not prove that Android composition succeeded.
-**Why partial:** A local Android fdebug APK compiled successfully against this
-exact plugin source, and focused host tests are green, but there is no connected
-emulator or physical device. The latest failure log also contains no lifecycle or
-`SurfaceDiag` events, so affected-device validation is still outstanding. This
-is a precise lifecycle invariant and a historical attempt, not a claim that the
-intermittent bug is universally fixed. Renderer-process loss remains BUG-002:
-it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
+### Attempt 12 — Repaint when the renderer reports pixels (`PAUSE-031`)
+
+**Date:** 2026-09-06
+
+**What it did.** Wired Android's `onPageCommitVisible` through
+`WebViewConfig` to a nudge under the trigger `page-commit-visible`, on both the
+site webview (via `WebViewModel.onPageCommitVisible`, the same shape as
+`onLoadSettled`) and the nested `InAppWebViewScreen`. Deliberately not gated on
+the PAUSE-027 commit window.
+
+**Why.** The second device capture (gap #18) showed a load where all six nudges
+had drained and the 15-second window had closed twelve or more seconds before
+the renderer produced any content. Every trigger up to here is a lifecycle
+event *hoped* to imply a painted surface — a resume, a metrics change, a route
+pop, a load settling. `onLoadStop` is the closest, and it reports that a
+navigation finished, not that a frame exists; on a slow device the gap between
+them is seconds. `onPageCommitVisible` is the only signal in the stack that
+fires because the WebView committed a visible frame, so it is the one trigger
+that cannot land before there is something to paint. It was already plumbed to
+Dart in the fork and unused, which gap #16 had named as the way out of
+enumerating paths.
+
+**Why it is partial.** It is still a trigger, and gap #18 leaves open whether
+the mechanism it calls works at all on the reporting device — the two
+hypotheses in that gap are not yet separated, and this attempt only helps under
+one of them. It says nothing about the `-1` no-body case (gap #17). It is
+Android-only by construction. And a page whose first commit-visible frame is
+itself blank (a shell that paints later) gets one nudge at the wrong moment and
+nothing after, because there is no second commit for a same-document update.
+
+### Attempt 13 — Offer texture composition as an experiment (`PAUSE-032`)
+
+**Date:** 2026-09-26
+
+**What it did.** Made texture layer hybrid composition (TLHC) available on
+Android as an experimental feature (DEVTOOLS-011): with developer mode on and
+the **Texture page rendering** switch on, every `InAppWebViewSettings` the
+app builds carries `useHybridComposition: false`; otherwise it carries true,
+as before. Hybrid composition stays the default until texture mode has run on
+devices. The mode is read once at launch. A structural gate
+(`test/js/composition_mode_parity.test.js`) holds every settings object to
+the field, because the fork's `setSettings` replaces native settings
+wholesale and the Dart class defaults the field to true.
+
+**Why.** Attempts 1 to 12 each added a trigger for the same remedy, a nudge,
+and gap #18 is a device on which the trace shows every trigger firing, the
+renderer alive with a 376 KB document, and the page white. Its two
+hypotheses are that the nudge is inert (H1) or that it ran too early (H2).
+Both are hypotheses about repainting a surface that hybrid composition owns.
+The correction in gap #16 names that surface: under HC, Flutter renders into
+`FlutterImageView`s around the WebView, and an image view presents the last
+image it acquired until something makes it acquire another. That is the
+object every attempt has been trying to poke. In texture mode it does not
+exist: the WebView draws into a texture, a new WebView frame makes Flutter
+schedule a frame, and Flutter composites the texture itself. So this is the
+first attempt that removes the mechanism instead of adding a path to the list
+of things that work around it, which is what gap #3 has asked for since
+Attempt 8. It is also what the official `webview_flutter` plugin uses on
+Android by default, and what `flutter_inappwebview` 5.x used before 6.0
+switched its own default to HC.
+
+What texture mode changes, read from the pinned fork: the
+`InputAwareWebView` input-connection proxy is gated on `!useHybridComposition`
+but also on a non-null container view, and the v2 embedding passes a null
+`FlutterView` (`InAppWebViewFlutterPlugin.onAttachedToEngine`), so the proxy
+stays inert and the WebView handles input natively; text selection uses the
+plugin's floating menu (`rebuildActionMode`) instead of the system toolbar;
+and the plugin injects a one-line keydown listener that hides that menu.
+Flutter's own documentation lists texture mode's costs as jank during fast
+scrolling and lost accessibility for `SurfaceView`s, which a WebView does not
+contain.
+
+**Why it may be partial.** Nobody has run it on a device that goes white,
+so like Attempts 9 to 12 its causal claim is unverified until one does, and
+as an experiment it reaches no one who has not turned on developer mode. What
+would falsify it is a white screen with the experiment on: if that happens,
+the stale surface was not hybrid composition's, and gap #18's H1 and H2 both
+need re-reading. Texture mode has its own resume-blank history
+(flutter/flutter#148662, fixed by flutter/engine#52980, long before the 3.38.6 we pin). The
+repaint nudges stay wired: they are harmless in texture mode, and the default
+mode still needs them. The adb tier runs the default mode, so it does not
+exercise texture mode. One CI run made while texture mode was briefly the
+default passed the in-process white-screen pixel test in it, which says as
+little about the bug as the HC runs do (gap #13).
+
+The in-process window sampler (`SurfaceDiagPlugin`) was itself a
+hybrid-composition instrument. `PixelCopy.request(Window, ...)` copies the
+window's own surface and never a `SurfaceView` layer; under HC Flutter draws
+into image views inside the window, so that was the whole picture, but in
+texture mode Flutter and the webview's texture are in `FlutterSurfaceView`
+and the window over them is a transparent hole. The first CI run read
+`0x00000000, uniform 1.0` over a page the adb tier had never been asked
+about. The sampler now fills transparent window pixels from the
+`SurfaceView` behind them, which reads the same as before under HC.
+
+---
 
 ## Known open gaps (candidates for the next recurrence)
 
@@ -313,25 +454,36 @@ it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
    but adding one on Android would need the same funnel.)
 8. ~~Return from a pushed route~~ — **closed by Attempt 10** for both screens
    (`PAUSE-024`), gated structurally and covered by pixel scenarios 8 and 9.
-3. **The class isn't closed.** Every fix is per-path. Attempt 12 adds native
-   WebView attach/visible chokepoints, reducing the path/timing dependence of the
-   Dart trigger list, but those callbacks do not prove that every underlying
-   `SurfaceView` buffer re-attach emits one or that composition succeeds. Attempt 11
-   removes the old geometry dependency and gives every existing trigger a native
-   relayout plus invalidation operation. A native surface-changed/-redrawn callback
-   may still be needed for reattachments outside the covered lifecycle callbacks.
-   **Attempt 8 narrows this** with `didChangeMetrics`, and **Attempt 9** with the
-   load-settled proxy; both remain useful retained triggers alongside Attempt 12.
-   Every attach path is still enumerated by hand: Attempt 10 found its three paths
-   by auditing the code against the chokepoint list, and that audit must be redone
-   whenever a new screen hosts a webview or a new lifecycle signal appears. A native
-   attach callback makes that audit unnecessary rather than merely up to date.
+9. **Every attach path is still enumerated by hand.** Attempt 10 found its three paths by
+   auditing the code against the chokepoint list, not from a report — which is an improvement
+   on waiting for users, but the audit is only as good as the reviewer, and it must be redone
+   whenever a new screen hosts a webview or a new lifecycle signal appears. That is gap #3
+   from the process side: a native attach callback would make the audit unnecessary rather
+   than merely up to date.
+3. **The class isn't closed.** (Attempt 13 takes the class-level route this
+   gap asks for from the other side: rather than a native attach callback for
+   hybrid composition, it offers a mode without it, as a developer-mode
+   experiment. Open until a device confirms it, and until texture mode is the
+   default.) Every fix is per-path. The durable fix is a **single
+   chokepoint** that nudges on *every* surface (re)attach — ideally a native
+   surface-changed/-redrawn callback from the fork driving the repaint — instead of
+   enumerating Dart-side navigation paths forever. **Attempt 8 narrows this**: it keys the
+   warm-start repaint on `didChangeMetrics` (a Dart-side *proxy* for the surface attach)
+   rather than a lifecycle event, but a proxy is not the native callback and is not
+   guaranteed to fire on every device, so the gap stands. **Attempt 9 is the same shape
+   once more** — a reload, keyed on the load-settled proxy — and is the second recurrence
+   in a row whose fix was an *ordering* one (nudge at the trigger, re-nudge at the attach
+   proxy). Two data points that the durable fix is the native callback, not a longer list
+   of triggers. **Attempt 11 is a third**, and the sharpest: its trigger was already
+   covered — the user was refreshing, the path Attempt 9 added — and it still went blank,
+   because the *settle side* of a proxy-keyed fix has its own arithmetic to get wrong. A
+   native attach callback would need no latch at all, so it would have no latch to spend.
 6. **Proxies fire before the compositor.** Both attach proxies now in use are upstream of
    the actual first paint: `didChangeMetrics` (Attempt 8) tracks the main FlutterView's
    metrics, and `onLoadingChanged(false)` (Attempt 9) maps to `onLoadStop`, i.e. document
    parse rather than frame commit. A surface that receives its first frame materially
-   later than the six-pulse native repaint budget can still outrun it. This is gap #3 seen
-   from the timing side: the native callback is the only signal that *is* the attach.
+   later than either signal still outruns the nudge budget. This is gap #3 seen from the
+   timing side: the native callback is the only signal that *is* the attach.
 4. **The TLAPS proof doesn't cover the recurrence — by construction.**
    `RepaintLiveness` is proved over `GoodSpec`/`GoodNext`, a *fixed* set of attach actions
    (`Activate`, `Resume`, `ControllerAttach`, `Back`, `Forward`, `LoadSite`, `Evict`), each of
@@ -350,21 +502,13 @@ it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
    unmodeled path; the `surface_repaint_funnel` gate now also covers the `didChangeMetrics`
    resume path. The kernel's TLAPS proof is still over the atomic-attach `GoodNext`, so the
    two models disagree by design — `warmstart.tla` is the faithful one for this ordering.
-5. **The device link is unproven.** Attempt 12's native hooks request layout and
-   animation invalidation without a size change at WebView attach/visible
-   chokepoints, but automated tests cannot prove that the Android System WebView
-   paints the surface on the affected device. Device validation must confirm both
-   the absence of horizontal/vertical wobble and recovery from a blank surface;
-   the existing `SurfaceDiag` trigger lines identify which retained funnel fired.
-   The retained Dart-side fallback also rests on `didChangeMetrics` actually
-   firing when the webview `SurfaceView` re-attaches on a real warm resume. Flutter
-   can dedupe identical window metrics, and the callback tracks the main
-   FlutterView, not the webview platform view. If it does not fire on the affected
-   device, Attempt 8 is a no-op there. The new `SurfaceDiag` line
-   `trigger=metrics-resume -> nudge` exists to confirm this from a device log; no
-   affected-device lifecycle/`SurfaceDiag` trace is available yet, so the causal
-   claim (that this fixes the reported warm-start white screen) remains
-   unverified.
+5. **The device link is unproven.** The whole fix rests on `didChangeMetrics` actually firing
+   when the webview `SurfaceView` re-attaches on a real warm resume. Flutter can dedupe
+   identical window metrics, and the callback tracks the main FlutterView, not the webview
+   platform view. If it does not fire on the affected device, Attempt 8 is a no-op there. The
+   new `SurfaceDiag` line `trigger=metrics-resume -> nudge` exists to confirm this from a
+   device log; until such a trace exists, the causal claim (this fixes the reported warm-start
+   white screen) is unverified.
 7. ~~**First activation of a fresh site is diagnostically dark and has no commit-side nudge.**~~
    **Closed by Attempt 10** (`PAUSE-025`): the controller attach now arms the commit latch and
    emits `trigger=controller-attach -> nudge`, so the settled load repaints the first document
@@ -382,12 +526,487 @@ it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
    path. Undetermined whether that report was this bug or a load that never committed; the
    window-pixel sampler below exists to make the next occurrence classifiable.
 
+10. **The 15s commit window is a guess.** Attempt 11 replaced a one-shot latch with a
+   bounded window because the number of commits per issue is not knowable from Dart, but
+   the bound itself is picked, not derived: a document that commits more than 15s after
+   its issue settles outside the window and is not repainted, and `formal/reloadlatch.tla`
+   *assumes* the window outlasts the in-flight loads rather than proving it. This is gap
+   #6 on the other axis — not "the proxy fires too early" but "the debt expires too soon".
+   The `trigger=commit-settled` line is what would show a device where it does.
+13. **Whether a native attach callback closes gap #3 is now testable, and untested.**
+   The instrument exists but has not been run: `RepaintSuppression` (debug-only,
+   diag tiers only) drops named Dart triggers, and adb Scenario B2 warm-starts with
+   `resume,metrics-resume` suppressed — so what repaints the surface afterwards is
+   whatever the native layer does alone. It is OPT-IN
+   (`WS_RUN_NATIVE_REPAINT_PROBE=1`) because it is expected red against a fork with
+   no such hook, and a permanently-red scenario would drown this tier's other
+   signals. `formal/warmstart.tla` now splits the two readings the model previously
+   conflated — `Fix="proxy"` (a correlated signal that may not fire; violates
+   `RepaintLiveness`) against `Fix="attach"` (the attach itself schedules the nudge;
+   holds) — which is gap #5 as a model-checked difference rather than an argument.
+   Upstream `starship-s/flutter_inappwebview` 643cf23 + 1a8ed58 add exactly that
+   hook (`onAttachedToWindow` + `onWindowVisibilityChanged(VISIBLE)` → geometry-free
+   `requestLayout()` + `postInvalidateOnAnimation()`); both cherry-pick cleanly onto
+   `v6.2.0-beta.3-privacy-v6`. Note they are **View**-lifecycle callbacks, not the
+   SurfaceView's own buffer callbacks, so they cover the warm-start and fresh-mount
+   triggers and none of the commit-side class (Attempts 9/10/11) — they narrow gap
+   #3, they do not close it.
+
+   **Run on 2026-09-04 (PR #576): the emulator cannot answer it.** With both
+   resume-time Dart repaint paths dropped and the `SurfaceDiag` trace showing
+   nothing else ran, the warm-started surface came back the page colour,
+   `uniform: 1.0`. On the CI emulator (API 34, x86_64, `swiftshader_indirect`)
+   the reattached SurfaceView repaints with no Dart help at all, so B2 is green
+   by nature there and can never be the red that justifies the fork pin. Two
+   readings of the instrument had to be fixed before that was even legible, and
+   both are worth knowing:
+   `RepaintSuppression` gated only `_nudgeSurfaceRepaint`, while
+   `_probeRendererAndRecover` repaints too — its `offsetHeight` read forces the
+   layout that schedules the missing paint — and both log under the same trigger
+   name, so suppressing "the resume nudge" left the other one doing the work;
+   and a passing run dumped no logcat, so a green proved nothing. Both are fixed
+   (the probe honours the suppression; B2 asserts both drops and prints the trace
+   on success). A corollary: because the native layer alone suffices on the
+   emulator, no CI run there can say whether the probe's read repaints anything —
+   which leaves the contradiction between `_nudgeSurfaceRepaint`'s doc comment
+   ("a JS `offsetHeight` read does not [fix it]") and `_probeRendererAndRecover`'s
+   ("the read alone fixes the blank surface") open. Deciding gap #5, and the fork
+   pin with it, needs a device that actually goes white.
+
+   **The reload path answers the same way (2026-09-04, PR #576).** Gap #5's
+   warm start was one route; refresh is another. Refresh is not *the* trigger:
+   the reporter's words are that it happens on "many things", without naming
+   them, and any account that treats one entry path as the bug's definition is
+   describing a route, not the bug. (An earlier revision of this paragraph
+   listed four specific paths as if the report named them. It did not; that
+   list was invented here and is removed.) Refresh is worth its own
+   arm because it differs in the way that should matter: a warm start carries
+   a window visibility change and a reload does not, so nothing below Dart has
+   an obvious reason to repaint what a reload blanks. Scenario B3-A suppresses
+   all fourteen `_nudgeSurfaceRepaint` triggers, issues one reload of a page
+   that stalls 5s before its first byte, and samples *past* the commit -- blank
+   before it is a slow page, blank after it is the bug. The trace shows the
+   four suppressions and nothing else firing, and the surface came back
+   painted. So the emulator repaints reloads on its own too, and no route this
+   harness has can make it go white. B3-A is therefore opt-in
+   (`WS_RUN_BLANK_CONTROL=1`) and not run in CI: it is the right experiment for
+   hardware that reproduces, not for this one. Three of the attempts to get
+   there were instrument defects rather than evidence -- a suppression list
+   missing `_probeRendererAndRecover`, one missing `metrics-resume`, and a
+   dropped `os.chdir` that made every page 404 into a white error document that
+   looked exactly like the bug. Each is why the tier now prints the app pid,
+   the focused window, the page-server access log and the SurfaceDiag tail on
+   any pixel failure.
+
+12. ~~Which composition mode the CI emulator runs~~ — **answered 2026-09-05, and
+    it is the affected one.** The worry was real: Flutter's platform-view docs
+    warn that certain Android views (`SurfaceView`, `SurfaceTexture`) do not
+    invalidate themselves when their content changes, so the embedder must; if
+    the emulator instead composited the webview into Flutter's own frames,
+    Flutter's frame loop would redraw it and the gap could not occur there by
+    construction, making gap #5's and gap #11's negatives statements about the
+    emulator rather than about the bug. It does not. The mode is settled in
+    Dart, not at runtime: `InAppWebViewSettings.useHybridComposition` defaults
+    to `true` and this app never sets it, and the fork's
+    `_createAndroidViewController` routes `true` to
+    `PlatformViewsService.initExpensiveAndroidView`, whose contract in the
+    pinned SDK (`packages/flutter/lib/src/services/platform_views.dart`) is
+    "Always creates a 'Hybrid Composition (HC)' view" with "the Android view and
+    Flutter widgets ... composed at the Android view hierarchy level". No
+    TLHC-or-HC fallback is in play; that logic belongs to
+    `initSurfaceAndroidView`, which is the `false` branch. So the emulator runs
+    the same mode as the reporting devices, and this tier's negative results
+    stand as evidence. The lifecycle tier still dumps `dumpsys SurfaceFlinger
+    --list`, the per-layer composition types and the platform-view logcat
+    chatter on every run (`build/white_screen_adb/composition-mode.txt`,
+    uploaded on green runs too) as the runtime witness — it does not decide the
+    mode, and a first cut of it that tried to read the mode off the layer count
+    got the reading backwards, which is why it now prints layer names and no
+    verdict. What it prints on the emulator, with the webview on screen:
+    `SurfaceView[<pkg>/.MainActivity]#402`, its `(BLAST)#403` buffer-queue
+    child, `Background for` that same SurfaceView, and the activity's own
+    window layers. One SurfaceView, which is `FlutterSurfaceView`, and no layer
+    of any kind for the webview. That is consistent with HC as current Flutter
+    implements it: the SurfaceView base stays and `FlutterImageView` overlays
+    are added above the platform view, and an overlay is a View inside the
+    window layer, not a layer of its own. So a layer list cannot separate the
+    two modes in either direction, and the Dart-level determination above is
+    the only sound one. Do not re-derive a verdict from this dump.
+
+13. **Why the device reproduces and this tier does not.** The tier's negatives
+    are real (gap #12), which makes this the live question, and it has one
+    settled part and several open ones.
+
+    Settled: **the emulator repaints the platform view with no Dart help.**
+    Scenario B2 (warm start) and Scenario B3-A (committed reload) each
+    suppressed every `_nudgeSurfaceRepaint` trigger *and* the second repaint
+    path in `_probeRendererAndRecover`, showed the drops in the trace, and the
+    surface came back painted anyway. So no arrangement of scenarios on this
+    host can go red on this class: the symptom needs a surface that stays stale
+    until something forces it, and this one does not stay stale. Adding
+    scenarios is not the missing piece.
+
+    Open: which host difference supplies that unprompted repaint. Ranked by how
+    directly each bears on it, with what CI can do about it:
+
+    1. **Software rasterisation.** The runner has no GPU, so the emulator runs
+       `-gpu swiftshader_indirect`. A software compositor recomposes the whole
+       frame every vsync; there is no damage-rect, buffer-age or partial-update
+       path for a stale buffer to survive in. This is the best candidate and it
+       is the one CI cannot change: GitHub-hosted runners have no GPU.
+    2. **Animations disabled.** The emulator step runs with
+       `disable-animations: true`, zeroing all three scales. BUG-001 lives in
+       activity and route transitions, and a transition with no animation has a
+       different surface-transaction ordering than a real one. Cheap to flip in
+       this tier; untried.
+    3. **Debug build.** The tier installs `app-fdebug-debug.apk`; users run
+       release. JIT vs AOT changes frame timing, and the timing is what decides
+       whether an attach lands before or after a commit. Flipping it costs the
+       diag hooks: `RepaintSuppression` is `kDebugMode`-gated, so B2/B3-A cannot
+       run against release, though the pixel scenarios could.
+    4. **One site, one trivial page.** The seed is a single site serving a
+       solid-colour static document from localhost. Users run many sites in the
+       `IndexedStack` with real pages: slow first paint, subframes, service
+       workers, and enough memory pressure to evict a renderer. Site count and
+       page weight are both raisable here.
+    5. **A different isolation engine.** `_useContainers` is resolved from
+       `WebViewFeature.MULTI_PROFILE` at startup, and it selects a different
+       webview creation path (`containerId` set, a Profile bound in the fork's
+       `prepare()`). If the emulator's bundled System WebView answers
+       differently from a Play-updated one on a phone, the two are not running
+       the same attach path at all. The tier now records the answer.
+
+    **Measured 2026-09-05 (`f3afb5c`), and #5 is no longer a candidate.** The
+    `host:` lines from the first green run carrying them:
+
+    ```
+    isolation engine: Container API not supported - using CookieIsolationEngine
+                      + (legacy) CookieManager
+    system webview:   com.google.android.webview, 113.0.5672.136
+    animation scales: 0.0 0.0 0.0   (window / transition / animator)
+    app build mode:   debug
+    build:            Android 14, api 34, sdk_gphone64_x86_64
+    ```
+
+    So **CI never runs the container engine at all.** The emulator's bundled
+    WebView is 113, which does not advertise `MULTI_PROFILE`, so
+    `ContainerNative.isSupported()` returns false and every scenario in this
+    tier exercises `CookieIsolationEngine`. A phone with a Play-updated System
+    WebView takes the other branch, where `WebViewFactory.createWebView` sets
+    `containerId` and the fork binds an `androidx.webkit.Profile` inside
+    `InAppWebView.prepare()`. That is a different webview creation and attach
+    path, and the attach path is where this bug lives. Candidate #5 is
+    confirmed: the two are not running the same code.
+
+    Candidate #2 is confirmed too — all three animation scales are 0.0, against
+    1.0 on a normal device, so every activity and route transition this tier
+    drives completes without the animation a real one has.
+
+    The WebView version is worth its own line: 113.0.5672.136 shipped in May
+    2023. The compositor a phone runs is years of Chromium ahead of the one
+    every one of these scenarios has ever tested.
+
+    The renderer line came back empty: the logcat pattern was a guess at the
+    engine's banner wording and matched nothing, so Impeller-vs-Skia and
+    Vulkan-vs-GLES are still unmeasured. The probe now dumps the candidate
+    lines instead of matching a phrase it cannot verify.
+
+    **Four of the five were our own choices (2026-09-06).** Only #1 is a
+    property of the runner. The others were configuration, and are now changed:
+
+    - **#5, the isolation engine.** `androidx.webkit` resolves to 1.14.0 (the
+      fork pins it; the app asks for 1.12.1), so the library supports
+      `MULTI_PROFILE`. What did not was the runtime WebView. Every emulator
+      image pins its WebView at image build time and has no Play Store to
+      update it, so API 34 sat on Chromium 113 from May 2023 no matter how
+      current the image itself looked; the API level is the only thing that
+      moves it. The emulator is now API 35, and on the **AOSP** image
+      (`target: default`, WebView `com.android.webview`) rather than
+      `google_apis`: this app ships GMS-free and CI asserts that about the APK,
+      so the test host should not carry Google's stack either. The tier records
+      the version it got, so the run says whether it crossed the threshold. If
+      it still reports unsupported, the next step is API 36, not a sideloaded
+      WebView APK: pulling a third-party binary into CI to fix a test host is
+      not a trade worth making.
+    - **#2, animations.** The tier now sets all three scales to 1.0 for its own
+      run and restores what it found. It runs last in the emulator session, so
+      no other tier sees them.
+    - **#3, build mode.** Already switchable (`WS_LIFECYCLE_BUILD_MODE`),
+      default `debug` until the profile arm's Scenario A failure is understood.
+
+    That leaves #1, software rasterisation, as the only difference CI cannot
+    close, and it is also the one Cuttlefish would not close: a GitHub-hosted
+    runner has no GPU, so `cvd` falls back to the same software compositor.
+    Reaching for a different emulator was the wrong instinct; the cheap
+    configuration changes above buy the differences that matter.
+
+    **The measurement that would settle it is on the device, not here.**
+    `_traceRepaint` is gated on developer mode, not `kDebugMode`, so a release
+    build with developer mode on records the full SurfaceDiag trigger sequence
+    into `LogService` (2000-entry ring) and Dev Tools can export it. Capturing
+    that at the moment a real screen goes white separates the two hypotheses
+    every attempt so far has had to guess between: **no nudge fired** (another
+    unnudged path, which is gap #3 and what all eleven attempts assumed) versus
+    **a nudge fired and the surface stayed blank** (the nudge itself does not
+    work on real hardware, which would invalidate the remedy rather than its
+    coverage). Nothing in the repository currently distinguishes them.
+
+14. **No CI tier has ever run a non-debug build on a device.** Every Android
+    device-side script builds debug: the lifecycle tier does
+    `flutter build apk --debug --flavor fdebug`, and the four `flutter test`
+    tiers get a debug APK by default. The release job builds the shipped APK
+    and checks two static properties of it (GMS-free, JNI survived shrinking),
+    then never installs it. So the artifact that goes white has not been run by
+    any test.
+
+    Two differences follow, and both sit inside the component that goes blank:
+
+    - **`isInspectable: kDebugMode`** (`lib/services/webview.dart:1221`, `:1928`,
+      `:3621`) is the *only* build-mode-dependent WebView setting in the app.
+      Every webview CI drives has `setWebContentsDebuggingEnabled(true)`; every
+      webview that ships has it off. An audit of `kDebugMode` across `lib/`
+      turns up nothing else touching the webview: the rest is startup
+      stopwatches, log forwarding, and the diag hooks themselves.
+    - **JIT vs AOT.** Frame timing decides whether an attach lands before or
+      after a commit, and every ordering fix in this file (PAUSE-020/021/025/027)
+      is about exactly that ordering.
+
+    The tier can now drive `profile` (`WS_LIFECYCLE_BUILD_MODE=profile`, also a
+    `workflow_dispatch` input), which flips both: AOT, `isInspectable` false,
+    and still debuggable, because Flutter's profile build type is
+    `initWith(debug)` (`FlutterPlugin.kt:250`) so the native `FLAG_DEBUGGABLE`
+    gate the diag channels use still passes. Three gates moved from `kDebugMode`
+    to `!kReleaseMode` to let it through — `DiagSeed`, `RepaintSuppression`, and
+    `LogService`'s logcat forwarding — none of which changes release behaviour,
+    which is what those gates were protecting.
+
+    The two modes install under **different applicationIds**. `#579` gave the
+    `debug` build type `applicationIdSuffix ".debug"`; `initWith(debug)` runs
+    while Flutter applies its plugin, which is before that block, so `profile`
+    copies `debuggable = true` but not the suffix. The tier derives `pkg` from
+    the mode for that reason — a hardcoded package name is right for exactly one
+    of them.
+
+    This does not reach the shipped artifact: profile does not run R8, and
+    `minifyEnabled true` with `proguard-android-optimize.txt` is release-only,
+    with no keep rules for the fork or androidx.webkit beyond their own consumer
+    rules. That gap stays open.
+
+    **First profile run (2026-09-05, `79ada4e`): unresolved, not negative.** The
+    `app-fdebug-profile.apk` built (152 MB) and installed, `am start -W` reported
+    `Status: ok / LaunchState: COLD / TotalTime: 2849`, and then Scenario A never
+    reached its pixels in 180s. What the job log carries: dominant `ffffff` at
+    `uniform 0.7644`, the app process alive (`pid 9414`), `mCurrentFocus` on the
+    **launcher** rather than the app, and the page server showing only the host's
+    own startup curl — the emulator never fetched `dark.html`. That is consistent
+    with the app never reaching a seeded webview, and it is not enough to say
+    why: the seed's native gate is `FLAG_DEBUGGABLE`, which profile should
+    satisfy (`initWith(debug)`), so either that assumption is wrong on this AGP
+    version or the app failed earlier. The run also cold-booted its AVD (snapshot
+    cache miss), so it was the slowest configuration this tier has had.
+
+    The empty `last SurfaceDiag lines` in that dump is *not* evidence either way:
+    those lines only appear once a repaint is traced, so an empty list says
+    nothing about how far startup got. That the dump could not distinguish
+    "crashed", "never seeded" and "still starting" is a defect in the dump, now
+    fixed — a pixel failure prints the Dart side's own `flutter:V` tail and any
+    `AndroidRuntime`/`FATAL`/`ANR`/force-finish lines. The tier is back on
+    `debug` by default; the profile arm stays available through
+    `WS_LIFECYCLE_BUILD_MODE` and the `lifecycle_build_mode` dispatch input, and
+    the next run of it will say what happened in the job log rather than only in
+    an artifact.
+
+    **The same symptom on the debug arm (2026-09-28, #643, run 36431970822):
+    not BUG-001.** Scenario A read `blank-white` (`uniform 0.9934`) with the app
+    in focus, and the page server again logged only the host's own curl. The
+    failure screenshot is Chromium's error page for
+    `http://10.0.2.2:<port>/dark.html` with `net::ERR_HTTP_RESPONSE_CODE_FAILURE`:
+    the navigation was answered with a non-2xx status and no body, and not by
+    the page server, so it was answered inside the emulator. The tier had run
+    `pm clear` after install, so no earlier tier's state was in play. The only
+    app code found that answers that way is the Android proxy relay
+    (`ProxyRelay.writeStatus`), which a DEFAULT site with no global proxy
+    should never reach; what answered is open. A main-frame failure now logs
+    its status, response header names and the proxy override/router state at
+    that moment without a URL, so the lines reach logcat, and the tier prints
+    them in its failure dump and keeps the whole logcat buffer.
+
+15. **The release predates the fix the tests are testing.** `v0.3.1` is tagged
+    2026-08-27. Attempt 11 (`PAUSE-027`/`PAUSE-028`, the bounded commit window)
+    landed 2026-09-03 in `7453743`, six days later. `v0.3.1:lib/main.dart`
+    carries `PAUSE-009`…`PAUSE-025`; master carries those plus `PAUSE-027` and
+    `PAUSE-028`, and `commitWindow` appears zero times in `v0.3.1`'s
+    `surface_repaint_engine.dart` against three on master.
+
+    So a device on `v0.3.1` has Attempt 9's one-shot reload latch with no
+    bounded window over it, which is precisely the state Attempt 11 was written
+    for: the report it answers is "if I hit refresh often it's still there ...
+    hitting refresh again helps", and a one-shot latch is exactly what makes
+    rapid refreshing fail while a single later refresh succeeds. Meanwhile
+    **Scenario B3-B, the tier's rapid-reload scenario, is the regression guard
+    for `PAUSE-027`** — it asserts behaviour the shipped build does not contain.
+    Before reaching for host or artifact differences, that is the first-order
+    answer to "why is CI green and the device not": CI is running the fix.
+
+    Two more BUG-001-adjacent fixes are also post-tag: `7fd570a` (pull-to-refresh
+    firing on a two-finger pinch, 2026-09-02) and `f02d4af` (below).
+
+    **Correction, and the reasoning error behind it.** This entry first claimed
+    the discriminator was `f02d4af`: `_refreshNotificationSites` reloading the
+    *visible* site on a native background-refresh tick, since Android's
+    WorkManager tick fires in the foreground while the handler took no
+    `excludeActive`. Two checks kill that as *the* discriminator. The same
+    unconditional wiring is present in `v0.2.6`, `v0.2.7`, `v0.2.9` and `v0.3.0`,
+    so nothing about it changed at this release; and the reload it issues goes
+    through `reloadAndRepaint`, the funnelled path the `PAUSE-021`/`027` latch
+    already covers, so it is a *trigger* for a blank the machinery claims to
+    handle, not an unnudged path. It also needs a `notificationsEnabled` site
+    and fires at most every 15 minutes. What it genuinely contributes is a
+    trigger with no user action behind it, which is worth having on the list of
+    things a user cannot attribute; it is not why this release goes white and
+    the tests do not. The error was reading a commit that post-dates the tag as
+    a regression introduced by the tag, without checking the older tags.
+
+    **Why no test caught the foreground leg anyway.** Scenario F fires the
+    refresh receiver while the app is BACKGROUNDED, the leg that was always
+    correct; the real 15-minute WorkManager tick cannot be driven in CI at all
+    (`cmd jobscheduler run -f` will not execute a periodic `WorkSpec` before its
+    next run time), so the debug receiver is the only way in and it was only
+    ever used from the background. Scenario F2 now fires it foregrounded and
+    asserts the visible site neither re-fetches nor blanks.
+
+    Verified green on `f3afb5c`: `visible site not reloaded (page loads
+    unchanged at 2)`, with the surface still painted. That confirms `f02d4af`
+    holds on a real foreground tick, and it is the leg no scenario drove before.
+
+    **What gap #15 does NOT claim.** That `v0.3.1` lacks `PAUSE-027` is a fact
+    about the tag. That `PAUSE-027` fixes this user's white screens is a
+    separate claim, and the base rate is against it: eleven attempts precede it,
+    every one landed believing it had the bug, and this file exists because each
+    was partial. Attempt 12 asserting otherwise would be the same error a
+    twelfth time.
+
+    Three things argue specifically against it. The reporter says the symptom
+    arrives on "many things", and `PAUSE-027` is a bounded window over the
+    *reload* latch: it does not touch warm start, activation, memory pressure or
+    route return. Those paths were already wired in the release —
+    `v0.3.1:lib/main.dart` has **14** `_nudgeSurfaceRepaint` call sites against
+    master's **15**, and already logs `commit-settled`, `controller-attach`,
+    `metrics-resume`, `reload` and `route-return`. So a device going white on
+    paths other than rapid refresh is a device on which Attempts 1–10 did not
+    hold, and one more call site plus a window will not change that. The honest
+    reading of the version skew is that it covers the *rapid-refresh subset* of
+    the report and nothing more.
+
+16. **The tier is built from the same enumeration as the fix, so it cannot
+    catch what the enumeration missed.** This is the structural answer to "why
+    is CI green", and unlike gap #15 it does not depend on which attempt is
+    latest. Every fix keys on a Dart-side proxy for "a surface attached"
+    (resumed, metrics changed, route popped, load settled), every scenario in
+    the adb tier drives one of those same known entry paths and checks pixels,
+    and the bug by construction lives in whatever path nobody enumerated. A
+    suite derived from the fix's own list of paths can only ever confirm the
+    list, never find what is missing from it. That is gap #3 and gap #9 stated
+    as a property of the tests rather than of the code, and it is why the count
+    of green scenarios has never predicted anything about the device.
+
+    The way out is the same one gap #3 names: stop enumerating. The fork
+    already surfaces the real signal — `onPageCommitVisible` is plumbed all the
+    way to Dart (`InAppWebViewClient.java:782`,
+    `InAppWebViewClientCompat.java:808`, `WebViewChannelDelegate.java:1183`,
+    `platform_webview.dart:1399`) and `grep -rn onPageCommitVisible lib/`
+    returns nothing. A repaint driven by the commit the engine actually reports,
+    rather than by a lifecycle event we hope implies one, needs no list.
+
+    **First step taken (2026-09-05): assert the request, not the paint.** Since
+    the pixels cannot fail here, the tier now also asserts, from the app's own
+    `SurfaceDiag` trace, that a repaint was *requested* on the path just driven:
+    `trigger=resume` after a warm start, `trigger=back` after a back gesture,
+    `trigger=activate` after a warm site switch (`assert_nudged` in
+    `scripts/run_android_lifecycle_tests.sh`). All three passed first time on
+    `f3afb5c`, so they are guards rather than findings: the wiring is intact on
+    the paths the tier drives. This is host-independent — it
+    reads the app, not the compositor — and it fails on the actual recurrence
+    mode, a path that reaches a surface without passing a chokepoint. It does
+    not make the tier representative: it still only covers paths someone
+    enumerated, and it still cannot tell whether a nudge that fires actually
+    saves the screen. Those two need the commit-driven chokepoint above and a
+    device trace respectively.
+
+    One correction rides along, because it changes where the next fix should
+    look. The `SurfaceView`-does-not-self-invalidate rule was cited here as the
+    root mechanism, but under HC the platform view is an `android.webkit.WebView`
+    in the Android view hierarchy, and a `WebView` is not a `SurfaceView` — it
+    draws through a functor into whatever surface contains it and never owns a
+    SurfaceFlinger layer. The surface that can present a stale frame in HC is
+    Flutter's own: `FlutterView.convertToImageView()` swaps the render surface
+    for `FlutterImageView`s, which present whatever image was last acquired and
+    do not repaint on their own. That is consistent with the symptom and with
+    why a 1px inset toggle clears it, but it is a different surface from the one
+    the doc quote names, and any fix aimed at "invalidate the platform view's
+    SurfaceView" would be aimed at the wrong object.
+
+   **What Scenario B3-B does and does not show.** It drives five reloads 120ms
+   apart against that 5s page, so four commits abort before the fifth lands --
+   the shape that spent the old one-shot latch on an aborted load. Every reload
+   nudge coalesced into one loop, and then `commit-settled` fired as a *fresh,
+   uncoalesced* nudge when the real document committed ~5s later. That trace is
+   real evidence, and it is evidence about the **latch's timing**: the window
+   was still open at the commit, which is what Attempt 11 built it for.
+
+   It is not evidence that the repaint prevented a blank. An earlier revision of
+   this paragraph said the surface "stayed painted" and read that as the fix
+   working, which is the same vacuity gap #16 describes: on this host the
+   surface stays painted with every trigger suppressed, so "stayed painted"
+   distinguishes nothing. B3-B guards the latch's *ordering*, read from the
+   app's trace. Whether that ordering saves a real screen is untested here and
+   needs a device.
+
+   **Forcing GPU composition was tried and could not be tried (2026-09-05).**
+   The one cheap hypothesis for why the emulator repaints unasked is hardware
+   overlays: an overlay-composed layer is re-scanned out every frame from
+   whatever its buffer last held. `service call SurfaceFlinger 1008 i32 1`, the
+   old "Disable HW overlays" developer-option call, was accepted and discarded
+   on API 34 both as shell and as root, with `dumpsys` still reporting four
+   layers at `composition type=DEVICE`. `1008` is a raw binder code from before
+   SurfaceFlinger moved to AIDL and no longer maps to that toggle. B3-A now
+   verifies that precondition and *skips* rather than failing, because a red
+   from an arm whose precondition never held is the same false evidence this
+   scenario exists to prevent. The overlay hypothesis is untested, not
+   disproved; testing it needs whatever the developer option calls on a modern
+   API level.
+12. **The trace is now honest but still opt-in.** `PAUSE-029` closed the coverage half
+   of the diagnostic — every path reports, and a new one cannot be silent — but the
+   developer-mode gate means a user who hits the bug has no trace *of the occurrence that
+   prompted them to report it*. They can only capture the next one. That is the deliberate
+   trade against evicting the log ring in every ordinary session, and it is why the
+   integration tiers assert on the trace rather than waiting for a user to supply one.
+11. **Nobody has confirmed native repaint on the affected device.** Gaps #4 and #5
+   remain an open device-validation question, not a modelling hole. The merged fork
+   sends geometry-free native layout/invalidation requests and invokes them on native
+   attach/visible callbacks, but host tests cannot observe SurfaceFlinger. The manual
+   diagnostic choices can isolate invalidation and visibility requests; until a device
+   report says which one clears the blank surface, compositor recovery remains unverified.
+   The developer-mode gate means that report will not arrive on its own: someone has to
+   walk a reporter through the seven taps, so treat asking as part of triaging recurrence.
+
 ## Guardrails now in place
 
+- **Geometry-free repaint gate** ([test/js/surface_repaint_funnel.test.js](../../test/js/surface_repaint_funnel.test.js)):
+  both webview hosts must pass their currently attached controller's native repaint
+  callback to the shared pulse controller. The gate checks that each pulse calls the
+  callback and that repaint state adds no inset, padding, or `SurfaceNudgeScope` to the
+  Flutter layout; the letterbox box uses the real available extent.
 - **Formal model** ([formal/kernel.tla](../../formal/kernel.tla)): `RepaintLiveness`
   (every blank-surface attach is eventually repainted); the `bypass` demonstrator *is*
   this bug and TLC rejects it. Liveness backbone proved for unbounded N in
   [formal/proofs/repaint_liveness.tla](../../formal/proofs/repaint_liveness.tla).
+- **Reload-latch model** ([formal/reloadlatch.tla](../../formal/reloadlatch.tla), run by
+  `formal/check.sh`): the settle side of the commit latch, which `warmstart.tla` does not
+  model. `reloadlatch_bug.cfg` (Fix="oneshot") reproduces the rapid-refresh white screen
+  (`RepaintLiveness` violated on the second commit); `reloadlatch.cfg` (Fix="window")
+  proves the bounded window closes it; `reloadlatch_reach.cfg` proves the spent-latch
+  state is reachable.
 - **Warm-start model** ([formal/warmstart.tla](../../formal/warmstart.tla), run by
   `formal/check.sh`): models the nudge as an event-triggered one-shot with a *separate*
   async `SurfaceReattach` (no magic `WF(Nudge)`), so the warm-start ordering the kernel
@@ -396,10 +1015,9 @@ it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
   proves the attach-triggered re-nudge closes it; `warmstart_reach.cfg` proves the
   ordering is reachable (non-vacuous).
 - **Engine characterization** ([test/surface_repaint_engine_test.dart](../../test/surface_repaint_engine_test.dart),
-  runs under `fvm flutter test`): `SurfaceRepaintEngine` tracks `owed`, emits six
-  geometry-free repaint ticks, coalesces refills, and aborts safely; a late `attach()` with
-  no re-nudge stays `owed` (reproduction), the metrics re-nudge clears it (fix), including
-  a timing-faithful 800ms-reattach case.
+  runs under `fvm flutter test`): the same ordering in runnable Dart. `SurfaceRepaintEngine`
+  tracks `owed`; a late `attach()` with no re-nudge stays `owed` (reproduction), the metrics
+  re-nudge clears it (fix), including a timing-faithful 800ms-reattach case.
 - **Structural gate** ([test/js/surface_repaint_funnel.test.js](../../test/js/surface_repaint_funnel.test.js),
   runs under `npm run test:js` in CI): on the main page, every Android `controller.goBack()`
   must route through `_goBackAndRepaint`. A new raw back path (the recurrence shape of
@@ -410,13 +1028,21 @@ it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
   `inappbrowser.dart` must sit inside a `reloadAndRepaint` funnel that latches the reload,
   `main.dart` must wire both host hooks to the engine, and each file must drive the repaint
   off the load-settled signal. A new raw reload fails CI.
-- Attempt 10 adds three more: both webview screens must be `RouteAware`, subscribe and
+  Attempt 10 adds three more: both webview screens must be `RouteAware`, subscribe and
   unsubscribe from `surfaceRouteObserver`, and nudge in `didPopNext` (with the observer
   registered on `MaterialApp`); each controller-attach handler must arm the commit latch as
   well as nudge; and the nested screen must carry the resume window + `didChangeMetrics`
   re-nudge. Dropping any of that wiring — the way a refactor quietly would — fails CI.
-- Attempt 11 additionally checks that both hosts invoke the native repaint wrapper from
-  their tick funnels and contain no repaint-only geometry state or padding.
+  Attempt 11 adds the latch's own shape: both hosts must arm through `_armCommitLatch`,
+  which must restart a `SurfaceRepaintEngine.commitWindow` timer and close the window;
+  nothing may call `noteCommitPending` outside it (an unbounded window is as much a defect
+  as a one-shot one); `dispose` must cancel the timer; and both menus must carry the
+  manual repaint entry wired to `_repaintCurrentSurface`, with *every* occurrence behind
+  both the Android and the developer-mode gate (counted, not matched: a second menu with
+  one ungated entry is the regression shape). It also holds the reporting contract: the
+  funnel must take a trigger label and report through `_traceRepaint`, no call site may
+  omit a label or hand-write a line, and `_traceRepaint` must carry the developer-mode
+  gate, the throttle and the flush-timer cancel.
 - **Window-pixel detector + scenario suite**
   ([android/.../SurfaceDiagPlugin.kt](../../android/app/src/main/kotlin/org/codeberg/theoden8/webspace/SurfaceDiagPlugin.kt),
   [lib/services/surface_diag_native.dart](../../lib/services/surface_diag_native.dart),
@@ -452,7 +1078,7 @@ it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
   [scripts/classify_window_pixels.py](../../scripts/classify_window_pixels.py) with the
   in-app sampler's thresholds; a white control cold start proves this plane is not
   vacuous either. Site list is injected at launch by a debug-only `ws_diag_seed`
-  intent extra ([lib/services/diag_seed.dart](../../lib/services/diag_seed.dart)) and
+  intent extra ([lib/diag_seed.dart](../../lib/diag_seed.dart)) and
   activated through the production pinned-shortcut `siteId` extra (a plain cold start
   shows the webspace picker with no site selected), so the cold-start scenario also
   pixel-checks the shortcut launch path (Attempt 2's trigger).
@@ -470,10 +1096,235 @@ it requires WebView destroy-and-rebuild recovery, not this live-surface repaint.
   is this bug; a blank that survives a relayout, or a visible "connection failed", is
   `PAUSE-022` (`ResumeReloadEngine`), which re-issues the load on resume. No nudge can
   fix that one.
+- A blank that survives a relayout on a site with the content blocker on: run #405's
+  root probe in the developer console. `root=STYLE ... blocker=ROOT` is
+  [BUG-031](031-content-blocker-style-becomes-document-root.md), not a surface.
 - Confirm it's the **surface**, not a dead renderer: does the page respond to taps /
   does a rotate or tab-switch instantly fix it? If yes → surface, use the nudge. If a
   rotate doesn't fix it and JS is dead → renderer death, a different bug:
   [BUG-002](002-black-screen.md) (`PAUSE-013/014`).
+17. **The probe calls an empty document healthy (first device capture,
+    2026-09-06).** The first `SurfaceDiag` trace anyone has taken off an
+    affected phone, an `fdebug` debug build in ordinary use over seven minutes,
+    ends like this:
+
+    ```
+    22:23:49  Switching to site 2: "GitHub ..." (siteId: hm1uscucyi-vy3)
+    22:24:00  Teardown of "Google Maps" ran [], stalled on stopRealCameraCapture
+    22:24:02  trigger=site-switch probe=-1 -> renderer-alive (nudge)
+    22:24:08  trigger=resume      probe=-1 -> renderer-alive (nudge)
+    22:24:19  trigger=resume      probe=-1 -> renderer-alive (nudge)
+    22:24:33  trigger=resume      probe=-1 -> renderer-alive (nudge)
+    ```
+
+    with the reporter saying GitHub never appeared. `-1` is the else branch of
+    `document.body ? document.body.offsetHeight : -1`: the document has no
+    body. `rendererProbeIndicatesGone` is `probeResult == null`
+    (`lib/web_view_model.dart:452`), so `-1` classifies as alive and the app
+    nudges. **A surface nudge cannot repaint a document that has no body**, so
+    every trigger on that path is a no-op by construction, however many of them
+    fire — which is why the count of enumerated paths has never mattered.
+
+    The same site had a body earlier in the session (`onLoadStop` at 22:17:33,
+    a 376 KB HTML cache save at 22:17:56), then sat backgrounded and paused
+    from 22:17:38 to 22:23:49 while two other webviews loaded, with no
+    `Creating webview` / `onControllerCreated` / `onLoadStart` for it in
+    between. Nothing was loading when the `-1`s were logged, and a parsing
+    document has a body from its first bytes, so "the page had not loaded yet"
+    does not account for four probes over 31 seconds.
+
+    **Two things this trace cannot settle, both of them the trace's fault.**
+    The probe line carried no site identity, and the window holds two logged
+    switches to site 2 (22:23:49, 22:24:00), two concurrent `site-switch`
+    probes, and teardowns of two other sites: a `-1` off a torn-down Maps
+    controller is indistinguishable from one off GitHub. `site=<siteId>` is now
+    on both probe lines. And the obvious mechanism — an Android WebView whose
+    renderer was reaped while backgrounded, answering from a fresh empty
+    document — is contradicted here: `handleRendererGone` logs
+    `Renderer gone for "..."` unconditionally (`lib/web_view_model.dart:1779`)
+    and that line is absent, so `onRenderProcessGone` never fired. Whatever
+    emptied the document did not announce itself as a renderer death.
+
+    Whichever site the `-1`s belong to, no tier scenario has ever produced one:
+    none leaves a site backgrounded behind two other loaded webviews for six
+    minutes, so `-1` has never appeared in a tier trace (gap #16).
+
+    **Not yet closed, and deliberately not fixed on one capture.** The trace
+    shows the classification is wrong; it does not yet show *which* document
+    answered. `_probeRendererAndRecover` now emits a second line on the `-1`
+    path (`readyState`, whether `documentElement` exists, `protocol//host`),
+    which separates a renderer that came back on `about:blank` from a live
+    document that genuinely has no body. Developer mode was off for this
+    capture, so `_traceRepaint` wrote nothing and only the probe's four call
+    sites are visible — the next capture needs it on. What the fix will be
+    depends on that line: a third classification (no body -> reload, not
+    nudge) if the document is blank, something else if it is not.
+
+18. **The nudge fires correctly and does not repaint (second device capture,
+    2026-09-06).** Same phone, same `fdebug` debug build, developer mode on so
+    `_traceRepaint` writes. A cold start, then one site opened for the first
+    time. It went white, and the trace is complete:
+
+    ```
+    22:32:19  trigger=activate          -> nudge
+    22:32:20  trigger=controller-attach -> nudge (coalesced)
+    22:32:21  trigger=reload            -> nudge (coalesced)
+    22:32:23  onLoadStart
+    22:32:24  onLoadStop
+    22:32:24  trigger=commit-settled    -> nudge
+    22:32:28  onLoadStart / onLoadStop
+    22:32:29  trigger=commit-settled    -> nudge
+    22:32:41  HtmlCache saved 376028 bytes for site hm1uscucyi-vy3
+    22:32:45  HtmlCache saved 376020 bytes
+    22:32:48  HtmlCache saved 376028 bytes  (x3)
+    ```
+
+    Six nudges. The two `commit-settled` ones are not coalesced, so each ran
+    its own six-tick loop, and they ran immediately after `onLoadStop` — the
+    moment PAUSE-027 exists to cover. The renderer answered `getHtml` five
+    times over the following seven seconds with a 376 KB document, after the
+    screen was already blank. Live renderer, complete document, every
+    enumerated trigger fired, blank surface.
+
+    **Two hypotheses fit this, and they are not yet separated.**
+
+    *H1, the mechanism is inert.* `_nudgeSurfaceRepaint` toggles a 1px body
+    inset over six frames to make the platform view recomposite
+    (`lib/main.dart`), standing in for the rotation / lock-unlock / tab switch
+    the reporter has always said does recover the screen. Those differ from a
+    1px resize in magnitude, in whether the view stops being painted, and in
+    whether the platform view is destroyed. If the stand-in reproduces none of
+    what matters, no trigger work can help.
+
+    *H2, every nudge ran too early.* The last nudge fired at 22:32:29 and its
+    six ticks drained by ~22:32:29.6. The commit window was armed by the reload
+    at 22:32:21 and closed 15 seconds later, ~22:32:36. No `onLoadStop`
+    followed 22:32:29, so no further `commit-settled` nudge. The renderer's DOM
+    serializations land at 22:32:41, :45 and :48 — 12 to 19 seconds after the
+    last nudge drained and after the window shut. If the first composited frame
+    arrived in that span, every trigger had already spent itself. This is the
+    shape of attempts 9, 10 and 11, one step further out in time, and it makes
+    `onPageCommitVisible` (gap #16) the fix rather than a better-timed call to
+    an inert mechanism.
+
+    **The discriminator is one tap.** The developer-mode "Repaint Screen" entry
+    cycles through mechanisms on successive taps and logs which it ran:
+
+    | tap | mechanism | what it does that the others do not |
+    |-----|-----------|-------------------------------------|
+    | 1 | `inset-1` | today's mechanism, unchanged |
+    | 2 | `inset-16` | same resize, sixteen times the magnitude |
+    | 3 | `unpaint` | Flutter stops painting the subtree for a few frames, so the Android view leaves and re-enters the hierarchy without the WebView being destroyed |
+    | 4 | `native-invalidate` | `View.invalidate()` + `requestLayout()` on every WebView in the window, called on the platform thread rather than resized from Dart |
+    | 5 | `native-visibility` | `GONE` then `VISIBLE` on the same views, which is what lock-unlock does |
+    | 6 | `recreate` | dispose and rebuild (reloads the page) |
+
+    Taps 1 and 2 separate "the mechanism works" from "the magnitude is too
+    small". Tap 3 separates a resize from a detach. Taps 4 and 5 separate
+    Flutter's platform-view plumbing from the Android views themselves —
+    `SurfaceDiagPlugin` already holds the Activity and runs on the main looper,
+    so neither needs a change in the fork. Tap 6 is the answer that always
+    works and costs the page.
+
+    Whichever tap restores the screen names the layer, and the mechanism the
+    automatic nudge should use becomes that one. Attempt 12 acts on H2, the
+    cheap half; H1 stays open until a device answers.
+
+    It also retires two working assumptions. The blank does not need a
+    backgrounded site or a warm start — this was a first load after a cold
+    start. And it is unrelated to gap #17's `-1`: the document here is 376 KB.
+
+    **The formal layer defined this away.** `Nudge` in `formal/kernel.tla`
+    carries `surface' = "painted"` inside the action, so "nudging repaints the
+    surface" is an axiom, and `formal/proofs/repaint_liveness.tla`
+    (`THEOREM Liveness == GoodSpecWF => (surface = "blank" ~> surface =
+    "painted")`) discharges liveness from it plus `WF_vars(Nudge)`. TLC and
+    TLAPS were both sound about a machine in which the failing proposition is
+    true by construction. A model of the repaint must make the effect of a
+    nudge a *possibility* rather than a definition, with a behavior where the
+    nudge fires and the surface stays blank — that behavior is the bug, and it
+    is currently unrepresentable.
+
+    **The discriminator ran (third device capture, 2026-10-04).** All six
+    taps, in order, on a GitHub repo page (`github.com/<owner>/<repo>`) that
+    went white right after a full navigation from the dashboard, with a
+    refresh between taps 4 and 5:
+
+    ```
+    06:47:07  manual mechanism=inset-1            probe=-1  no body: complete html https://github.com
+    06:47:12  manual mechanism=inset-16           probe=-1  no body: complete html https://github.com
+    06:47:14  manual mechanism=unpaint            probe=-1  no body: complete html https://github.com
+    06:47:17  manual mechanism=native-invalidate  (reached 1 view)  probe=-1  no body: ...
+    06:47:20  Refresh (cache cleared, reload, commit-settled nudge)
+    06:47:25  manual mechanism=native-visibility  (reached 1 view)  probe=-1  no body: ...
+    06:47:27  manual mechanism=recreate  -> new webview, onLoadStop, onPageCommitVisible,
+              HtmlCache saved 372622 bytes
+    06:47:31  manual mechanism=inset-1            probe=-1  no body: complete html https://github.com
+    ```
+
+    None restored the screen. `recreate` built a new WebView, a new platform
+    view and a new document, and landed on the same state, so neither H1 nor
+    H2 applies to this blank: both are about repainting a surface, and a
+    fresh surface showed the same thing. What every probe agreed on is gap
+    #17's shape: a live github.com document, `readyState` complete, a
+    document element present, and `document.body` null. That holds while
+    `getHtml()` (`getElementsByTagName('html')[0].outerHTML`) serialises 372
+    KB, ten times the page's head, so the content is still under an `<html>`
+    and only the body lookup fails. Same site as gap #17. The dashboard on
+    the same run probed `2565`, so it is specific to that page, and it
+    reproduced on every load of it in this session.
+
+    A headless Chromium experiment (no app shims, logged out) serves that page
+    with a body. A second one ruled out the early content-blocker CSS shim's
+    `(document.head || document.documentElement || document)` fallback, the
+    one path in the app that could make a `<style>` the document element:
+    Chromium has created `<html>` by the time a navigation commits, so the
+    `document` arm is not reached from `onLoadStart`. The cause is not
+    identified. The `-1` detail line now names the root element, how many
+    root and `<body>` elements exist, and the body's parent, which separates
+    a removed body, a body moved off the root, and a root that is not
+    `<html>`. The next capture of this site logs no content-blocker CSS for
+    GitHub at all (no `getEarlyCssScript` on create or on `onLoadStart`), and
+    its repo page did not go white. That proves nothing alone, but the
+    per-site content blocker is the first variable to toggle.
+
+    **What it changes.** For this class of blank, no repaint trigger is the
+    fix, and the menu's `recreate` cannot be either: the document is wrong,
+    not the surface. Gap #18's two hypotheses remain open for the 376 KB
+    capture they were written about.
+
+    **An upstream report of the 376 KB shape (2026-09-08).**
+    [flutter_inappwebview#2889](https://github.com/pichillilorenzo/flutter_inappwebview/issues/2889),
+    opened two days after this capture, describes it independently: Android,
+    hybrid composition, a page that renders on first load and stays blank
+    after any later load (a `reload()` or a navigation). The DOM is complete
+    while the surface is blank (`docH 787`, `readyState complete`, opacity 1).
+    The reporter ruled out Impeller on or off, hybrid composition versus the
+    SurfaceProducer backend, fresh platform views with new keys, and delays
+    between dispose and recreate. A brand-new platform view in the same
+    process is blank too, and only a process restart recovers. Their logcat
+    shows `FlutterRenderer: Width is zero. 0,0` once the second platform view
+    (id 1) is created. On their stack (plugin 6.1.5, Flutter 3.47.1), that
+    puts H1 in Flutter's platform-view layer, not in the nudge or the
+    WebView. If it is the same defect, three things follow: Attempt 13's
+    texture mode does not cover it (their SurfaceProducer run failed the
+    same way), the menu's `recreate` cannot recover it, and the next capture
+    should look in logcat for `Width is zero` and the platform-view id. It
+    does not match the 2026-10-04 capture above, where the document had no
+    body. Open, unlabelled, no replies as of 2026-10-04.
+
+    **The content-blocker fallback is reached after all (2026-10-08).** The
+    experiment above served the page whole, so `<html>` existed at commit. A
+    server that sends its headers before its body commits a document with no
+    root, and the early CSS shim's `onLoadStart` copy then made its `<style>`
+    the root. Three captures from
+    [#405](https://github.com/theoden8/webspace_app/issues/405) (ChatGPT and
+    Brave Search, content blocker on, white and black) printed `root=STYLE
+    roots=1 html=0 body=none`:
+    [BUG-031](031-content-blocker-style-becomes-document-root.md), fixed in the
+    shim (CB-019). It does not explain the GitHub capture, whose root was
+    `<html>`.
+
 - Identify the **new entry path**: what navigation/lifecycle event preceded the blank?
   Does it pass through `_setCurrentIndex` (Attempt 3) or `onControllerReady`
   (Attempt 4)? If neither, that path needs `_nudgeSurfaceRepaint`.

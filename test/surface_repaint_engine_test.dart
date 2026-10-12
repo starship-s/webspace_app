@@ -1,43 +1,22 @@
-import 'dart:async';
-
 import 'package:fake_async/fake_async.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/surface_repaint_engine.dart';
 
 void main() {
-  group('mustRepaint coverage contract', () {
-    test('every surface-attach transition owes a repaint; appBackground does not',
-        () {
-      for (final t in SurfaceTransition.values) {
-        final expected = t != SurfaceTransition.appBackground;
-        expect(SurfaceRepaintEngine.mustRepaint(t), expected, reason: '$t');
-      }
-    });
-
-    test('back and forward owe a repaint (PAUSE-018 / BUG-001)', () {
-      expect(SurfaceRepaintEngine.mustRepaint(SurfaceTransition.back), isTrue);
-      expect(SurfaceRepaintEngine.mustRepaint(SurfaceTransition.forward), isTrue);
-    });
-
-    test('reload owes a repaint (PAUSE-021 / BUG-001)', () {
-      expect(SurfaceRepaintEngine.mustRepaint(SurfaceTransition.reload), isTrue);
-    });
-  });
-
   group('coalescing tick machine', () {
     test('first request emits six repaint pulses and terminates', () {
       final e = SurfaceRepaintEngine();
       expect(e.request(), isTrue);
       expect(e.isLooping, isTrue);
 
-      var pulses = 0;
+      var repaintTicks = 0;
       RepaintTick t;
       do {
         t = e.tick();
-        if (!t.done) pulses++;
+        if (!t.done) repaintTicks++;
       } while (!t.done);
 
-      expect(pulses, SurfaceRepaintEngine.ticksPerRequest);
+      expect(repaintTicks, SurfaceRepaintEngine.ticksPerRequest);
       expect(e.isLooping, isFalse);
     });
 
@@ -71,47 +50,15 @@ void main() {
     test('abort stops the loop before the next repaint pulse', () {
       final e = SurfaceRepaintEngine();
       e.request();
-      expect(e.tick().done, isFalse);
+      e.tick();
       e.abort();
       expect(e.isLooping, isFalse);
       expect(e.tick().done, isTrue);
     });
   });
 
-  group('interleaving under FakeAsync (the nudge-loop race)', () {
-    // Host harness mirroring _nudgeSurfaceRepaint but Timer-based (no Flutter):
-    // two nudges fired mid-loop must coalesce onto ONE loop that terminates —
-    // the race attempts 2-3 fixed by making the loop re-entrant.
-    test('two nudges 50ms apart run a single terminating loop', () {
-      fakeAsync((async) {
-        final e = SurfaceRepaintEngine();
-        var pulses = 0;
-        var loopsStarted = 0;
-
-        void nudge() {
-          if (!e.request()) return;
-          loopsStarted++;
-          void tick() {
-            final t = e.tick();
-            if (t.done) return;
-            pulses++;
-            Future.delayed(const Duration(milliseconds: 100), tick);
-          }
-
-          tick();
-        }
-
-        nudge();
-        Future.delayed(const Duration(milliseconds: 50), nudge);
-        async.elapse(const Duration(seconds: 3));
-
-        expect(loopsStarted, 1, reason: 'coalesced onto a single loop');
-        expect(e.isLooping, isFalse, reason: 'loop terminated');
-        expect(pulses, greaterThan(SurfaceRepaintEngine.ticksPerRequest),
-            reason: 'the coalesced request refilled the shared budget');
-      });
-    });
-  });
+  // The host loop and window run against the real controller in
+  // test/surface_repaint_controller_test.dart.
 
   group('warm-start ordering (BUG-001 Attempt 8 / PAUSE-020)', () {
     // Code-layer mirror of formal/warmstart.tla. The warm-start white screen is
@@ -213,42 +160,43 @@ void main() {
 
     test('reproduce: the issue-time nudge drains before the recommit', () {
       final e = SurfaceRepaintEngine();
-      e.reloadIssued();
+      e.noteCommitPending();
       e.request();
       drain(e);
       expect(e.owed, isFalse, reason: 'nothing has re-attached yet');
 
       // The new document commits onto the surface only now. Pre-Attempt-9
       // there was no signal here, so no nudge ran against it.
-      expect(e.consumeLoadSettled(), isTrue);
+      expect(e.noteLoadSettled(), isTrue);
       expect(e.owed, isTrue,
           reason: 'BUG-001: the recommitted surface is left unpainted');
     });
 
     test('fix: the load-settled re-nudge repaints the recommit', () {
       final e = SurfaceRepaintEngine();
-      e.reloadIssued();
+      e.noteCommitPending();
       e.request();
       drain(e);
 
-      expect(e.consumeLoadSettled(), isTrue);
+      expect(e.noteLoadSettled(), isTrue);
       e.request();
       drain(e);
       expect(e.owed, isFalse);
     });
 
-    test('the latch is one-shot: a later unrelated load does not nudge', () {
+    test('a closed window means a later unrelated load does not nudge', () {
       final e = SurfaceRepaintEngine();
-      e.reloadIssued();
-      expect(e.consumeLoadSettled(), isTrue);
+      e.noteCommitPending();
+      expect(e.noteLoadSettled(), isTrue);
+      e.closeCommitWindow();
       expect(e.commitPending, isFalse);
-      expect(e.consumeLoadSettled(), isFalse,
+      expect(e.noteLoadSettled(), isFalse,
           reason: 'an ordinary navigation must not trigger a repaint');
     });
 
     test('a load settling with no reload in flight owes nothing', () {
       final e = SurfaceRepaintEngine();
-      expect(e.consumeLoadSettled(), isFalse);
+      expect(e.noteLoadSettled(), isFalse);
       expect(e.owed, isFalse);
     });
 
@@ -271,10 +219,10 @@ void main() {
             tick();
           }
 
-          e.reloadIssued();
+          e.noteCommitPending();
           nudge();
           Future.delayed(const Duration(seconds: 2), () {
-            if (e.consumeLoadSettled() && withSettledRenudge) nudge();
+            if (e.noteLoadSettled() && withSettledRenudge) nudge();
           });
           async.elapse(const Duration(seconds: 5));
 
@@ -341,7 +289,7 @@ void main() {
         e.attach();
         nudge();
         Future.delayed(const Duration(seconds: 3), () {
-          if (e.consumeLoadSettled()) nudge();
+          if (e.noteLoadSettled()) nudge();
         });
         async.elapse(const Duration(seconds: 6));
 
@@ -349,13 +297,83 @@ void main() {
       });
     });
 
-    test('a reload latch and a first-commit latch are the same one-shot', () {
+    test('a reload latch and a first-commit latch arm the same window', () {
       final e = SurfaceRepaintEngine();
       e.noteCommitPending();
-      e.reloadIssued();
-      expect(e.consumeLoadSettled(), isTrue);
-      expect(e.consumeLoadSettled(), isFalse,
-          reason: 'one pending commit, one repaint');
+      e.noteCommitPending();
+      expect(e.noteLoadSettled(), isTrue);
+      expect(e.noteLoadSettled(), isTrue,
+          reason: 'the window stays open until the host closes it');
+      e.closeCommitWindow();
+      expect(e.noteLoadSettled(), isFalse);
+    });
+  });
+
+  group('rapid-refresh ordering (BUG-001 Attempt 11 / PAUSE-027)', () {
+    // Reported: "if I hit refresh often it's still there; hitting refresh
+    // again helps". Two refreshes land inside one document's lifetime, so the
+    // aborted load settles first and the replacement settles after it. Under
+    // the one-shot latch the first settle spent the repaint on a document that
+    // was already discarded, and the one the user is looking at stayed blank.
+
+    void drain(SurfaceRepaintEngine e) {
+      RepaintTick t;
+      do {
+        t = e.tick();
+      } while (!t.done);
+    }
+
+    // The pre-fix latch: the first settle after an issue consumes it.
+    bool oneShotSettle(SurfaceRepaintEngine e) {
+      if (!e.commitPending) return false;
+      e.closeCommitWindow();
+      e.attach();
+      return true;
+    }
+
+    test('reproduce: a one-shot latch leaves the second refresh unpainted', () {
+      final e = SurfaceRepaintEngine();
+      e.noteCommitPending(); // refresh #1
+      e.request();
+      drain(e);
+      e.noteCommitPending(); // refresh #2, issued while #1 is in flight
+      e.request();
+      drain(e);
+
+      expect(oneShotSettle(e), isTrue,
+          reason: "refresh #1's load aborts and settles first");
+      e.request();
+      drain(e);
+
+      expect(oneShotSettle(e), isFalse,
+          reason: "refresh #2's commit finds the latch already spent");
+      // Which is the bug: that commit is the surface the user is looking at.
+      e.attach();
+      expect(e.owed, isTrue);
+    });
+
+    test('fix: the window repaints every commit inside it', () {
+      final e = SurfaceRepaintEngine();
+      e.noteCommitPending();
+      e.noteCommitPending();
+
+      expect(e.noteLoadSettled(), isTrue, reason: 'aborted load settles');
+      e.request();
+      drain(e);
+
+      expect(e.noteLoadSettled(), isTrue,
+          reason: 'the replacement commits and still repaints');
+      e.request();
+      drain(e);
+      expect(e.owed, isFalse);
+    });
+
+    test('a redirect chain settling twice repaints both commits', () {
+      // One issue, two settles: the interstitial commits, then the target.
+      final e = SurfaceRepaintEngine();
+      e.noteCommitPending();
+      expect(e.noteLoadSettled(), isTrue);
+      expect(e.noteLoadSettled(), isTrue);
     });
   });
 }

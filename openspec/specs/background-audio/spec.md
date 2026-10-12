@@ -116,7 +116,7 @@ is driven by actual playback, in BGAUDIO-010.
 
 Sync points (all idempotent, routed through
 `BackgroundTaskService.setBackgroundAudioActive`): per-site settings save,
-site activation tail (`_setCurrentIndex`), site deletion GC, and the
+site activation tail (`setCurrentIndex`), site deletion GC, and the
 lifecycle `paused` branch.
 
 #### Scenario: Toggling the setting on prepares the audio session
@@ -241,7 +241,7 @@ constraints.
 - The notification exposes **play/pause/stop only** — next/previous have no
   universal web mechanism, so dead buttons are deliberately omitted.
 - The service runs only while a background-audio site is loaded and playing;
-  when the last such site unloads, `_updateBackgroundAudioSession` calls
+  when the last such site unloads, `BackgroundSitesController.updateAudioSession` calls
   `stopAll`. Enabling the toggle requests `POST_NOTIFICATIONS` so the media
   controls are visible on Android 13+.
 - Scope: the media notification is driven by the **root** site webview. A
@@ -270,7 +270,7 @@ resumable paused state
 
 **Given** the media notification is showing
 **When** the only background-audio site is unloaded or its toggle is turned off
-**Then** `_updateBackgroundAudioSession` finds no loaded background-audio site
+**Then** `BackgroundSitesController.updateAudioSession` finds no loaded background-audio site
 and calls `MediaSessionService.stopAll`, stopping the foreground service
 
 #### Scenario: A player that never enters the DOM still raises the notification
@@ -366,8 +366,15 @@ therefore be frame-scoped:
   has nothing to say about playback.
 - `MediaSessionService` SHALL record the reporting frame on every
   `playing: true` and SHALL accept `playing: false` only from that same
-  frame of that same site. Ownership moves with playback: a report of
-  `playing: true` from another frame makes that frame the owner.
+  frame of that same site.
+- Ownership moves with playback, but not to any frame that asks for it. The
+  frame token is minted by the shim, which runs in an ad iframe too, so "who
+  reported last" is otherwise all it takes to retitle what the user is
+  listening to and inherit its transport controls. A **subframe** report of
+  `playing: true` SHALL therefore take ownership only when no main frame holds
+  it. A main-frame report takes ownership as before. Whether a report came from
+  the top document SHALL be read from the `wsMediaSession` handler's frame data
+  (computed by the plugin's bridge preamble), never from the page's payload.
 
 Without this, a site whose player sits in the main frame is silenced by its
 own subframes: the ad iframe reports `playing: false` for the same `siteId`
@@ -389,12 +396,22 @@ notification is up
 **And** even if it did report `playing: false`, the frame guard would drop it
 (regression test: `test/media_session_service_test.dart`)
 
+#### Scenario: An ad iframe cannot retitle what is playing
+
+**Given** a background-audio site is playing in its main frame and the
+notification is up
+**When** a subframe of the same site reports `playing: true` with its own
+title and artwork
+**Then** the notification still shows the main frame's track
+(regression test: `test/media_session_service_test.dart`)
+
 #### Scenario: Playback moving between frames transfers ownership
 
-**Given** the main frame raised the notification
-**When** a subframe reports `playing: true`
+**Given** a background-audio site whose top document never plays anything
+**When** its player iframe reports `playing: true`
 **Then** the subframe becomes the owner and its later `playing: false` is
 honored
+**And** a main-frame report takes ownership from any frame, as before
 
 ---
 
@@ -420,6 +437,11 @@ the ordering constraint CAM-012 already carries):
 - the defensive sweep over other loaded sites at the tail of a switch;
 - every index in `LifecycleBackgroundPlan.mediaPauseIndices` on app background.
 
+On app background it SHALL also precede the cookie flush, which is the other
+platform call the handler makes: Android's `CookieManager.flush()` blocks the
+platform thread on disk I/O, and channel messages behind it wait — the element
+decodes on for as long as the stop sits in a queue.
+
 `AppLifecycleEngine.backgroundPlan` SHALL populate `mediaPauseIndices` with
 every loaded, in-bounds site WITHOUT background audio, ascending. Unlike the
 JS-pause veto (BGAUDIO-002), the exemption here is per-site: one opted-in site
@@ -430,7 +452,7 @@ ask for is worse than leaving it paused where they can hit play.
 Pausing the media is not enough on iOS: WebKit publishes its own Now Playing
 info for any page that plays, and that entry outlives the audio as a control
 whose play button reaches a site the app is no longer keeping alive. When no
-loaded site has the toggle, `_updateBackgroundAudioSession` SHALL therefore
+loaded site has the toggle, `BackgroundSitesController.updateAudioSession` SHALL therefore
 call `MediaSessionService.clearOsMediaSurface()`, which clears the surface
 even when the app never raised it (`stopAll` alone cannot: it early-returns
 because nothing of ours is active). Three things that clearing needs to
@@ -487,6 +509,9 @@ on the Android emulator
 **When** the test injects `AppLifecycleState.paused`, waits, then `resumed`
 **Then** the beacons that follow the resume report `paused=true` with an
 unchanged `currentTime`
+**And** the media clock advanced by less than the background window it sat out,
+measured against the wall clock the run actually took: a fixed budget reads a
+slow emulator's foreground as a site that kept playing
 **And** `notificationPosted()` is false — no media surface for a site that
 never opted in
 (regression test: `integration_test/background_audio_media_stop_test.dart`)
@@ -722,7 +747,7 @@ the events reach the page as they always have
 - `lib/services/app_lifecycle_engine.dart` — `anyLoadedBackgroundAudio`,
   plan/resume gating; BGAUDIO-009 `mediaPauseIndices`.
 - `lib/main.dart` — engine callbacks, decision log line, retention tier,
-  `_updateBackgroundAudioSession` sync points; BGAUDIO-009 media stop at the
+  `BackgroundSitesController.updateAudioSession` sync points; BGAUDIO-009 media stop at the
   site-switch, going-home, sweep and app-background call sites.
 - `lib/services/background_task_service.dart` — `setBackgroundAudioActive`.
 - `ios/Runner/BackgroundTaskPlugin.swift`, `ios/Runner/Info.plist` —
@@ -733,9 +758,8 @@ the events reach the page as they always have
 - `lib/services/site_settings_qr_codec.dart` — QR-shareable key.
 - `lib/services/webview.dart` — `WebViewConfig.backgroundAudioEnabled`, media
   shim injection (+ the BGAUDIO-007 armed line), `wsMediaSession` handler.
-- `lib/services/media_session_shim.dart` — BGAUDIO-009 `buildMediaPauseJs`
-  (dumped to `test/js_fixtures/media_session/pause_media.js`); BGAUDIO-012
-  visibility mask, background watchdog and `__wsMediaBackground`.
+- `lib/js/media_pause.js` — BGAUDIO-009; `lib/js/media_session.js` —
+  BGAUDIO-012 visibility mask, background watchdog and `__wsMediaBackground`.
 - `lib/services/media_session_shim.dart`, `lib/services/media_session_service.dart`
   — BGAUDIO-006 page-JS bridge + Dart channel bridge; BGAUDIO-007 detached-
   element registry, raise/teardown logging and the visibility check;
@@ -745,9 +769,8 @@ the events reach the page as they always have
   `.../MediaSessionPlugin.kt`, `MainActivity.kt`, `AndroidManifest.xml` —
   BGAUDIO-006 foreground media service + permissions; BGAUDIO-007
   `isNotificationActive`.
-- `tool/dump_shim_js.dart` + `test/js_fixtures/media_session/shim.js` — the
-  media-session shim joins the dumped-fixture pipeline so the browser tier
-  runs the exact injected string.
+- `lib/js/media_session.js` — the media-session shim, which the browser tier
+  runs as the app injects it.
 
 ### Added
 

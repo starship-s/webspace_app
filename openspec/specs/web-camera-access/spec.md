@@ -152,9 +152,17 @@ decision is not inherited across the origin change.
 **And** the answer is reused for further requests within that nested screen
 **And** nothing is persisted
 
+#### Scenario: The parent's device grant does not follow the link
+
+**Given** site "Acme" is set to `real`
+**When** a link on it opens a nested webview on another domain and that page requests the camera
+**Then** the nested screen starts from `ask` (`SitePosture.forNested` maps `real` to `ask`; `block` and `virtual` are inherited as they are)
+**And** the Allow/Block popup names the nested page's origin before the device opens
+
 ### Requirement: CAM-006 — Archive-tier sites deny silently
 
-`effectiveCameraMode` SHALL be `block` for archive-tier sites regardless
+The camera's effective mode (`WebViewModel.effectiveCaptures`, folded by
+`ArchiveFold.captures`) SHALL be `block` for archive-tier sites regardless
 of stored value (ARCH-006: the popup, the file picker, and Android's OS
 permission dialog are OS-level UI). No popup is shown; the stored mode
 and any picked source are preserved for when the site leaves the archive.
@@ -198,12 +206,11 @@ fingerprinter inspects: the overrides live on `MediaDevices.prototype` and
 leak), every override stringifies as `[native code]` including the `label`
 accessor, the track reports as `MediaStreamTrack` rather than
 `CanvasCaptureMediaStreamTrack`, and a track the shim did not create keeps
-its real label and settings. Probes live in
-`test/browser/lie_detection.test.js`; two gaps remain open there as `todo`
-because they are shared by every shim in the repo rather than specific to
-the camera (the `__ws*` install markers are enumerable on `window`, and a
-parent realm's `Function.prototype.toString` reveals an override defined in
-a child realm). When `virtual` is selected but no source has been picked,
+its real label and settings, also when one same-origin realm stringifies
+another's override. Probes live in `test/browser/lie_detection.test.js`; one
+gap remains open there as `todo` because it is shared by every shim in the
+repo rather than specific to the camera: the `__ws*` install markers are
+enumerable on `window`. When `virtual` is selected but no source has been picked,
 the request MUST be denied and the picker re-offered.
 
 #### Scenario: Virtual stream replaces the camera
@@ -242,6 +249,26 @@ from the constraints before the real camera is opened
 **When** the page calls `getUserMedia({video: true})`
 **Then** the request is denied (NotAllowedError) rather than opening the real camera
 
+### Requirement: CAM-015 — The picked file carries no metadata
+
+The stream a virtual source produces observes nothing, but the file behind it
+was taken by the user's own device, and the shim hands the file's bytes to page
+script as a `data:` URL that any frame can also fetch from the bridge directly.
+At pick time the source SHALL therefore be stripped of what it says about the
+user (`lib/services/media_metadata_strip.dart`): an image is re-encoded without
+EXIF, XMP or ICC (JPEG stays JPEG, everything else becomes PNG); an ISO-BMFF
+video (mp4, m4v, mov) has every `udta`, `meta` and `uuid` box overwritten in
+place with `free` so chunk offsets stay valid. A container the walker does not
+parse (webm, ogv) is delivered as picked. The same rule covers the shared
+surface (SHARE-016) and the microphone clip (MIC-017).
+
+#### Scenario: A phone photo becomes the camera
+
+**Given** the user picks a JPEG whose EXIF carries GPS coordinates, the device model and the capture time
+**When** the pick completes
+**Then** the `data:` URL on the model decodes to a JPEG with no EXIF segment
+**And** a page reading the bridge response sees the pixels and nothing else
+
 ### Requirement: CAM-010 — Real-Android-WebView coverage
 
 The camera modes SHALL be exercised on a real Android WebView by
@@ -274,11 +301,25 @@ a frame onto a canvas
 rather than freezing on the first decoded frame
 
 The probe waits for that change rather than sampling a fixed window: the
-emulator's software decoder runs the clip several times slower than real time
-and at a rate that varies per runner, so a fixed window turns a correctly
-playing stream into a red build (the same 4s window produced 8, 2 and 0
-transitions across runs). It samples until the first transition or 30s, so a
-stalled decoder still fails and a healthy one exits in about a second.
+emulator's software decoder runs the clip slower than real time and at a rate
+that varies per runner, so a fixed window can close before a correctly playing
+stream has shown both colours. It samples until the first transition or 30s, so
+a stalled decoder still fails and a healthy one exits in about a second.
+
+The fixture SHALL alternate its two colours on every frame, so each colour
+holds half the clip's media time and the first transition costs two decoded
+frames. Its predecessor carried the second colour on a single frame at the very
+end of the clip — the generator painted the canvas twice and let
+`captureStream(10)` sample it, and that capture emits a frame only when the
+canvas is touched — which left a sampler racing the loop wrap for that colour.
+That race is the 8/2/0 variance above, and a run that saw one colour across 300
+samples. `tool/generate_camera_video_fixture.js` enforces the property at
+generation time — it decodes what it just encoded, walks the presented frames,
+and refuses to write the fixture unless the first flip lands on frame 1 — and
+`test/browser/camera_stream_real_engine.test.js` re-derives it from the
+committed bytes in CI. This tightens the freeze check rather than loosening it,
+since a stream stuck on frame 0 still reports a single colour. Lineage:
+[docs/bugs/010-camera-clip-flip-flake.md](../../../docs/bugs/010-camera-clip-flip-flake.md).
 
 #### Scenario: Blocked site is denied on-device
 
@@ -310,8 +351,9 @@ running JS (pause is not a security boundary, see
 this a background site can pop a permission dialog the user reads as
 belonging to the site on screen, or — with a remembered `real`/`virtual`
 grant — start capture with nothing on screen to attribute it to. The gate
-lives in `CameraDecisionEngine.decide` as a required `isSiteActive`
-predicate, so a new call site cannot be wired up without answering it.
+lives in `GrantStore.capture` (`media_grant_engine.dart`), whose
+constructor takes a required `isSiteActive` predicate, so a new store cannot
+be wired up without answering it.
 
 Only the grant is gated. The non-prompting `webCameraMode` read behind
 `enumerateDevices` is not: the shim caches it for the document's lifetime,
@@ -372,6 +414,70 @@ Two ordering properties hold at every call site, both gated structurally by
   notification and background-audio sites — exactly the sites whose JS keeps
   running while backgrounded.
 
+The stop runs in the page's own realm, so the page can call it — which is
+harmless — but SHALL NOT be able to defeat it. The hook is therefore installed
+non-writable and non-configurable, its track lists are closed over rather than
+held on `globalThis`, and its skip list refuses a track already registered as
+device-backed. Registration SHALL carry onto a clone (`MediaStreamTrack.clone`,
+`MediaStream.clone`), since a clone is independently live and stopping the
+original leaves it capturing.
+
+Closing the state over the install block is only half of it: everything the hook
+CALLS is resolved when the hook runs, which is long after page script has. Every
+platform primitive it depends on — `WeakRef`, `MediaStreamTrack.prototype.stop`,
+that prototype's `readyState` getter, `MediaStream.prototype.getTracks` — SHALL
+therefore be captured inside the install block and invoked with `.call()`. Left
+as a bare lookup each one is an ordinary writable global that neuters the stop
+from outside without touching the hook: a `WeakRef` whose `deref` returns null
+empties the registry, a no-op `stop` makes the hook report a stop it never
+performed, and a `getTracks` returning `[]` means nothing is ever registered
+while `getVideoTracks` keeps serving the page.
+
+Because Dart evaluates in the main frame only and the shim is injected
+`forMainFrameOnly: false`, the hook SHALL relay the stop down the frame tree. It
+SHALL walk children by index rather than through `frames` or `length`: both are
+`[Replaceable]` on `Window`, so either one hides every subframe behind a single
+assignment, while indexed access is unforgeable (WindowProxy
+`[[DefineOwnProperty]]` rejects array indices). It SHALL deliver by both a
+direct hook call and `postMessage`, since each path alone is tamperable from a
+different side — a same-origin child can null its own `postMessage`, and a frame
+the shim never reached could define a hostile hook — while a cross-origin child
+can do neither. A relayed message can only end capture, never start it.
+
+Regression: `test/js/capture_stop_tamper.test.js`, every case of which fails
+against the pre-hardening registry.
+
+#### Scenario: The page cannot neutralise the stop
+
+**Given** a site in `real` mode holding a live camera track
+**When** page script replaces `__wsStopRealCapture`, empties a global track
+list, or marks its device track as substituted
+**And** the user switches to another site
+**Then** the track still ends
+
+#### Scenario: The page cannot neutralise what the stop calls
+
+**Given** a site in `real` mode
+**When** page script replaces `WeakRef`, `MediaStreamTrack.prototype.stop`, its
+`readyState` getter, or `MediaStream.prototype.getTracks` before or after the
+grant
+**And** the user switches to another site
+**Then** the track still ends, and the hook does not report a stop it did not
+perform
+
+#### Scenario: A subframe cannot be hidden from the relay
+
+**Given** a site whose subframe holds a device track
+**When** page script sets `window.frames` or `window.length` to hide it
+**And** the user switches to another site
+**Then** the relay still reaches that subframe and its capture ends
+
+#### Scenario: A cloned device track is ended too
+
+**Given** a site in `real` mode that cloned the track it was handed
+**When** the user switches to another site
+**Then** both the original and the clone end
+
 #### Scenario: Switching away ends the camera
 
 **Given** a site in `real` mode holding a live camera track
@@ -406,6 +512,71 @@ the request rather than fall through to the device camera.
 
 ---
 
+### Requirement: CAM-013 — The prompt names an origin the page did not choose
+
+The origin rendered in the camera decision dialog SHALL be read from the
+webview (`controller.getUrl()`, falling back to the site's configured
+URL), never from the shim's argument. The camera shim is injected
+`forMainFrameOnly: false`, and `flutter_inappwebview.callHandler` is
+reachable from any frame's own script, so a page-supplied origin lets a
+frame ask the user for camera access in another site's name.
+
+#### Scenario: A page-supplied origin is ignored
+
+**Given** site "Acme" is loaded at `https://acme.example/app`
+**When** page script calls the `webCameraRequest` handler with
+`"https://bank.example"` as its argument
+**Then** the decision dialog names `https://acme.example/app`
+
+---
+
+### Requirement: CAM-014 — A device grant does not travel to a subframe
+
+The camera shim is injected `forMainFrameOnly: false` so a QR scanner embedded
+in a cross-origin frame is covered (CAM-004). That also puts a third-party ad
+frame on the same handler, and `real` is the one mode that opens the device.
+A settled `real` grant SHALL therefore short-circuit only for the top document;
+a subframe SHALL be asked separately, and its popup SHALL name the frame's own
+origin (computed by the plugin's bridge preamble, so page script can neither
+forge it nor call the handler around it). The answer a subframe popup produced
+SHALL apply to that request only and SHALL NOT be written back to the site's
+stored mode — one frame cannot flip the whole site to `real`. Request
+coalescing SHALL be keyed by prompt origin, so a subframe never rides the
+answer the user gave for the top document.
+
+The device-free answers are inherited as they are: `block` denies, and
+`virtual` serves the file the user picked, which observes nothing.
+
+Allowing a frame makes the shim call the real `getUserMedia`, and the platform
+permission request that follows reaches the same resolver milliseconds later
+for the same origin. A subframe answer SHALL therefore be held for a short
+grace window, keyed by prompt origin, so that follow-up reuses it rather than
+asking the user the same question twice. The window does not persist anything
+and cannot hand back an answer given for a different frame.
+
+Gated by `test/js/page_bridge_authority.test.js` and
+`test/media_grant_engine_test.dart`.
+
+#### Scenario: An ad frame does not inherit the site's camera
+
+**Given** site "Acme" is set to `real` and is the site on screen
+**When** a cross-origin frame it embeds calls `getUserMedia({video: true})`
+**Then** the user is asked, and the dialog names the frame's origin
+**And** the site's own mode is still `real` whatever the user answers
+
+#### Scenario: A frame's allow does not become the site's
+
+**Given** site "Acme" is set to `ask`
+**When** a cross-origin frame asks and the user allows it
+**Then** the frame gets its stream
+**And** the site's stored mode is still `ask`
+
+#### Scenario: A QR scanner in a frame still works unprompted
+
+**Given** site "Acme" is set to `virtual` with a picked image
+**When** a cross-origin frame calls `getUserMedia({video: true})`
+**Then** it is served the picked image with no popup
+
 ## Platform notes
 
 - **Android**: grant requires the app's CAMERA runtime permission
@@ -425,7 +596,8 @@ the request rather than fall through to the device camera.
   camera and its prompt are never touched on any platform. The picked
   source is inlined as a `data:` URL on the model (like `customIconPng`)
   so it rides settings backups and lives inside the encrypted archive
-  slice for archive-tier sites; `VirtualCameraService` caps it at 24 MiB.
+  slice for archive-tier sites; `VirtualMediaPicker` caps a visual source at
+  24 MiB.
 - Tracking Protection does not force-block camera (unlike protected
   content, ETP-023): capture starts only after an explicit per-site Allow
   or a user-picked file, so it is not a silent tracking vector.

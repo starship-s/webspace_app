@@ -15,7 +15,8 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'file_store_web.dart' if (dart.library.io) 'file_store_io.dart' as impl;
+import 'package:webspace/services/host_storage.dart' as impl
+    show createFileStore;
 
 abstract class FileStore {
   /// Create the directory if it does not exist.
@@ -26,14 +27,18 @@ abstract class FileStore {
   /// File contents, or null when the file is absent or unreadable.
   Future<String?> readText(String name);
 
-  Future<void> writeText(String name, String contents);
+  Future<void> writeText(String name, {required String contents});
 
   /// Binary contents, or null when absent or unreadable.
   Future<Uint8List?> readBytes(String name);
 
-  Future<void> writeBytes(String name, List<int> bytes);
+  Future<void> writeBytes(String name, {required List<int> bytes});
 
   Future<void> delete(String name);
+
+  /// Identifies what [name] holds without reading it: a write that changes it
+  /// changes the stamp. Null when absent.
+  Future<String?> stamp(String name);
 
   /// File names (not paths) currently in the directory.
   Future<List<String>> list();
@@ -46,29 +51,53 @@ abstract class FileStore {
 FileStore defaultFileStore(String directoryName) =>
     impl.createFileStore(directoryName);
 
+/// Throw unless [name] addresses a direct child of the store directory.
+///
+/// Callers build names from ids that can originate in an imported backup
+/// (site ids, filter-list ids); a store entry must never be able to reach
+/// outside its directory even when a caller forgets to validate its id.
+void checkFileStoreName(String name) {
+  if (name.isEmpty ||
+      name.contains('/') ||
+      name.contains(r'\') ||
+      name.contains('..')) {
+    throw ArgumentError.value(name, 'name', 'escapes the store directory');
+  }
+}
+
 /// In-memory [FileStore]. The web implementation and the fake tests reach for:
 /// same semantics, no disk.
 class MemoryFileStore implements FileStore {
   final Map<String, String> _files = {};
   final Map<String, Uint8List> _bytes = {};
+  final Map<String, int> _writes = {};
+  int _writeCount = 0;
 
   @override
   Future<void> ensure() async {}
 
   @override
-  Future<bool> exists(String name) async =>
-      _files.containsKey(name) || _bytes.containsKey(name);
+  Future<bool> exists(String name) async {
+    checkFileStoreName(name);
+    return _files.containsKey(name) || _bytes.containsKey(name);
+  }
 
   @override
-  Future<String?> readText(String name) async => _files[name];
+  Future<String?> readText(String name) async {
+    checkFileStoreName(name);
+    return _files[name];
+  }
 
   @override
-  Future<void> writeText(String name, String contents) async {
+  Future<void> writeText(String name, {required String contents}) async {
+    checkFileStoreName(name);
     _files[name] = contents;
+    _writes[name] = ++_writeCount;
   }
 
   @override
   Future<Uint8List?> readBytes(String name) async {
+    checkFileStoreName(name);
     final bytes = _bytes[name];
     if (bytes != null) return bytes;
     final text = _files[name];
@@ -76,14 +105,25 @@ class MemoryFileStore implements FileStore {
   }
 
   @override
-  Future<void> writeBytes(String name, List<int> bytes) async {
+  Future<void> writeBytes(String name, {required List<int> bytes}) async {
+    checkFileStoreName(name);
     _bytes[name] = Uint8List.fromList(bytes);
+    _writes[name] = ++_writeCount;
   }
 
   @override
   Future<void> delete(String name) async {
+    checkFileStoreName(name);
     _files.remove(name);
     _bytes.remove(name);
+    _writes.remove(name);
+  }
+
+  @override
+  Future<String?> stamp(String name) async {
+    checkFileStoreName(name);
+    final write = _writes[name];
+    return write == null ? null : '$write';
   }
 
   @override
@@ -93,5 +133,6 @@ class MemoryFileStore implements FileStore {
   Future<void> deleteAll() async {
     _files.clear();
     _bytes.clear();
+    _writes.clear();
   }
 }

@@ -10,6 +10,9 @@
 ///   change as the device moves.
 enum LocationMode { off, spoof, live }
 
+/// Accuracy in meters a spoofed Position reports until the user sets one.
+const double kDefaultSpoofAccuracy = 50.0;
+
 /// Granularity of the fix surfaced by [LocationMode.live]. Three tiers
 /// trade off precision for permission posture and OS resource use:
 ///
@@ -54,6 +57,34 @@ enum LocationGranularity { gps, approximate, gsm }
 /// Real IP does not leak but WebRTC breaks unless a TURN server is reachable.
 /// [disabled] — neutralize `RTCPeerConnection` entirely.
 enum WebRtcPolicy { defaultPolicy, relayOnly, disabled }
+
+/// Where the site is told the device is, and how it may find out.
+typedef SiteLocation = ({
+  LocationMode mode,
+  double? latitude,
+  double? longitude,
+  double accuracy,
+  // The effective zone, "From picked location" already resolved at save.
+  String? timezone,
+  LocationGranularity granularity,
+  WebRtcPolicy webRtc,
+});
+
+/// The policy a webview actually runs (ETP-031). Tracking Protection on a
+/// proxied site raises [WebRtcPolicy.defaultPolicy] to
+/// [WebRtcPolicy.relayOnly]: a direct ICE candidate carries the device IP
+/// around the proxy. [WebRtcPolicy.disabled] is stricter and stays; the
+/// stored value comes back when either condition goes away.
+WebRtcPolicy resolveWebRtcPolicy({
+  required WebRtcPolicy stored,
+  required bool trackingProtectionEnabled,
+  required bool proxied,
+}) =>
+    trackingProtectionEnabled &&
+            proxied &&
+            stored == WebRtcPolicy.defaultPolicy
+        ? WebRtcPolicy.relayOnly
+        : stored;
 
 /// Common IANA timezone names shown in the per-site settings picker.
 /// The list is intentionally curated — `Intl.supportedValuesOf('timeZone')`

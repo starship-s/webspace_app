@@ -1,7 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/settings/proxy.dart';
 import 'package:webspace/web_view_model.dart';
-import 'package:webspace/services/webview.dart';
+import 'package:webspace/services/webview_proxy.dart';
 
 void main() {
   group('Proxy Integration Tests', () {
@@ -96,7 +96,8 @@ void main() {
       final savedJson = viewModel.toJson();
 
       // Simulate app restart - deserialize (load from disk)
-      final restoredViewModel = WebViewModel.fromJson(savedJson, null);
+      final restoredViewModel =
+          WebViewModel.fromJson(savedJson, stateSetterF: null);
 
       // Verify all settings including proxy are restored
       expect(restoredViewModel.initUrl, viewModel.initUrl);
@@ -190,7 +191,7 @@ void main() {
 
       // Serialize and verify it can be restored
       final json = viewModel.toJson();
-      final restored = WebViewModel.fromJson(json, null);
+      final restored = WebViewModel.fromJson(json, stateSetterF: null);
 
       expect(restored.proxySettings.type, ProxyType.SOCKS5);
       expect(restored.proxySettings.address, '127.0.0.1:1080');

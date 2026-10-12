@@ -15,7 +15,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webspace/main.dart' as app;
-import 'package:webspace/demo_data.dart';
+import 'package:webspace/settings/demo_mode.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -118,7 +118,7 @@ void main() {
     await tester.tap(deleteIcon);
     await tester.pumpAndSettle(const Duration(seconds: 5));
 
-    // Confirmation dialog (lib/main.dart `_deleteWebspace` shows
+    // Confirmation dialog (`DialogWebspacePrompts.confirmDelete` shows
     // a generic confirm dialog with Cancel / Delete buttons).
     final confirmDelete = find.widgetWithText(TextButton, 'Delete');
     if (confirmDelete.evaluate().isEmpty) {

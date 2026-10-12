@@ -5,7 +5,10 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/archive_crypto.dart';
 
 void main() {
-  group('ArchiveCrypto.deriveSalt', () {
+  // Superseded by the per-install random salt from `ArchiveStorage`; these
+  // stay because pre-upgrade slots and pre-upgrade exported sections are still
+  // opened with it (once, before being re-sealed).
+  group('ArchiveCrypto.deriveSalt (legacy)', () {
     test('is deterministic for the same passphrase', () async {
       final a = await ArchiveCrypto.deriveSalt('correct horse battery staple');
       final b = await ArchiveCrypto.deriveSalt('correct horse battery staple');
@@ -23,24 +26,24 @@ void main() {
   group('ArchiveCrypto.hmac', () {
     test('is deterministic for the same key + label', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
-      final a = await ArchiveCrypto.hmac(key, 'container:abc');
-      final b = await ArchiveCrypto.hmac(key, 'container:abc');
+      final a = await ArchiveCrypto.hmac(key, info: 'container:abc');
+      final b = await ArchiveCrypto.hmac(key, info: 'container:abc');
       expect(a, equals(b));
       expect(a.length, equals(32));
     });
 
     test('differs for different labels', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
-      final a = await ArchiveCrypto.hmac(key, 'container:abc');
-      final b = await ArchiveCrypto.hmac(key, 'container:xyz');
+      final a = await ArchiveCrypto.hmac(key, info: 'container:abc');
+      final b = await ArchiveCrypto.hmac(key, info: 'container:xyz');
       expect(a, isNot(equals(b)));
     });
 
     test('differs for different keys', () async {
       final keyA = Uint8List.fromList(List<int>.generate(32, (i) => i));
       final keyB = Uint8List.fromList(List<int>.generate(32, (i) => 255 - i));
-      final a = await ArchiveCrypto.hmac(keyA, 'container:abc');
-      final b = await ArchiveCrypto.hmac(keyB, 'container:abc');
+      final a = await ArchiveCrypto.hmac(keyA, info: 'container:abc');
+      final b = await ArchiveCrypto.hmac(keyB, info: 'container:abc');
       expect(a, isNot(equals(b)));
     });
   });
@@ -49,47 +52,51 @@ void main() {
     test('round-trips plaintext under matching key', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
       final plaintext = Uint8List.fromList(utf8.encode('hello world'));
-      final wire = await ArchiveCrypto.seal(key, plaintext);
-      final out = await ArchiveCrypto.open(key, wire);
+      final wire = await ArchiveCrypto.seal(key, plaintext: plaintext);
+      final out = await ArchiveCrypto.open(key, wire: wire);
       expect(out, equals(plaintext));
     });
 
     test('wire format begins with nonce, ends with mac, contains ciphertext', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
       final plaintext = Uint8List.fromList(utf8.encode('x'));
-      final wire = await ArchiveCrypto.seal(key, plaintext);
+      final wire = await ArchiveCrypto.seal(key, plaintext: plaintext);
       expect(wire.length, equals(kArchiveNonceLength + 1 + kArchiveMacLength));
     });
 
     test('returns null with wrong key', () async {
       final keyA = Uint8List.fromList(List<int>.generate(32, (i) => i));
       final keyB = Uint8List.fromList(List<int>.generate(32, (i) => 255 - i));
-      final wire = await ArchiveCrypto.seal(keyA, Uint8List.fromList(utf8.encode('hi')));
-      final out = await ArchiveCrypto.open(keyB, wire);
+      final wire = await ArchiveCrypto.seal(keyA,
+          plaintext: Uint8List.fromList(utf8.encode('hi')));
+      final out = await ArchiveCrypto.open(keyB, wire: wire);
       expect(out, isNull);
     });
 
     test('returns null with tampered ciphertext', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
-      final wire = await ArchiveCrypto.seal(key, Uint8List.fromList(utf8.encode('hi')));
+      final wire = await ArchiveCrypto.seal(key,
+          plaintext: Uint8List.fromList(utf8.encode('hi')));
       wire[kArchiveNonceLength] ^= 0x01;
-      final out = await ArchiveCrypto.open(key, wire);
+      final out = await ArchiveCrypto.open(key, wire: wire);
       expect(out, isNull);
     });
 
     test('returns null with tampered nonce', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
-      final wire = await ArchiveCrypto.seal(key, Uint8List.fromList(utf8.encode('hi')));
+      final wire = await ArchiveCrypto.seal(key,
+          plaintext: Uint8List.fromList(utf8.encode('hi')));
       wire[0] ^= 0x01;
-      final out = await ArchiveCrypto.open(key, wire);
+      final out = await ArchiveCrypto.open(key, wire: wire);
       expect(out, isNull);
     });
 
     test('returns null with tampered mac', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
-      final wire = await ArchiveCrypto.seal(key, Uint8List.fromList(utf8.encode('hi')));
+      final wire = await ArchiveCrypto.seal(key,
+          plaintext: Uint8List.fromList(utf8.encode('hi')));
       wire[wire.length - 1] ^= 0x01;
-      final out = await ArchiveCrypto.open(key, wire);
+      final out = await ArchiveCrypto.open(key, wire: wire);
       expect(out, isNull);
     });
 
@@ -99,16 +106,16 @@ void main() {
       final aadB = Uint8List.fromList([5, 6, 7, 8]);
       final wire = await ArchiveCrypto.seal(
         key,
-        Uint8List.fromList(utf8.encode('hi')),
+        plaintext: Uint8List.fromList(utf8.encode('hi')),
         aad: aadA,
       );
-      final out = await ArchiveCrypto.open(key, wire, aad: aadB);
+      final out = await ArchiveCrypto.open(key, wire: wire, aad: aadB);
       expect(out, isNull);
     });
 
     test('returns null on too-short wire', () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
-      final out = await ArchiveCrypto.open(key, Uint8List(8));
+      final out = await ArchiveCrypto.open(key, wire: Uint8List(8));
       expect(out, isNull);
     });
   });
@@ -123,10 +130,10 @@ void main() {
     });
   });
 
-  // ARCH-002: the Argon2id cost is the only barrier to an offline dictionary
-  // attack (the salt derives from the passphrase, adding no entropy), so a
-  // silent parameter downgrade must fail CI. Pins the named constants that
-  // feed the Argon2id constructor.
+  // ARCH-002: with the per-install random salt, the Argon2id cost is what an
+  // attacker pays per target in an offline dictionary attack, so a silent
+  // parameter downgrade must fail CI. Pins the named constants that feed the
+  // Argon2id constructor.
   group('Argon2id cost parameters (ARCH-002)', () {
     test('are pinned at the documented values', () {
       expect(kArchiveArgon2Parallelism, equals(4));
@@ -151,8 +158,8 @@ void main() {
         () async {
       final key = Uint8List.fromList(List<int>.generate(32, (i) => i));
       final pt = Uint8List.fromList(utf8.encode('same plaintext, same key'));
-      final a = await ArchiveCrypto.seal(key, pt);
-      final b = await ArchiveCrypto.seal(key, pt);
+      final a = await ArchiveCrypto.seal(key, plaintext: pt);
+      final b = await ArchiveCrypto.seal(key, plaintext: pt);
       final nonceA = a.sublist(0, kArchiveNonceLength);
       final nonceB = b.sublist(0, kArchiveNonceLength);
       expect(nonceA, isNot(equals(nonceB)),

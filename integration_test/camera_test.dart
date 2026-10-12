@@ -13,8 +13,9 @@
 //      -> bridge -> shim -> canvas captureStream -> <video> -> page, and fails
 //      on the autoplay regression because no frame ever arrives.
 //   2. Virtual mode, VIDEO source: the clip must play AND keep looping. The
-//      fixture alternates two colours every ~500ms, so a stream frozen on its
-//      first decoded frame reports zero transitions and fails.
+//      fixture alternates its two colours on every frame, so a stream frozen
+//      on its first decoded frame reports zero transitions and fails, while a
+//      live one proves itself off two decoded frames.
 //   3. Block mode: the same page must be denied (NotAllowedError), proving
 //      scenarios 1-2 are not vacuously green.
 //   4. Real mode: the device camera is handed over when one exists. Skipped
@@ -40,13 +41,15 @@ import 'package:image/image.dart' as img;
 import 'package:integration_test/integration_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webspace/main.dart' as app;
-import 'package:webspace/demo_data.dart';
+import 'package:webspace/settings/demo_mode.dart';
 import 'package:webspace/services/log_service.dart';
-import 'package:webspace/settings/camera.dart';
+import 'package:webspace/settings/capture.dart';
 import 'package:webspace/web_view_model.dart';
 import 'package:webspace/webspace_model.dart';
 
 import 'fixtures/virtual_camera_video.dart';
+import 'fixture_server.dart';
+import 'helpers/ui.dart';
 
 // A colour Flutter never draws and no real camera would produce, so a match
 // proves the sampled pixel came from the picked image.
@@ -55,6 +58,9 @@ const int _kSourceG = 0xC8;
 const int _kSourceB = 0x7A;
 
 /// Solid-colour PNG used as the virtual camera source, as a `data:` URL.
+CaptureGrants _camera(CameraAccessMode mode, {VirtualVisualSource? source}) =>
+    CaptureGrants.none.copyWith(camera: (mode: mode, source: source));
+
 String _sourceImageDataUrl() {
   final image = img.Image(width: 320, height: 240);
   img.fill(image, color: img.ColorRgb8(_kSourceR, _kSourceG, _kSourceB));
@@ -120,14 +126,15 @@ function transitions(list) {
     // single-sample check), so the test needs the observed colours and the
     // number of transitions.
     var samples = [];
-    // The emulator's software decoder runs the clip several times slower than
-    // real time, and how much slower varies per runner: the same 4s window has
-    // produced 8, 2 and 0 transitions across CI runs, the last of which is a
-    // red build for a stream that is playing correctly. So watch the video
-    // source until it has actually flipped, capped well above the slowest
-    // observed decode; a healthy engine proves the loop in about a second and
-    // breaks out immediately. Sources that are supposed to hold one colour
-    // keep the short window.
+    // The emulator's software decoder runs the clip slower than real time, at
+    // a rate that varies per runner: the same 4s window has produced 8, 2 and
+    // 0 transitions across CI runs, the last of which is a red build for a
+    // stream that is playing correctly. The fixture answers most of that by
+    // flipping colour on every frame, so the proof costs two decoded frames;
+    // this window is the remaining headroom. Watch the video source until it
+    // has actually flipped rather than for a fixed span, capped well above the
+    // slowest observed decode; a healthy engine breaks out in about a second.
+    // Sources that are supposed to hold one colour keep the short window.
     var observeMs = WANTS_LOOP ? 30000 : 4000;
     var deadline = Date.now() + (WANTS_LOOP ? 45000 : 20000);
     var observeUntil = null;
@@ -194,7 +201,7 @@ void main() {
     isDemoMode = true;
 
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-    server!.listen((request) {
+    listenFixture(server!, onEvent: (request) {
       if (request.uri.path == '/report') {
         final tag = request.uri.queryParameters['site'] ?? 'unknown';
         final raw = request.uri.queryParameters['data'] ?? '{}';
@@ -215,7 +222,7 @@ void main() {
     });
     final base = 'http://127.0.0.1:${server!.port}';
 
-    final source = VirtualCameraSource(
+    final source = VirtualVisualSource(
       kind: 'image',
       dataUrl: _sourceImageDataUrl(),
       fileName: 'source.png',
@@ -225,31 +232,32 @@ void main() {
       siteId: 'ws-cam-virtual',
       initUrl: '$base/probe.html?site=virtual',
       name: 'CamVirtual',
-      cameraMode: CameraAccessMode.virtual,
-      virtualCameraSource: source,
+      captures: _camera(CameraAccessMode.virtual, source: source),
     );
     final video = WebViewModel(
       siteId: 'ws-cam-video',
       initUrl: '$base/probe.html?site=video',
       name: 'CamVideo',
-      cameraMode: CameraAccessMode.virtual,
-      virtualCameraSource: const VirtualCameraSource(
-        kind: 'video',
-        dataUrl: kVirtualCameraVideoDataUrl,
-        fileName: 'clip.webm',
+      captures: _camera(
+        CameraAccessMode.virtual,
+        source: const VirtualVisualSource(
+          kind: 'video',
+          dataUrl: kVirtualCameraVideoDataUrl,
+          fileName: 'clip.webm',
+        ),
       ),
     );
     final blocked = WebViewModel(
       siteId: 'ws-cam-block',
       initUrl: '$base/probe.html?site=block',
       name: 'CamBlock',
-      cameraMode: CameraAccessMode.block,
+      captures: _camera(CameraAccessMode.block),
     );
     final real = WebViewModel(
       siteId: 'ws-cam-real',
       initUrl: '$base/probe.html?site=real',
       name: 'CamReal',
-      cameraMode: CameraAccessMode.real,
+      captures: _camera(CameraAccessMode.real),
     );
 
     SharedPreferences.setMockInitialValues({
@@ -278,8 +286,8 @@ void main() {
   // pumpAndSettle deadlocks on a live webview, so poll in fixed slices until
   // the probe page posts its report.
   Future<Map<String, dynamic>> awaitReport(
-    WidgetTester tester,
-    String tag, {
+    WidgetTester tester, {
+    required String tag,
     Duration timeout = const Duration(seconds: 90),
   }) async {
     final deadline = DateTime.now().add(timeout);
@@ -293,42 +301,7 @@ void main() {
         'usually means the page never ran: check the site loaded at all.');
   }
 
-  Future<void> openSiteDrawer(WidgetTester tester) async {
-    for (var attempt = 0; attempt < 3; attempt++) {
-      if (find.byType(Drawer).evaluate().isNotEmpty) return;
-      final menuIcon = find.byIcon(Icons.menu);
-      if (menuIcon.evaluate().isNotEmpty) {
-        await tester.tap(menuIcon.first);
-      } else {
-        for (final element in find.byType(Scaffold).evaluate()) {
-          final state = tester.state<ScaffoldState>(
-              find.byWidget(element.widget as Scaffold));
-          if (state.hasDrawer) {
-            state.openDrawer();
-            break;
-          }
-        }
-      }
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 400));
-    }
-    expect(find.byType(Drawer), findsOneWidget,
-        reason: 'site drawer should open for switching sites');
-  }
-
-  Future<void> tapSite(WidgetTester tester, String siteName) async {
-    final drawer = find.byType(Drawer);
-    final tile = drawer.evaluate().isNotEmpty
-        ? find.descendant(of: drawer, matching: find.text(siteName))
-        : find.text(siteName);
-    if (tile.evaluate().isEmpty) dumpDiagnostics('site tile "$siteName" missing');
-    expect(tile, findsWidgets, reason: '$siteName should be in the site list');
-    await tester.tap(tile.first);
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400));
-  }
-
-  bool near(int actual, int expected, {int tolerance = 24}) =>
+  bool near(int actual, {required int expected,int tolerance = 24}) =>
       (actual - expected).abs() <= tolerance;
 
   testWidgets('per-site camera modes behave on a real Android WebView',
@@ -339,8 +312,8 @@ void main() {
     await tester.pumpAndSettle(const Duration(seconds: 5));
 
     // --- Scenario 1: virtual mode serves the picked image ------------------
-    await tapSite(tester, 'CamVirtual');
-    final virtualReport = await awaitReport(tester, 'virtual');
+    await tapSite(tester, siteName: 'CamVirtual', diagnose: dumpDiagnostics);
+    final virtualReport = await awaitReport(tester, tag: 'virtual');
     if (virtualReport['ok'] != true) {
       dumpDiagnostics('virtual mode produced no frame: $virtualReport');
     }
@@ -349,12 +322,12 @@ void main() {
             'got ${virtualReport['error']}. A "no frame before deadline" here '
             'is the mediaPlaybackRequiresUserGesture regression.');
     final px = (virtualReport['px'] as List).cast<num>();
-    expect(near(px[0].toInt(), _kSourceR), isTrue,
+    expect(near(px[0].toInt(), expected: _kSourceR), isTrue,
         reason: 'red channel of the served frame should match the picked '
             'image, got $px');
-    expect(near(px[1].toInt(), _kSourceG), isTrue,
+    expect(near(px[1].toInt(), expected: _kSourceG), isTrue,
         reason: 'green channel should match the picked image, got $px');
-    expect(near(px[2].toInt(), _kSourceB), isTrue,
+    expect(near(px[2].toInt(), expected: _kSourceB), isTrue,
         reason: 'blue channel should match the picked image, got $px');
     // The synthetic track presents as an ordinary camera, and enumeration
     // reports exactly one videoinput in virtual mode.
@@ -362,11 +335,11 @@ void main() {
     expect(virtualReport['cams'], 1);
 
     // --- Scenario 2: a video source plays AND loops ------------------------
-    // The clip alternates two colours every ~500ms, so a stream that is
+    // The clip alternates two colours on every frame, so a stream that is
     // merely frozen on the first decoded frame reports zero transitions.
     await openSiteDrawer(tester);
-    await tapSite(tester, 'CamVideo');
-    final videoReport = await awaitReport(tester, 'video');
+    await tapSite(tester, siteName: 'CamVideo', diagnose: dumpDiagnostics);
+    final videoReport = await awaitReport(tester, tag: 'video');
     if (videoReport['ok'] != true) {
       dumpDiagnostics('video source produced no frame: $videoReport');
     }
@@ -377,24 +350,25 @@ void main() {
         .map((p) => (p as List).cast<num>())
         .toList();
     bool sawColour(List<int> want) => distinct.any((p) =>
-        near(p[0].toInt(), want[0]) &&
-        near(p[1].toInt(), want[1]) &&
-        near(p[2].toInt(), want[2]));
+        near(p[0].toInt(), expected: want[0]) &&
+        near(p[1].toInt(), expected: want[1]) &&
+        near(p[2].toInt(), expected: want[2]));
     expect(sawColour(kVirtualCameraVideoColorA), isTrue,
         reason: 'first colour of the clip should appear; saw $distinct after '
             '${videoReport['observedMs']}ms');
     expect(sawColour(kVirtualCameraVideoColorB), isTrue,
         reason: 'second colour of the clip should appear; saw $distinct after '
-            '${videoReport['observedMs']}ms. The probe watches until the clip '
-            'flips or 30s elapse, so one colour here means the decoder is '
-            'stalled, not merely slow.');
+            '${videoReport['observedMs']}ms. Every frame of the clip flips '
+            'colour, so one colour here means under two frames decoded in the '
+            'whole window, not merely a slow decoder.');
     // At least one transition proves the stream is live rather than frozen on
     // the first decoded frame. Deliberately not a tighter bound: the emulator
     // decodes the VP8 clip far slower than real time and at a rate that varies
     // per runner (CI has seen 8, 2 and 0 transitions inside the same 4s
-    // window), so the probe waits for the flip instead and the count stays at
-    // one. The strict looping proof — several transitions per clip length — is
-    // asserted in test/browser/camera_stream_real_engine.test.js against a
+    // window, back when catching the second colour was also a race with the
+    // loop wrap), so the probe waits for the flip instead and the count stays
+    // at one. The strict looping proof — several transitions per clip length —
+    // is asserted in test/browser/camera_stream_real_engine.test.js against a
     // real engine.
     expect((videoReport['changes'] as num) >= 1, isTrue,
         reason: 'the clip must keep playing, not freeze on one frame; '
@@ -404,8 +378,8 @@ void main() {
 
     // --- Scenario 3: block mode denies (control for scenario 1) ------------
     await openSiteDrawer(tester);
-    await tapSite(tester, 'CamBlock');
-    final blockReport = await awaitReport(tester, 'block');
+    await tapSite(tester, siteName: 'CamBlock', diagnose: dumpDiagnostics);
+    final blockReport = await awaitReport(tester, tag: 'block');
     expect(blockReport['ok'], isFalse,
         reason: 'a blocked site must not receive a camera stream');
     expect(blockReport['error'].toString(), contains('NotAllowedError'),
@@ -416,8 +390,8 @@ void main() {
     // Emulated cameras are an AVD option, not a guarantee: treat "no camera
     // on this runner" as a skip and everything else as a failure.
     await openSiteDrawer(tester);
-    await tapSite(tester, 'CamReal');
-    final realReport = await awaitReport(tester, 'real');
+    await tapSite(tester, siteName: 'CamReal', diagnose: dumpDiagnostics);
+    final realReport = await awaitReport(tester, tag: 'real');
     final realError = (realReport['error'] ?? '').toString();
     // No camera device on this runner, or the app-level CAMERA permission was
     // never granted (scripts/run_android_camera_tests.sh pre-grants it; a
@@ -443,9 +417,9 @@ void main() {
       // Real frames must NOT be the virtual source colour: that would mean
       // the virtual path leaked into a site set to the real camera.
       final realPx = (realReport['px'] as List).cast<num>();
-      final looksSynthetic = near(realPx[0].toInt(), _kSourceR) &&
-          near(realPx[1].toInt(), _kSourceG) &&
-          near(realPx[2].toInt(), _kSourceB);
+      final looksSynthetic = near(realPx[0].toInt(), expected: _kSourceR) &&
+          near(realPx[1].toInt(), expected: _kSourceG) &&
+          near(realPx[2].toInt(), expected: _kSourceB);
       expect(looksSynthetic, isFalse,
           reason: 'a real-camera site must not be served the virtual source');
       expect((realReport['w'] as num) > 0, isTrue);

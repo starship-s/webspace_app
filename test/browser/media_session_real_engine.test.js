@@ -1,6 +1,5 @@
 // Real-Chromium proof for the media-session bridge shim (BGAUDIO-006,
-// lib/services/media_session_shim.dart, dumped to
-// test/js_fixtures/media_session/shim.js).
+// lib/js/media_session.js).
 //
 // The Dart tier (test/media_session_shim_test.dart) only asserts substrings of
 // the builder's output, which passes whether or not the shim ever reports
@@ -22,6 +21,7 @@ const {
   newShimPage,
   reports,
   settle,
+  waitForReports,
 } = require('./helpers/media_session_page');
 
 const browser = setupBrowser(LAUNCH_ARGS);
@@ -36,7 +36,7 @@ test('reports playing:true with page metadata once audio actually plays', async 
       document.title = 'Fallback Title';
       const a = document.createElement('audio');
       a.loop = true;
-      a.src = wsMakeSilentWav(2);
+      a.src = window.wsMakeSilentWav(2);
       document.body.appendChild(a);
       navigator.mediaSession.metadata = new MediaMetadata({
         title: 'Track One',
@@ -56,12 +56,17 @@ test('reports playing:true with page metadata once audio actually plays', async 
     });
     assert.equal(played, true, 'autoplay must be allowed in this tier');
 
-    await settle();
-    const got = await reports(page);
-    assert.ok(got.length >= 1, 'shim reported nothing while audio was playing');
-    assert.equal(got[0].name, 'wsMediaSession');
+    // Not `got[0]`: the shim's liveness predicate is `currentTime > 0`, and
+    // the 300ms debounce after `play` can elapse before the media clock has
+    // moved on a loaded runner. That first report says playing:false and the
+    // 3s reconcile follows with the real state, so wait for the one that
+    // says playing rather than assuming it is the first.
+    const got = await waitForReports(page, (r) => r.some((x) => x.payload.playing));
+    const said = got.find((x) => x.payload.playing) || got[0];
+    assert.ok(said, 'shim reported nothing while audio was playing');
+    assert.equal(said.name, 'wsMediaSession');
     // Opaque per-frame token; media_session_frames.test.js owns its semantics.
-    const { frame, ...payload } = got[0].payload;
+    const { frame, ...payload } = said.payload;
     assert.match(frame, /^f[a-z0-9]+$/);
     // Every remaining key MediaSessionService.report destructures.
     assert.deepEqual(payload, {
@@ -85,17 +90,17 @@ test('falls back to document.title when the page declares no metadata', async (t
       document.title = 'Radio Station';
       const a = document.createElement('audio');
       a.loop = true;
-      a.src = wsMakeSilentWav(2);
+      a.src = window.wsMakeSilentWav(2);
       document.body.appendChild(a);
       await a.play();
     });
-    await settle();
-    const got = await reports(page);
-    assert.ok(got.length >= 1, 'shim reported nothing');
-    assert.equal(got[0].payload.playing, true);
-    assert.equal(got[0].payload.title, 'Radio Station');
-    assert.equal(got[0].payload.artist, '');
-    assert.equal(got[0].payload.artwork, '');
+    const got = await waitForReports(page, (r) => r.some((x) => x.payload.playing));
+    const said = got.find((x) => x.payload.playing) || got[0];
+    assert.ok(said, 'shim reported nothing');
+    assert.equal(said.payload.playing, true);
+    assert.equal(said.payload.title, 'Radio Station');
+    assert.equal(said.payload.artist, '');
+    assert.equal(said.payload.artwork, '');
   } finally {
     await page.close();
   }
@@ -111,12 +116,12 @@ test('picks up an element created and played before it enters the DOM', async (t
       document.title = 'Detached Player';
       const a = document.createElement('audio');
       a.loop = true;
-      a.src = wsMakeSilentWav(2);
+      a.src = window.wsMakeSilentWav(2);
       window.__detached = a;
       await a.play();
     });
-    await settle();
-    const got = await reports(page);
+    const got = await waitForReports(
+      page, (r) => r.some((x) => x.payload.playing === true));
     assert.ok(
       got.some((r) => r.payload.playing === true),
       'a detached element that is playing must still be reported',
@@ -134,11 +139,11 @@ test('transport control round-trip drives the element and re-reports', async (t)
       document.title = 'Transport';
       const a = document.createElement('audio');
       a.loop = true;
-      a.src = wsMakeSilentWav(2);
+      a.src = window.wsMakeSilentWav(2);
       document.body.appendChild(a);
       await a.play();
     });
-    await settle();
+    await waitForReports(page, (r) => r.length >= 1);
 
     // Dart -> page, exactly what MediaSessionService.onTransport evaluates.
     const pausedState = await page.evaluate(async () => {
@@ -148,7 +153,8 @@ test('transport control round-trip drives the element and re-reports', async (t)
     });
     assert.equal(pausedState, true, 'pause must reach the media element');
 
-    let got = await reports(page);
+    let got = await waitForReports(
+      page, (r) => r.length > 0 && r[r.length - 1].payload.playing === false);
     assert.equal(
       got[got.length - 1].payload.playing,
       false,
@@ -162,8 +168,8 @@ test('transport control round-trip drives the element and re-reports', async (t)
     });
     assert.equal(resumedState, false, 'play must reach the media element');
 
-    await settle();
-    got = await reports(page);
+    got = await waitForReports(
+      page, (r) => r.length > 0 && r[r.length - 1].payload.playing === true);
     assert.equal(got[got.length - 1].payload.playing, true);
   } finally {
     await page.close();
@@ -179,15 +185,14 @@ test('a transport that reaches nothing is reported, not swallowed', async (t) =>
     // identical to a dead bridge. Only the failure is reported, so the
     // ordinary playing/paused sequence above is unaffected.
     await page.evaluate(() => window.__wsMediaControl('play'));
-    await settle();
-    let got = await reports(page);
+    let got = await waitForReports(page, (r) => r.length >= 1);
     assert.equal(got.length, 1, 'a control with no media must say so');
     assert.equal(got[0].payload.control, 'play');
     assert.equal(got[0].payload.error, 'no-media-element');
 
     const refused = await page.evaluate(async () => {
       const a = document.createElement('audio');
-      a.src = wsMakeSilentWav(2);
+      a.src = window.wsMakeSilentWav(2);
       document.body.appendChild(a);
       // Reject the way a suspended/blocked engine does, which is the state
       // the iOS lockscreen play lands in.
@@ -200,8 +205,8 @@ test('a transport that reaches nothing is reported, not swallowed', async (t) =>
       return true;
     });
     assert.equal(refused, true);
-    await settle();
-    got = await reports(page);
+    got = await waitForReports(
+      page, (r) => r.filter((x) => x.payload.control === 'play').length >= 2);
     const failure = got.filter((r) => r.payload.control === 'play').pop();
     assert.equal(failure.payload.error, 'NotAllowedError');
   } finally {
@@ -217,12 +222,11 @@ test('does not re-report unchanged state', async (t) => {
       document.title = 'Steady';
       const a = document.createElement('audio');
       a.loop = true;
-      a.src = wsMakeSilentWav(2);
+      a.src = window.wsMakeSilentWav(2);
       document.body.appendChild(a);
       await a.play();
     });
-    await settle();
-    const first = (await reports(page)).length;
+    const first = (await waitForReports(page, (r) => r.length >= 1)).length;
     // Two full reconcile ticks with nothing changing.
     await settle(7000);
     const second = (await reports(page)).length;
@@ -244,12 +248,11 @@ test('reports metadata that arrives after playback started', async (t) => {
       document.title = 'Before Metadata';
       const a = document.createElement('audio');
       a.loop = true;
-      a.src = wsMakeSilentWav(2);
+      a.src = window.wsMakeSilentWav(2);
       document.body.appendChild(a);
       await a.play();
     });
-    await settle();
-    const before = await reports(page);
+    const before = await waitForReports(page, (r) => r.length >= 1);
     assert.equal(before[before.length - 1].payload.title, 'Before Metadata');
 
     // Streaming players set metadata once the track resolves, well after the
@@ -260,8 +263,11 @@ test('reports metadata that arrives after playback started', async (t) => {
         artist: 'Resolved Artist',
       });
     });
-    await settle(RECONCILE_MS);
-    const after = await reports(page);
+    const after = await waitForReports(
+      page,
+      (r) => r[r.length - 1].payload.title === 'Resolved Track',
+      { timeout: RECONCILE_MS + 6000 },
+    );
     assert.ok(after.length > before.length, 'late metadata was never reported');
     assert.equal(after[after.length - 1].payload.title, 'Resolved Track');
     assert.equal(after[after.length - 1].payload.artist, 'Resolved Artist');

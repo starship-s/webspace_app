@@ -18,18 +18,56 @@ void main() {
         );
       });
 
-      test('cdn-cgi/challenge-platform path is detected on any domain', () {
+      test('cdn-cgi/challenge-platform path is detected on the site\'s own domain', () {
         expect(
-          WebViewFactory.isCaptchaChallenge('https://example.com/cdn-cgi/challenge-platform/scripts/turnstile'),
+          WebViewFactory.isCaptchaChallenge(
+            'https://example.com/cdn-cgi/challenge-platform/scripts/turnstile',
+            siteUrl: 'https://www.example.com/',
+          ),
           isTrue,
         );
       });
 
-      test('cf-turnstile in URL is detected', () {
+      test('cf-turnstile in the path is detected on the site\'s own domain', () {
         expect(
-          WebViewFactory.isCaptchaChallenge('https://example.com/cf-turnstile/widget'),
+          WebViewFactory.isCaptchaChallenge(
+            'https://shop.example.com/cf-turnstile/widget',
+            siteUrl: 'https://example.com/',
+          ),
           isTrue,
         );
+      });
+
+      // The two path markers are the only host-agnostic rules, and a captcha
+      // URL both loads in place and may open the verification popup, so any
+      // origin could otherwise claim them with a path of its choosing.
+      test('the path markers do not count on another origin (CAPTCHA-010)', () {
+        for (final url in const [
+          'https://evil.example/cdn-cgi/challenge-platform/h/b',
+          'https://evil.example/cf-turnstile/widget',
+        ]) {
+          expect(
+            WebViewFactory.isCaptchaChallenge(url, siteUrl: 'https://acme.example/'),
+            isFalse,
+            reason: url,
+          );
+          expect(WebViewFactory.isCaptchaChallenge(url), isFalse, reason: url);
+        }
+      });
+
+      // A captcha URL loads in place and can open a popup window, so any
+      // origin that could name itself one would get a way around the
+      // navigation decision engine. The Cloudflare markers are path-scoped:
+      // an attacker controls the query and fragment of a link they hand us.
+      test('a Cloudflare marker in the query string is NOT detected', () {
+        for (final url in const [
+          'https://evil.example/x?cf-turnstile',
+          'https://evil.example/x?next=/cdn-cgi/challenge-platform/h/b',
+          'https://evil.example/x#cf-turnstile',
+          'https://evil.example/x#/cdn-cgi/challenge-platform',
+        ]) {
+          expect(WebViewFactory.isCaptchaChallenge(url), isFalse, reason: url);
+        }
       });
     });
 

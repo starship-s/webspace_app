@@ -38,9 +38,10 @@ import 'package:integration_test/integration_test.dart';
 import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webspace/main.dart' as app;
-import 'package:webspace/demo_data.dart';
+import 'package:webspace/settings/demo_mode.dart';
 import 'package:webspace/services/proxy_password_secure_storage.dart';
-import 'package:webspace/settings/global_outbound_proxy.dart';
+import 'package:webspace/settings/app_prefs.dart';
+import 'package:webspace/services/global_outbound_proxy.dart';
 import 'package:webspace/settings/proxy.dart';
 
 import 'secure_storage_fake.dart';
@@ -117,7 +118,7 @@ void main() {
     // Pre-seed: a global outbound proxy entry with username (no
     // password — passwords have never lived in SharedPreferences).
     SharedPreferences.setMockInitialValues({
-      kGlobalOutboundProxyKey: jsonEncode({
+      AppPref.globalOutboundProxy.key: jsonEncode({
         'type': ProxyType.HTTPS.index,
         'address': 'proxy.example.com:8080',
         'username': 'ci-user',
@@ -129,7 +130,7 @@ void main() {
     final pwdStore = ProxyPasswordSecureStorage();
     await pwdStore.savePassword(
       ProxyPasswordSecureStorage.globalProxyKey,
-      secretPwd,
+      password: secretPwd,
     );
 
     FilePickerPlatform.instance = stub;
@@ -153,27 +154,36 @@ void main() {
     expect(GlobalOutboundProxy.current.password, secretPwd,
         reason: 'password should hydrate from secure storage on startup');
 
-    // Reach App Settings, scroll to the Export/Import row pair.
+    // Reach App Settings and open Backup and archives, where the
+    // Export/Import row pair lives.
     Future<void> openSettingsAndScrollTo(Finder target) async {
       final settingsButton = find.byTooltip('App Settings');
       expect(settingsButton, findsOneWidget,
           reason: 'App Settings icon should be visible on the webspaces list');
       await tester.tap(settingsButton);
       await tester.pumpAndSettle(const Duration(seconds: 5));
-      // Scroll to the specific tile being tapped: the ListView culls
-      // offscreen children, so scrolling only to Export would leave the
-      // adjacent Import tile out of the element tree.
+      // The index's ListView culls offscreen children, so the row is not in
+      // the element tree until scrolled into view.
+      final backup = find.text('Backup and archives');
       await tester.scrollUntilVisible(
-        target,
+        backup,
         300.0,
         scrollable: find.byType(Scrollable).first,
       );
+      // The drag loop stops as soon as the row is built, which the ListView
+      // does up to a cacheExtent below the fold, and the ensureVisible jump
+      // that closes it is not laid out until the next frame. Settle so the
+      // tap reads where the row ended up rather than where it was.
+      await tester.pumpAndSettle();
+      await tester.tap(backup);
+      await tester.pumpAndSettle();
+      expect(target, findsOneWidget);
     }
 
-    // Tap the Export Settings tile. The tile's onTap pops the
-    // AppSettings route BEFORE invoking the callback (see
-    // lib/screens/app_settings.dart:913), so we land back on the
-    // webspaces-list screen while the export's file write + snackbar
+    // Tap the Export Settings tile. The Backup screen pops with the choice
+    // and App Settings pops itself BEFORE invoking the callback (see
+    // `_openBackup` in lib/screens/app_settings.dart), so we land back on
+    // the webspaces-list screen while the export's file write + snackbar
     // run on the parent's context.
     stub.saveReturn = exportPath;
     await openSettingsAndScrollTo(find.text('Export Settings'));

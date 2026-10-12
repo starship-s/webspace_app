@@ -1,17 +1,19 @@
 # Per-Site Containers
 
 ## Status
-**Implemented on Android (System WebView 110+), iOS / macOS (iOS 17+ /
+**Implemented on Android (System WebView reporting `MULTI_PROFILE`), iOS / macOS (iOS 17+ /
 macOS 14+) and Linux (WPE WebKit 2.40+ via the WebSpace fork's
 `flutter_inappwebview_linux`). Older OS / WebView versions fall
 through to [`CookieIsolationEngine`](../per-site-cookie-isolation/spec.md).**
 
 ## Platform Support Matrix
 
-The three native primitives this engine binds to all landed within
-seven months of each other in 2023, so the floor for the Profile
-path is roughly "anything that can run the September-2023 OS cohort
-or later". Older devices keep working via the legacy
+The Apple and Linux primitives both landed in 2023, so on those
+platforms the floor is roughly "anything that can run the
+September-2023 OS cohort or later". Android has no comparable floor
+to quote: `MULTI_PROFILE` is detected at runtime and ships with
+whatever System WebView the device happens to carry, independent of
+its OS version. Devices without it keep working via the legacy
 [`CookieIsolationEngine`](../per-site-cookie-isolation/spec.md)
 fallback — `_useContainers` resolves to `false` at startup and the
 existing capture-nuke-restore code path runs unchanged.
@@ -20,7 +22,7 @@ existing capture-nuke-restore code path runs unchanged.
 
 | Platform | Minimum OS | Native primitive | Earliest devices | Released |
 |----------|------------|------------------|------------------|----------|
-| Android  | Lollipop (API 21) **AND** System WebView 110+ | [`androidx.webkit.Profile`](https://developer.android.com/reference/androidx/webkit/Profile) via [`WebViewCompat.setProfile`](https://developer.android.com/reference/androidx/webkit/WebViewCompat#setProfile) | Anything that can update System WebView via Play Store; in practice Android 7.0+ (Nougat) keeps WebView fresh on most devices | Feb 2023 (WebView 110) |
+| Android  | Lollipop (API 21) **AND** a System WebView reporting `MULTI_PROFILE` | [`androidx.webkit.Profile`](https://developer.android.com/reference/androidx/webkit/Profile) via [`WebViewCompat.setProfile`](https://developer.android.com/reference/androidx/webkit/WebViewCompat#setProfile) | Anything that can update System WebView via Play Store; in practice Android 7.0+ (Nougat) keeps WebView fresh on most devices | Runtime-detected; no published milestone |
 | iOS      | 17.0 | [`WKWebsiteDataStore(forIdentifier:)`](https://developer.apple.com/documentation/webkit/wkwebsitedatastore/init(foridentifier:)) | iPhone XS / XR (2018) and newer; iPad Pro 11" 1st-gen / 12.9" 3rd-gen / iPad Air 3 / iPad mini 5 / iPad 7 and newer — anything with the A12 Bionic or newer | Sept 2023 |
 | macOS    | 14.0 Sonoma | Same as iOS (`WKWebsiteDataStore(forIdentifier:)`) | iMac 2019+, iMac Pro 2017+, MacBook Air 2018+, MacBook Pro 2018+, Mac mini 2018+, Mac Pro 2019+, Mac Studio 2022+ | Sept 2023 |
 | Linux    | WPE WebKit 2.40 | Per-container `WebKitNetworkSession` cached in `container_session_cache` (fork's `flutter_inappwebview_linux`); cookies routed via `webkit_web_view_get_network_session(webview)`; proxy fan-out across default + cached container sessions | Ubuntu 23.10+, Fedora 38+, Debian trixie | Mar 2023 (WPE 2.40) |
@@ -32,8 +34,22 @@ The runtime check that decides Profile vs. legacy engine is in
   This catches the device + WebView combination correctly (e.g. an
   Android 6 device with an outdated System WebView returns false
   even though `androidx.webkit` is present in the build).
-- **iOS / macOS.** Native side checks
-  `if #available(iOS 17.0, macOS 14.0, *)`.
+
+  Do not restate this gate as a WebView version number. `androidx.webkit`
+  declares `MULTI_PROFILE` as an `ApiFeature.NoFramework` with a
+  runtime-only `isSupportedByWebView()`, and neither the reference docs
+  nor the source publishes a minimum milestone. Measured counterexample:
+  the API-34 `google_apis` emulator image ships WebView
+  113.0.5672.136 and does **not** report the feature.
+- **iOS / macOS.** Dart side probes the running OS
+  (`appleOsMeetsFloor` over `Platform.operatingSystemVersion`: iOS 17,
+  macOS 14) on top of the fork's build-time `isClassSupported`. The
+  deployment floors are iOS 15 and macOS 10.15, and the fork's
+  `WKWebsiteDataStore(forIdentifier:)` bind no-ops below its
+  `#available(iOS 17.0, macOS 14.0, *)` guard, so without the probe every
+  site below the floor would share the default store while
+  `_useContainers` disabled the legacy mutex. Below the floor
+  `isSupported()` is false and the legacy engine runs.
 - **Linux.** Build-time check via
   `inapp.ContainerController.isClassSupported(platform: TargetPlatform.linux)`.
   The fork's CMakeLists already gates compilation on
@@ -57,7 +73,8 @@ Engine-level cookie + storage isolation between sites in WebSpace.
 Replaces the cookie-only capture-nuke-restore engine on platforms with
 native per-site data-store primitives:
 
-- **Android**, System WebView 110+: `androidx.webkit.Profile`. Each
+- **Android**, System WebView reporting `MULTI_PROFILE`:
+  `androidx.webkit.Profile`. Each
   site maps to a named profile `ws-<siteId>`.
 - **iOS 17+ / macOS 14+**: `WKWebsiteDataStore(forIdentifier: UUID)`.
   The siteId string is hashed via SHA-256 to produce a deterministic
@@ -111,8 +128,8 @@ for cookies but leaves three gaps:
    With per-site profiles the jars are partitioned at the engine
    level, so this restriction is unnecessary.
 
-`androidx.webkit.Profile` (System WebView 110+) is the native
-primitive for partitioning all of the above in one call.
+`androidx.webkit.Profile` (System WebView reporting `MULTI_PROFILE`)
+is the native primitive for partitioning all of the above in one call.
 
 ## Solution
 
@@ -122,8 +139,8 @@ Each site gets a named profile. Lifecycle:
 |---|---|
 | App startup, after restoring sites | Cache `ContainerNative.isSupported()` once. Sweep profiles whose owning site no longer exists (`ContainerIsolationEngine.garbageCollectOrphans`), then drop every incognito site's container outright with `onSiteDeleted` (pre-bind, `deleteContainer` is reliable here). |
 | Site activated | `ContainerIsolationEngine.ensureContainer(siteId)` (idempotent). |
-| WebView created (`onWebViewCreated`) | `ContainerNative.bindContainerToWebView(siteId)` — native side walks the activity view tree and calls `WebViewCompat.setProfile` on every flutter_inappwebview WebView for that siteId. |
-| User taps "Clear Site Data" | `ContainerIsolationEngine.clearForSite(siteId)` → fork's `clearContainerData` (Apple: `WKWebsiteDataStore.removeData(ofTypes:modifiedSince:)`). Container stays in place; only its contents go. `disposeWebView` afterwards forces a fresh InAppWebView so the user sees a clean page. |
+| WebView created | Nothing to do: the WebView was built with `InAppWebViewSettings.containerId`, which the fork reads before any session-bound operation (CONT-005). |
+| User taps "Clear Site Data" | `ContainerIsolationEngine.clearForSite(siteId)` → fork's `clearContainerData` (Apple: `WKWebsiteDataStore.removeData(ofTypes:modifiedSince:)`). Container stays in place; only its contents go. `disposeWebView` afterwards forces a fresh InAppWebView so the user sees a clean page. The app-side per-`siteId` residue the container never held — saved nav state and the HTML snapshot — is dropped alongside it in both engine modes ([tracking-protection](../tracking-protection/spec.md) ETP-022). |
 | Site deleted | `ContainerIsolationEngine.onSiteDeleted(siteId)` after `disposeWebView`. |
 | Profile API not supported (iOS, macOS, legacy Android) | `_useContainers` is false; engine selection at the call site falls through to `CookieIsolationEngine`. No cross-engine state leaks. |
 
@@ -142,21 +159,21 @@ check resolved at app startup.
 
 #### Scenario: Profile API supported on Android
 
-**Given** the app is launching on Android with System WebView 110+
-  (`WebViewFeature.MULTI_PROFILE` true)
-**When** `_restoreAppState` runs
+**Given** the app is launching on Android with a System WebView
+  reporting `WebViewFeature.MULTI_PROFILE` true
+**When** `StartupController.restore` runs
 **Then** `_useContainers` resolves to `true`
-**And** every subsequent `_setCurrentIndex(index)` skips
+**And** every subsequent `setCurrentIndex(index)` skips
   `SiteActivationEngine.findDomainConflict` and the capture-nuke-
   restore cycle — superseding the legacy
   [ISO-001](../per-site-cookie-isolation/spec.md) mutex
-**And** `_setCurrentIndex(index)` calls
+**And** `setCurrentIndex(index)` calls
   `ContainerIsolationEngine.ensureContainer(target.siteId)` instead
 
 #### Scenario: Profile API supported on iOS / macOS
 
 **Given** the app is launching on iOS 17+ or macOS 14+
-**When** `_restoreAppState` runs
+**When** `StartupController.restore` runs
 **Then** the native plugin reports `isSupported() == true`
 **And** `_useContainers` resolves to `true`
 **And** the same conflict-skip / engine-selection behavior as Android
@@ -166,7 +183,7 @@ check resolved at app startup.
 
 **Given** the app is launching on Linux against the WebSpace fork's
   `flutter_inappwebview_linux` (WPE WebKit 2.40+)
-**When** `_restoreAppState` runs
+**When** `StartupController.restore` runs
 **Then** `inapp.ContainerController.isClassSupported(platform: TargetPlatform.linux)`
   returns true
 **And** `_useContainers` resolves to `true`
@@ -176,15 +193,14 @@ check resolved at app startup.
 
 #### Scenario: Profile API not supported
 
-**Given** the app is launching on Android System WebView <110, or
-  iOS <17, or macOS <14, or Windows / web (or Linux without the fork
-  override resolved)
-**When** `_restoreAppState` runs
+**Given** the app is launching on an Android System WebView that does
+  not report `MULTI_PROFILE`, or iOS <17, or macOS <14, or Windows /
+  web (or Linux without the fork override resolved)
+**When** `StartupController.restore` runs
 **Then** `_useContainers` resolves to `false`
-**And** `_setCurrentIndex` runs the existing capture-nuke-restore flow
+**And** `setCurrentIndex` runs the existing capture-nuke-restore flow
   unchanged
-**And** `ContainerIsolationEngine.bindForSite` is a no-op (returns 0
-  without touching ProfileStore)
+**And** `ContainerIsolationEngine` touches no ProfileStore
 
 ### Requirement: CONT-002 — Profile Lifecycle
 
@@ -248,6 +264,10 @@ container that nothing references.
 **And** the cached `WebViewModel.webview` is nulled so the next
   `IndexedStack` rebuild constructs a fresh `InAppWebView` bound to
   the now-empty profile
+**And** the app-side per-`siteId` residue is dropped too — the pending
+  debounced nav-state capture is cancelled, `removeState(siteId)` and
+  `HtmlCacheService.deleteCache(siteId)` run — since neither lives in the
+  container and both are replayed on the next activation (ETP-022)
 
 #### Scenario: Profile deleted on site deletion
 
@@ -274,7 +294,7 @@ load and run concurrently with fully isolated cookies, `localStorage`,
 **And** profile mode is active
 **When** the user activates site A and then site B without unloading A
 **Then** site A is NOT unloaded (no `_unloadSiteForDomainSwitch` call)
-**And** both sites are in `_loadedIndices`
+**And** both sites are in `_sites.loaded`
 **And** site A's session cookies are not visible to site B and vice
   versa
 **And** site B logging out does not log site A out
@@ -292,7 +312,7 @@ load and run concurrently with fully isolated cookies, `localStorage`,
 **And** site A is in webspace `Work` and site B is in webspace `Personal`
 **And** both A and B have been loaded
 **When** the user switches webspace from `Work` to `Personal`
-**Then** site A is NOT unloaded (it remains in `_loadedIndices` and its
+**Then** site A is NOT unloaded (it remains in `_sites.loaded` and its
   webview stays in the IndexedStack), even though it isn't part of the
   newly-active webspace
 **Because** the per-site container isolates A's state from B's, so
@@ -314,10 +334,11 @@ under this policy, two backstops apply:
    webspaces.
 2. **OS memory pressure**
    (`WidgetsBindingObserver.didHaveMemoryPressure`). Each event
-   evicts one site via
-   [`SiteUnloadEngine.indexToEvictForMemoryPressure`](../../../lib/services/site_unload_engine.dart).
-   The OS controls the curve: if pressure persists, the callback
-   fires again and the next victim is picked. One-per-event matches
+   promotes one site one lifecycle tier deeper via
+   [`SiteLifecyclePromotionEngine.pickPromotionTarget`](../../../lib/services/site_lifecycle_promotion_engine.dart)
+   (see webview-pause-lifecycle). The OS controls the curve: if
+   pressure persists, the callback fires again and the next site is
+   picked. One-per-event matches
    the OS signaling cadence and avoids over-evicting on transient
    pressure (e.g. another foregrounded app spike). Mirrors
    Flutter's own `ImageCache` reactivity pattern.
@@ -330,12 +351,12 @@ under this policy, two backstops apply:
   `didHaveMemoryPressure` between the version bump and the eventual
   webview resume
 **Then** A is NOT picked as the eviction victim
-**Because** `_setCurrentIndex` records its target in
-  `_activationInFlightIndex` (set in the try block, cleared in
-  finally); `_handleMemoryPressure` includes that index in its
-  hard-protected set alongside `_currentIndex`. Without the in-flight
+**Because** `setCurrentIndex` records its target in
+  `SiteRuntime.activating` (set in the try block, cleared in
+  finally); `SiteRuntime.retentionPriority` ranks it `activating`,
+  which no eviction takes, alongside the `active` current site. Without the in-flight
   guard, mid-activation eviction would dispose A's webview, leaving
-  `_setCurrentIndex` to call `resumeWebView()` on a null controller
+  `setCurrentIndex` to call `resumeWebView()` on a null controller
   (no-op) — the IndexedStack would re-create a fresh webview on next
   paint, silently wiping the user's URL/scroll/session.
 
@@ -349,7 +370,7 @@ The system SHALL sweep profiles whose owning site no longer exists.
 **And** the persisted site list contains only A and C (B was deleted
   in a previous session before profile mode was enabled, or via a
   crash mid-deletion)
-**When** the app launches and `_restoreAppState` runs
+**When** the app launches and `StartupController.restore` runs
 **Then** `ContainerIsolationEngine.garbageCollectOrphans({A, C})` is
   invoked
 **And** profile `ws-B` is deleted
@@ -599,7 +620,7 @@ runs against the built F-Droid APK and fails the build on any hit.
 
 - [`ContainerIsolationEngine`](../../../lib/services/container_isolation_engine.dart)
   — pure-Dart engine. Methods: `ensureContainer(siteId)`,
-  `bindForSite(siteId)`, `onSiteDeleted(siteId)`,
+  `clearForSite(siteId)`, `onSiteDeleted(siteId)`,
   `garbageCollectOrphans(activeSiteIds)`. No Flutter imports, no
   `setState`, no `context`. Constructor takes a [`ContainerNative`]
   instance so tests can inject a mock.
@@ -608,7 +629,7 @@ runs against the built F-Droid APK and fails the build on any hit.
   `ContainerNative.isSupported()` is false.
 - Engine selection lives in
   [`_WebSpacePageState`](../../../lib/main.dart) as a single cached
-  `bool _useContainers`, resolved during `_restoreAppState`.
+  `bool _useContainers`, resolved during `StartupController.restore`.
 
 ### Native Bridge
 
@@ -665,17 +686,12 @@ return inapp.InAppWebView(
 
 `cachedSupported` is the synchronous getter on
 [`ContainerNative`](../../../lib/services/container_native.dart),
-populated during `_restoreAppState` (the same pass that resolves
+populated during `StartupController.restore` (the same pass that resolves
 `_useContainers`). The first webview a process ever constructs
-(before `_restoreAppState` runs to completion) sees
+(before `StartupController.restore` runs to completion) sees
 `cachedSupported == false` and takes the non-profile path — but by
 then no site has been activated yet, so this case never fires in
 practice.
-
-The legacy [`ContainerNative.bindContainerToWebView`](../../../lib/services/container_native.dart)
-post-hoc bind method remains in the engine for diagnostics and the
-mock used by tests, but the production webview-construction path no
-longer calls it; the native plugin does the bind during `prepare()`.
 
 `Future.microtask` is still used for
 `WebInterceptNative.attachToWebViews`, which is race-insensitive
@@ -686,7 +702,7 @@ longer calls it; the native plugin does the bind during `prepare()`.
 A profile gives storage isolation, not behavior changes. Per-site
 settings — language, geolocation/timezone spoof, WebRTC policy, user
 scripts, content blocking, ClearURLs, DNS blocklist, cookie blocking,
-blockAutoRedirects — remain `WebViewConfig`-driven
+the external-link mode — remain `WebViewConfig`-driven
 and propagate to nested webviews via `launchUrl` →
 `InAppWebViewScreen` exactly as today (per the CLAUDE.md
 "Per-site settings MUST apply to nested webviews" rule).
@@ -701,11 +717,10 @@ JS gets injected*.
 - `android/app/src/main/kotlin/.../MainActivity.kt` —
   instantiates `WebSpaceContainerPlugin`
 - `lib/main.dart` — caches `_useContainers`, gates engine selection in
-  `_setCurrentIndex` and `_deleteSite`, runs orphan GC in
-  `_restoreAppState`
-- `lib/services/webview.dart` — calls
-  `ContainerNative.instance.getOrCreateContainer + bindContainerToWebView`
-  in `onWebViewCreated`
+  `setCurrentIndex` and `SiteEditingController.deleteSite`, runs orphan GC in
+  `StartupController.restore`
+- `lib/services/webview.dart` — sets `InAppWebViewSettings.containerId`
+  (`containerIdFor`) when it builds a site's WebView
 
 ### Created
 - `android/app/src/main/kotlin/.../WebSpaceContainerPlugin.kt` —
@@ -763,9 +778,7 @@ When iOS plumbing lands:
 3. Adjust the bind call site: iOS needs the data store assigned to
    `WKWebViewConfiguration` *before* construction, so the
    Dart-side path threads `websiteDataStoreId` into
-   `InAppWebViewSettings` rather than calling
-   `bindContainerToWebView` after the fact. The engine's
-   `bindForSite` API absorbs this — only the platform impl differs.
+   `InAppWebViewSettings` rather than binding after the fact.
 4. iOS-specific test: verify `websiteDataStoreId` is threaded into
    the settings dict for activation paths.
 
@@ -781,8 +794,7 @@ Engine tests cover:
 
 - Unsupported-platform short-circuit (no native ProfileStore is
   touched when `isSupported() == false`)
-- Create-then-bind sequencing of `bindForSite`
-- Idempotency of repeated `bindForSite` calls
+- Idempotency of repeated `ensureContainer` calls
 - `onSiteDeleted` only drops the named site
 - Orphan GC against the live siteId set
 - Empty-active-set GC (every profile dropped)
@@ -808,7 +820,8 @@ local-dev convenience.
 
 ## Manual Testing
 
-Profile-mode hardware (Android with Chrome WebView 110+):
+Profile-mode hardware (Android with a System WebView reporting
+`MULTI_PROFILE`):
 
 1. Create two sites on the same domain, e.g. `github.com/personal`
    and `github.com/work`.
@@ -826,7 +839,8 @@ Profile-mode hardware (Android with Chrome WebView 110+):
 7. Delete site A — confirm its profile dir is gone and B's is
    intact.
 
-Legacy hardware (Android System WebView <110):
+Legacy hardware (Android System WebView not reporting
+`MULTI_PROFILE`):
 
 1. Confirm at startup `LogService` reports `Profile API not
    supported — using CookieIsolationEngine fallback`.

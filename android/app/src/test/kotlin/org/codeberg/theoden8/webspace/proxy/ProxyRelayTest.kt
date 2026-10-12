@@ -1,17 +1,37 @@
 package org.codeberg.theoden8.webspace.proxy
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.clientConnectThenGet
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.clientContext
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.fakeOrigin
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.fakeServer
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.fakeTlsServer
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.generateKeyStore
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.readFully
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.readPreamble
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.serverContext
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.spliceTo
+import org.codeberg.theoden8.webspace.proxy.RelayTestSupport.withDefaultSslContext
+import java.io.File
 import java.io.InputStream
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.nio.file.Files
+import java.security.KeyStore
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLServerSocket
+import javax.net.ssl.TrustManagerFactory
 
 /**
  * JVM unit tests for [ProxyRelay] — no Android framework, no emulator.
@@ -67,7 +87,7 @@ class ProxyRelayTest {
                     ProxyRelay.UpstreamType.HTTP, "127.0.0.1", proxy.localPort, "user", "pass",
                 )
             )
-            val body = clientConnectThenGet(port, "example.com", 443)
+            val body = clientConnectThenGet(port, "example.com", 443, relay.host)
             assertTrue("origin response should reach the client", body.contains("hi"))
             assertEquals(
                 "Proxy-Authorization: Basic ${ProxyRelay.base64("user:pass".toByteArray())}",
@@ -112,12 +132,227 @@ class ProxyRelayTest {
                     ProxyRelay.UpstreamType.SOCKS5, "127.0.0.1", socks.localPort, "alice", "s3cret",
                 )
             )
-            val body = clientConnectThenGet(port, "example.com", 443)
+            val body = clientConnectThenGet(port, "example.com", 443, relay.host)
             assertTrue(body.contains("ok"))
             assertEquals("alice", seenUser.get())
             assertEquals("s3cret", seenPass.get())
         } finally {
             relay.stop(); socks.close(); origin.close()
+        }
+    }
+
+    // --- peer ownership -------------------------------------------------
+    //
+    // The listener is on loopback, so every app on the device can reach it and
+    // would get the user's upstream credentials attached to whatever it asked
+    // for. A connection this process opened appears in our own /proc/net/tcp
+    // (API 29+ scopes that file to the calling UID); another app's does not.
+
+    @Test
+    fun peerVerdict_ownSocketIsRecognised() {
+        // local 127.0.0.1:0xC001 -> remote 127.0.0.1:0x1F90 (relay), uid 10123.
+        val table = """
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid
+               0: 0100007F:C001 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  10123
+        """.trimIndent()
+        assertEquals(
+            ProxyRelay.PeerVerdict.OWN,
+            ProxyRelay.peerVerdict(listOf(table, null), 0xC001, 0x1F90, 10123),
+        )
+    }
+
+    @Test
+    fun peerVerdict_anotherUidOwningThePortPairIsForeign() {
+        // The whole point: on a table that lists the namespace, this row is
+        // exactly what a foreign app's connection to the relay looks like. Match
+        // on ports alone and it reads as OWN, which is what made the check inert.
+        val table = """
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid
+               0: 0100007F:C001 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  10999
+        """.trimIndent()
+        assertEquals(
+            ProxyRelay.PeerVerdict.FOREIGN,
+            ProxyRelay.peerVerdict(listOf(table, null), 0xC001, 0x1F90, 10123),
+        )
+    }
+
+    @Test
+    fun peerVerdict_withoutOurUidTheCheckCannotReject() {
+        // No UID to compare against degrades to the port pair, which cannot
+        // reject. Stated so nobody mistakes that path for a passing check.
+        val table = """
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid
+               0: 0100007F:C001 0100007F:1F90 01 00000000:00000000 00:00000000 00000000  10999
+        """.trimIndent()
+        assertEquals(
+            ProxyRelay.PeerVerdict.OWN,
+            ProxyRelay.peerVerdict(listOf(table, null), 0xC001, 0x1F90, null),
+        )
+    }
+
+    @Test
+    fun peerVerdict_readableTableWithoutThePeerIsForeign() {
+        val table = """
+              sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid
+               0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  10123
+        """.trimIndent()
+        assertEquals(
+            "only the listener is ours; the connecting socket belongs elsewhere",
+            ProxyRelay.PeerVerdict.FOREIGN,
+            ProxyRelay.peerVerdict(listOf(table, null), 0xC001, 0x1F90, 10123),
+        )
+    }
+
+    @Test
+    fun peerVerdict_unreadableTableIsUnknownNotForeign() {
+        // Failing closed here would strand proxying on every device whose
+        // kernel or SELinux policy denies the read.
+        assertEquals(
+            ProxyRelay.PeerVerdict.UNKNOWN,
+            ProxyRelay.peerVerdict(listOf(null, null), 0xC001, 0x1F90, 10123),
+        )
+    }
+
+    @Test
+    fun peerVerdict_scansTheIpv6Table() {
+        val tcp6 = """
+              sl  local_address                         remote_address
+               0: 0000000000000000FFFF00000100007F:C001 0000000000000000FFFF00000100007F:1F90 01 00000000:00000000 00:00000000 00000000  10123
+        """.trimIndent()
+        assertEquals(
+            ProxyRelay.PeerVerdict.OWN,
+            ProxyRelay.peerVerdict(listOf(null, tcp6), 0xC001, 0x1F90, 10123),
+        )
+    }
+
+    @Test
+    fun listener_bindsARandomLoopbackAddressNotJust127001() {
+        // The peer check cannot reject anything from API 29, so on a modern
+        // device finding the listener is the only cost an attacker pays. A port
+        // is ~15 bits; the address adds ~24 more, and 127/8 all routes to lo.
+        val relays = (1..8).map { ProxyRelay() }
+        try {
+            val cfg = ProxyRelay.UpstreamConfig(
+                ProxyRelay.UpstreamType.HTTP, "127.0.0.1", 1, null, null)
+            val hosts = relays.map { it.start(cfg); it.host }
+            assertTrue("every bind must land inside 127/8",
+                hosts.all { it.startsWith("127.") })
+            assertTrue("the address must carry entropy, not always be 127.0.0.1",
+                hosts.any { it != "127.0.0.1" })
+        } finally {
+            relays.forEach { it.stop() }
+        }
+    }
+
+    @Test
+    fun listener_isNotReachableOnAnotherLoopbackAddress() {
+        // Proves the address is real entropy rather than an alias: the same
+        // port on 127.0.0.1 must not answer.
+        val relay = ProxyRelay()
+        try {
+            val port = relay.start(
+                ProxyRelay.UpstreamConfig(
+                    ProxyRelay.UpstreamType.HTTP, "127.0.0.1", 1, null, null))
+            org.junit.Assume.assumeTrue(
+                "fell back to 127.0.0.1 on this host", relay.host != "127.0.0.1")
+            Socket().use { s ->
+                val refused = try {
+                    s.connect(InetSocketAddress(InetAddress.getByName("127.0.0.1"), port), 1500)
+                    false
+                } catch (e: Exception) {
+                    true
+                }
+                assertTrue("the port must not answer on a different 127/8 address", refused)
+            }
+        } finally {
+            relay.stop()
+        }
+    }
+
+    @Test
+    fun foreignPeer_isRefusedBeforeAnyUpstreamConnect() {
+        val upstreamHits = AtomicReference(0)
+        val proxy = fakeServer { sock ->
+            upstreamHits.set(upstreamHits.get() + 1)
+            runCatching { sock.close() }
+        }
+        val relay = ProxyRelay(peerCheck = { _, _ -> ProxyRelay.PeerVerdict.FOREIGN })
+        try {
+            val port = relay.start(
+                ProxyRelay.UpstreamConfig(
+                    ProxyRelay.UpstreamType.HTTP, "127.0.0.1", proxy.localPort, "user", "pass",
+                )
+            )
+            Socket().use { s ->
+                s.connect(InetSocketAddress(InetAddress.getByName(relay.host), port), 2000)
+                s.soTimeout = 3000
+                s.getOutputStream().write(
+                    "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n".toByteArray()
+                )
+                s.getOutputStream().flush()
+                assertEquals("the relay must close on a foreign peer, not answer it",
+                    -1, s.getInputStream().read())
+            }
+            assertEquals("no upstream connection may be opened for a foreign peer",
+                0, upstreamHits.get())
+        } finally {
+            relay.stop(); proxy.close()
+        }
+    }
+
+    @Test
+    fun ownPeer_withThisProcessUid_isServedNormally() {
+        // The UID half of the check, against a live /proc: this JVM's own
+        // connection to the relay must carry this JVM's UID. Nothing else here
+        // proves that a socket we opened is attributed to us.
+        val uid = File("/proc/self/status").readLines()
+            .firstOrNull { it.startsWith("Uid:") }
+            ?.trim()?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
+        org.junit.Assume.assumeTrue("no readable /proc/self/status", uid != null)
+
+        val origin = fakeOrigin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+        val proxy = fakeServer { sock ->
+            readPreamble(sock.getInputStream())
+            sock.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+            sock.getOutputStream().flush()
+            spliceTo(sock, origin.localPort)
+        }
+        val relay = ProxyRelay(ownUid = uid)
+        try {
+            val port = relay.start(
+                ProxyRelay.UpstreamConfig(
+                    ProxyRelay.UpstreamType.HTTP, "127.0.0.1", proxy.localPort, "user", "pass",
+                )
+            )
+            assertTrue(clientConnectThenGet(port, "example.com", 443, relay.host).contains("hi"))
+        } finally {
+            relay.stop(); proxy.close(); origin.close()
+        }
+    }
+
+    @Test
+    fun ownPeer_isServedNormally() {
+
+        // The default check runs for real here: the test client and the relay
+        // are the same process, so a readable /proc/net/tcp must classify the
+        // connection as ours rather than refusing it.
+        val origin = fakeOrigin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+        val proxy = fakeServer { sock ->
+            readPreamble(sock.getInputStream())
+            sock.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+            sock.getOutputStream().flush()
+            spliceTo(sock, origin.localPort)
+        }
+        val relay = ProxyRelay()
+        try {
+            val port = relay.start(
+                ProxyRelay.UpstreamConfig(
+                    ProxyRelay.UpstreamType.HTTP, "127.0.0.1", proxy.localPort, "user", "pass",
+                )
+            )
+            assertTrue(clientConnectThenGet(port, "example.com", 443, relay.host).contains("hi"))
+        } finally {
+            relay.stop(); proxy.close(); origin.close()
         }
     }
 
@@ -134,7 +369,7 @@ class ProxyRelayTest {
                 )
             )
             Socket().use { c ->
-                c.connect(InetSocketAddress("127.0.0.1", port), 2000)
+                c.connect(InetSocketAddress(relay.host, port), 2000)
                 c.getOutputStream().write(
                     "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n".toByteArray()
                 )
@@ -147,95 +382,83 @@ class ProxyRelayTest {
         }
     }
 
-    // --- helpers ---
-
-    private data class Preamble(val requestLine: String, val headers: List<String>)
-
-    private fun readPreamble(ins: InputStream): Preamble {
-        val sb = StringBuilder()
-        var last4 = 0
-        while (true) {
-            val b = ins.read()
-            if (b < 0) break
-            sb.append(b.toChar())
-            last4 = (last4 shl 8) or b
-            if (last4 == 0x0D0A0D0A) break
-        }
-        val lines = sb.toString().split("\r\n").filter { it.isNotEmpty() }
-        return Preamble(lines.firstOrNull() ?: "", lines.drop(1))
-    }
-
-    private fun readFully(ins: InputStream, buf: ByteArray) {
-        var off = 0
-        while (off < buf.size) {
-            val n = ins.read(buf, off, buf.size - off)
-            if (n < 0) throw IllegalStateException("eof")
-            off += n
-        }
-    }
-
-    private fun clientConnectThenGet(relayPort: Int, host: String, port: Int): String {
-        Socket().use { c ->
-            c.connect(InetSocketAddress("127.0.0.1", relayPort), 3000)
-            val out = c.getOutputStream()
-            out.write("CONNECT $host:$port HTTP/1.1\r\nHost: $host:$port\r\n\r\n".toByteArray())
-            out.flush()
-            val established = readPreamble(c.getInputStream())
-            assertTrue("CONNECT should succeed: ${established.requestLine}", established.requestLine.contains("200"))
-            out.write("GET / HTTP/1.1\r\nHost: $host\r\nConnection: close\r\n\r\n".toByteArray())
-            out.flush()
-            return c.getInputStream().readBytes().toString(Charsets.ISO_8859_1)
-        }
-    }
-
-    private fun fakeOrigin(response: String): ServerSocket {
-        val server = ServerSocket()
-        server.bind(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
-        Thread {
-            while (!server.isClosed) {
-                val s = try { server.accept() } catch (e: Exception) { break }
-                Thread {
-                    try {
-                        readPreamble(s.getInputStream())
-                        s.getOutputStream().write(response.toByteArray())
-                        s.getOutputStream().flush()
-                    } catch (e: Exception) {
-                    } finally { runCatching { s.close() } }
-                }.apply { isDaemon = true }.start()
+    @Test
+    fun httpsUpstream_rejectsCertificateIssuedForAnotherHost() {
+        // The upstream's certificate chains to a trusted root but is issued
+        // for a name the attacker owns. A raw SSLSocket validates the chain
+        // and stops there, so without endpoint identification the relay
+        // hands it the Proxy-Authorization header and every CONNECT target.
+        val pki = generateKeyStore("CN=evil.example", "dns:evil.example")
+        val seenAuth = AtomicReference<String?>(null)
+        val reachedUpstream = CountDownLatch(1)
+        val proxy = fakeTlsServer(serverContext(pki)) { sock ->
+            val req = readPreamble(sock.getInputStream())
+            if (req.requestLine.isNotEmpty()) {
+                seenAuth.set(req.headers.firstOrNull { it.startsWith("Proxy-Authorization:", true) })
+                reachedUpstream.countDown()
             }
-        }.apply { isDaemon = true }.start()
-        return server
-    }
-
-    private fun fakeServer(handler: (Socket) -> Unit): ServerSocket {
-        val server = ServerSocket()
-        server.bind(InetSocketAddress(InetAddress.getLoopbackAddress(), 0))
-        Thread {
-            while (!server.isClosed) {
-                val s = try { server.accept() } catch (e: Exception) { break }
-                Thread {
-                    try { handler(s) } catch (e: Exception) { } finally { runCatching { s.close() } }
-                }.apply { isDaemon = true }.start()
+        }
+        withDefaultSslContext(clientContext(pki)) {
+            val relay = ProxyRelay()
+            try {
+                val port = relay.start(
+                    ProxyRelay.UpstreamConfig(
+                        ProxyRelay.UpstreamType.HTTPS, "localhost", proxy.localPort, "user", "pass",
+                    )
+                )
+                Socket().use { c ->
+                    c.connect(InetSocketAddress(relay.host, port), 3000)
+                    c.getOutputStream().write(
+                        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n".toByteArray()
+                    )
+                    c.getOutputStream().flush()
+                    val status = readPreamble(c.getInputStream()).requestLine
+                    assertTrue("expected 502, got: $status", status.contains("502"))
+                }
+                assertFalse(
+                    "handshake must not complete against a mismatched certificate",
+                    reachedUpstream.await(1, TimeUnit.SECONDS),
+                )
+                assertNull("credentials must never reach the impostor", seenAuth.get())
+            } finally {
+                relay.stop(); proxy.close()
             }
-        }.apply { isDaemon = true }.start()
-        return server
+        }
     }
 
-    private fun spliceTo(client: Socket, originPort: Int) {
-        val origin = Socket()
-        origin.connect(InetSocketAddress("127.0.0.1", originPort), 3000)
-        val latch = CountDownLatch(2)
-        Thread {
-            runCatching { client.getInputStream().copyTo(origin.getOutputStream()); origin.getOutputStream().flush() }
-            runCatching { origin.shutdownOutput() }
-            latch.countDown()
-        }.apply { isDaemon = true }.start()
-        Thread {
-            runCatching { origin.getInputStream().copyTo(client.getOutputStream()); client.getOutputStream().flush() }
-            runCatching { client.shutdownOutput() }
-            latch.countDown()
-        }.apply { isDaemon = true }.start()
-        latch.await(10, TimeUnit.SECONDS)
-        runCatching { origin.close() }
+    @Test
+    fun httpsUpstream_acceptsMatchingCertificateAndInjectsCredentials() {
+        // Positive control for the test above: same trust setup, a
+        // certificate that actually names the configured upstream. Proves
+        // the rejection there is the hostname check and not the chain.
+        val pki = generateKeyStore("CN=localhost", "dns:localhost")
+        val origin = fakeOrigin("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi")
+        val seenAuth = AtomicReference<String?>(null)
+        val proxy = fakeTlsServer(serverContext(pki)) { sock ->
+            val req = readPreamble(sock.getInputStream())
+            seenAuth.set(req.headers.firstOrNull { it.startsWith("Proxy-Authorization:", true) })
+            sock.getOutputStream().write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+            sock.getOutputStream().flush()
+            spliceTo(sock, origin.localPort)
+        }
+        withDefaultSslContext(clientContext(pki)) {
+            val relay = ProxyRelay()
+            try {
+                val port = relay.start(
+                    ProxyRelay.UpstreamConfig(
+                        ProxyRelay.UpstreamType.HTTPS, "localhost", proxy.localPort, "user", "pass",
+                    )
+                )
+                val body = clientConnectThenGet(port, "example.com", 443, relay.host)
+                assertTrue("origin response should reach the client", body.contains("hi"))
+                assertEquals(
+                    "Proxy-Authorization: Basic ${ProxyRelay.base64("user:pass".toByteArray())}",
+                    seenAuth.get(),
+                )
+            } finally {
+                relay.stop(); proxy.close(); origin.close()
+            }
+        }
     }
+
 }

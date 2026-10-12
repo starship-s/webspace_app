@@ -1,4 +1,4 @@
-// Camera-stop funnel gate (CAM-012). Every path that stops a site from being
+// Capture-stop funnel gate (CAM-012 / MIC-012). Every path that stops a site from being
 // the one on screen must end its device capture, and must do so BEFORE the
 // pause: on iOS the per-instance pause blocks the page's JS thread (the
 // plugin's alert() hack, see openspec/specs/webview-pause-lifecycle/spec.md),
@@ -12,14 +12,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-const { blockAfter } = require('./helpers/dart_blocks');
+const { read, blockAfter, dartFiles, jsFiles } = require('./helpers/source');
 
-const repoRoot = path.resolve(__dirname, '..', '..');
-const MAIN = 'lib/main.dart';
+const MAIN = 'lib/controllers/site_activation_controller.dart';
 
-const src = fs.readFileSync(path.join(repoRoot, MAIN), 'utf8');
+const src = read(MAIN);
 const lines = src.split('\n');
 
 // Every deactivation path (go-home, site switch, the sweep of the sites left
@@ -28,7 +25,7 @@ const lines = src.split('\n');
 test(`${MAIN}: the deactivation funnel stops capture before it pauses`, () => {
   const funnel = blockAfter(
     src, 'Future<void> _quiesceOutgoingSite(', ') async {', MAIN);
-  const stopIdx = funnel.indexOf('stopRealCameraCapture');
+  const stopIdx = funnel.indexOf('stopRealCapture');
   const pauseIdx = funnel.indexOf('pauseWebView');
   assert.notEqual(stopIdx, -1,
     'a site being backgrounded must have its device capture ended (CAM-012)');
@@ -59,11 +56,11 @@ for (const { line, i } of pauseSites) {
       .join('\n');
     assert.match(
       window,
-      /stopRealCameraCapture\(\)/,
+      /stopRealCapture\(\)/,
       `a site being backgrounded must have its device capture ended first ` +
         `(CAM-012). Offending pause: ${line.trim()}`,
     );
-    const stopIdx = window.indexOf('stopRealCameraCapture()');
+    const stopIdx = window.indexOf('stopRealCapture()');
     const pauseIdx = window.indexOf('pauseWebView()');
     assert.ok(
       stopIdx < pauseIdx,
@@ -73,19 +70,50 @@ for (const { line, i } of pauseSites) {
   });
 }
 
-test('WebViewModel.stopRealCameraCapture is not folded into pauseWebView', () => {
-  const model = fs.readFileSync(
-    path.join(repoRoot, 'lib/web_view_model.dart'),
-    'utf8',
-  );
+test('WebViewModel.stopRealCapture is not folded into pauseWebView', () => {
+  const model = read('lib/web_view_model.dart');
   const pauseBody = model.slice(
     model.indexOf('Future<void> pauseWebView()'),
-    model.indexOf('Future<void> stopRealCameraCapture()'),
+    model.indexOf('Future<void> stopRealCapture()'),
   );
   assert.ok(
-    !/stopRealCameraCapture\(/.test(pauseBody),
+    !/stopRealCapture\(/.test(pauseBody),
     'pauseWebView() early-returns for notification and background-audio ' +
       'sites; folding the camera stop into it would exempt exactly the sites ' +
       'whose JS keeps running in the background',
   );
 });
+
+// MIC-012: the hook lives on globalThis under a single name, so a shim that
+// installs its own would silently replace the other's and which capture
+// survives a site switch would depend on injection order. One installer, one
+// shared registry, and every shim that hands over a device stream routes it
+// through the same remember call.
+const SHIMS = [
+  'lib/js/camera_stream.js',
+  'lib/js/microphone_stream.js',
+];
+const CAPTURE = [...SHIMS, 'lib/js/screen_share.js'];
+const PRELUDE = 'lib/js/_capture_prelude.js';
+
+test(`${PRELUDE} is the only definer of __wsStopRealCapture`, () => {
+  const definers = [...dartFiles(), ...jsFiles()]
+    .filter((rel) => /__wsStopRealCapture'\s*,/.test(read(rel)));
+  assert.deepEqual(definers, [PRELUDE],
+    'a second definer would clobber the first depending on injection order');
+});
+
+for (const shim of CAPTURE) {
+  test(`${shim} is built on the shared prelude`, () => {
+    assert.match(read(shim), /^\s*\/\/ @include _capture_prelude\.js$/m,
+      'every capture shim reaches the registry through the shared prelude');
+  });
+}
+
+for (const shim of SHIMS) {
+  test(`${shim}: device streams go through the shared registry`, () => {
+    assert.match(read(shim), /rememberRealTracks\(/,
+      'a stream this shim obtained from the platform must be registered, or '
+        + 'the deactivation stop cannot end it');
+  });
+}

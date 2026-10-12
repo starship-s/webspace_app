@@ -325,12 +325,22 @@ The system SHALL expose a per-site `spoofTimezone` (IANA name, nullable). When s
 - `Intl.DateTimeFormat(locales, options)` — when `options.timeZone` is absent, the configured zone is injected so `resolvedOptions().timeZone` reports it,
 - `Date.prototype.getTimezoneOffset` — returns the offset in the configured zone at the given Date instant (DST-correct via Intl),
 - `Date.prototype.toString` — returns a well-formed browser-style string with the spoofed GMT offset and long timezone name.
+- `Date.prototype.toDateString` and `Date.prototype.toTimeString` — the two halves of that string, rebuilt from the same parts; each is an independent builtin that would otherwise print the engine's real zone.
 
 #### Scenario: Intl reports spoofed zone
 
 **Given** `spoofTimezone = 'Asia/Tokyo'`
 **When** a site reads `new Intl.DateTimeFormat().resolvedOptions().timeZone`
 **Then** the value is `'Asia/Tokyo'`
+
+#### Scenario: The wrapper is not bypassable through its own prototype
+
+**Given** `spoofTimezone = 'Asia/Tokyo'`
+**When** a site evaluates
+`new (Intl.DateTimeFormat.prototype.constructor)().resolvedOptions().timeZone`
+**Then** the value is `'Asia/Tokyo'`, not the device zone
+**And** the same holds after the language shim has wrapped `Intl.DateTimeFormat`
+in turn
 
 #### Scenario: getTimezoneOffset returns spoofed offset
 
@@ -342,7 +352,7 @@ The system SHALL expose a per-site `spoofTimezone` (IANA name, nullable). When s
 
 **Given** `spoofTimezone = 'Asia/Tokyo'` and device real zone is `UTC`
 **When** a site calls `new Date().getHours()` and compares to `Intl.DateTimeFormat('en', { hour: 'numeric', timeZone: 'Asia/Tokyo' }).format(new Date())`
-**Then** the values disagree (real local vs spoofed). This is a known gap — the implementation deliberately does not override `Date` getters to keep the shim small; cross-referencing callers can detect the spoof.
+**Then** the values disagree (real local vs spoofed). This is a known gap — the implementation deliberately does not override `Date` getters to keep the shim small; cross-referencing callers can detect the spoof. The `Date()` call form (no `new`) returns the engine's own string too; the global constructor is not wrapped.
 
 **Rationale:** covering `getHours`/`getMinutes`/`getDate`/... requires shifting each call into the target zone, which is invasive and has DST-boundary edge cases. Most fingerprint libraries use `Intl` or `getTimezoneOffset`.
 
@@ -361,7 +371,7 @@ This is a UI affordance only — when `spoofTimezone` is `null` the JS shim is n
 
 The per-site model SHALL expose a boolean field `spoofTimezoneFromLocation`. When true AND coordinates are set AND a polygon dataset is loaded, the effective spoof timezone is the IANA zone whose polygon contains `(spoofLatitude, spoofLongitude)`. `spoofTimezone` is ignored in that case (the two fields are mutually exclusive in the UI).
 
-If the polygon dataset is absent, or the coordinates fall in a region not covered by the dataset (e.g. open ocean in the no-oceans variant), the lookup SHALL fall through to no-timezone-spoof (system default) rather than failing the whole shim. The lookup happens once at shim build time in `webview.dart`, not on every JS call, so a slow polygon test does not affect page perf after the initial page load.
+If the polygon dataset is absent, or the coordinates fall in a region not covered by the dataset (e.g. open ocean in the no-oceans variant), the lookup SHALL fall through to no-timezone-spoof (system default) rather than failing the whole shim. The lookup happens where the dataset is loaded, at settings save (and on startup for a site saved before that), and the resolved zone is stored in `spoofTimezone`; every webview applies that stored zone, so the dataset never loads on the webview-build path and a slow polygon test never touches page load.
 
 The polygon dataset SHALL be downloadable on demand via App Settings → Location picker → "Timezone polygons" → Download. Default source is the `evansiroky/timezone-boundary-builder` GitHub release (zipped GeoJSON, ~7–15 MB compressed). The download URL is user-configurable so users can swap in a smaller community dataset, a self-hosted mirror, or a pre-extracted GeoJSON file. The dataset is not bundled with the app — it is opt-in. The state (loaded zone count, last-updated timestamp, configured URL) round-trips across app launches in app private storage.
 
@@ -400,6 +410,16 @@ The per-site Timezone dropdown SHALL include a "From picked location" entry. The
 **Then** the cache file is deleted, in-memory state is cleared, and `isReady` returns false
 **And** any per-site setting with `spoofTimezoneFromLocation = true` falls through to system default
 
+#### Scenario: App Settings reports the dataset on disk, not in memory
+
+**Given** the dataset was downloaded in an earlier launch
+**And** nothing in this launch has loaded it (only per-site settings and the from-location startup refresh do)
+**When** the user opens App Settings
+**Then** the "Timezone polygons" row SHALL show the zone count stored at download, the last-updated timestamp, and the Refresh and Clear buttons
+**And** showing the row SHALL NOT load the polygons into memory; a dataset stored before the count was recorded is counted once on a background isolate
+**And** when the dataset file is absent the row SHALL read "Not downloaded" with no timestamp, whatever the stored timestamp says
+**And** the row SHALL follow a load, download or clear made while it is open
+
 ---
 
 ### Requirement: LOC-004 - WebRTC policy
@@ -416,6 +436,23 @@ the per-site / app-global proxy precedence.
 **When** a site creates a new `RTCPeerConnection(config)` and calls `setLocalDescription(offer)`
 **Then** the effective config has `iceTransportPolicy = 'relay'`
 **And** the SDP passed to `setLocalDescription` has all non-`typ relay` candidate lines stripped
+
+#### Scenario: Relay-only survives setConfiguration and the prototype method
+
+**Given** `webRtcPolicy = relayOnly` and a connection the page created
+**When** the page calls `pc.setConfiguration({iceTransportPolicy: 'all'})`, or `RTCPeerConnection.prototype.setLocalDescription.call(pc, offer)`, or `pc.setLocalDescription()` with no argument
+**Then** the configuration the engine holds still has `iceTransportPolicy = 'relay'` (the policy is forced on `RTCPeerConnection.prototype.setConfiguration`)
+**And** the SDP filter is the prototype method itself, so there is no per-instance wrapper to skip
+
+#### Scenario: Relay-only survives the prototype constructor
+
+**Given** `webRtcPolicy = relayOnly`
+**When** a site evaluates
+`new (RTCPeerConnection.prototype.constructor)({iceServers: [...]})`
+**Then** it gets the patched constructor, so `iceTransportPolicy` is still
+forced to `'relay'` and `setLocalDescription` still strips non-relay candidates
+**And** no path exists from page script to a peer connection that gathers host
+candidates outside the proxy
 
 #### Scenario: Disabled throws
 
@@ -557,7 +594,7 @@ This is a manual user action that fills inputs the user can still edit. It does 
 
 ### Requirement: LOC-007 - Settings apply to nested webviews
 
-Every per-site field on `WebViewModel` that controls privacy behavior (`locationMode`, `spoofLatitude`, `spoofLongitude`, `spoofAccuracy`, `spoofTimezone`, `spoofTimezoneFromLocation`, `liveLocationGranularity`, `webRtcPolicy`) SHALL propagate to every `InAppWebViewScreen` spawned by cross-domain navigation from the parent site via `launchUrl` in `lib/main.dart`. The JS shim SHALL be injected into cross-origin iframes as well as the top frame by setting `forMainFrameOnly: false` on the `inapp.UserScript`.
+Every per-site field on `WebViewModel` that controls privacy behavior (`locationMode`, `spoofLatitude`, `spoofLongitude`, `spoofAccuracy`, the resolved `spoofTimezone`, `liveLocationGranularity`, the effective `webRtcPolicy`) SHALL propagate to every `InAppWebViewScreen` spawned by cross-domain navigation from the parent site, through the `SitePosture` location group (NESTED-010). `spoofTimezoneFromLocation` is a UI marker the resolution reads and no webview does. The JS shim SHALL be injected into cross-origin iframes as well as the top frame by setting `forMainFrameOnly: false` on the `inapp.UserScript`.
 
 When the parent's mode is `live`, nested webviews SHALL inherit the live behavior — including the `getRealLocation` JS handler registration in `webview.dart`'s `onWebViewCreated` — so that a nested browser opened from the parent site continues to read fresh device coords through the shim, not platform-default geolocation.
 
@@ -570,12 +607,35 @@ Otherwise a site could defeat the spoof by linking to a detection page (e.g. bro
 **Then** the nested webview reports the spoofed coordinates
 **And** `RTCPeerConnection` is neutered in the nested webview too
 
+#### Scenario: Nested browser keeps the resolved zone under Tracking Protection
+
+**Given** site "Acme" has Tracking Protection on, picked coordinates in Paris, and `spoofTimezone = 'Europe/Paris'` resolved at save
+**When** the user follows a cross-domain link from Acme into a nested `InAppWebViewScreen`
+**Then** `Intl.DateTimeFormat().resolvedOptions().timeZone` in the nested page is `Europe/Paris`, not the device's zone (BUG-025)
+
 #### Scenario: Iframe sees the spoof
 
 **Given** a page embeds `https://browserleaks.com/webrtc` inside a cross-origin iframe
 **When** the iframe runs its detection script
 **Then** `navigator.geolocation` returns the spoofed coordinates
 **And** `RTCPeerConnection` is either neutered or relay-only per the parent site's policy
+
+### Requirement: LOC-011 - A live fix is served to the top document only
+
+The location shim is injected `forMainFrameOnly: false` (LOC-007) so a page's own frames see the same spoof, which also puts a cross-origin iframe on the `getRealLocation` handler. In `live` mode the handler SHALL read the frame identity the plugin's bridge preamble supplies (`JavaScriptHandlerFunctionData`, which page script can neither forge nor call around) and SHALL answer a frame whose origin differs from the top document's with `permission_denied`, which the shim maps to `PERMISSION_DENIED`: exactly what an iframe without `allow="geolocation"` sees in a browser. A same-origin frame keeps the engine's default `'self'` allowlist. Gated by `test/js/page_bridge_authority.test.js`.
+
+#### Scenario: A cross-origin iframe asks for the device fix
+
+**Given** site "Acme" has `locationMode = live`
+**When** a cross-origin iframe it embeds calls `navigator.geolocation.getCurrentPosition`, or calls the `getRealLocation` handler directly
+**Then** the error callback receives `PERMISSION_DENIED`
+**And** the device's location service is not consulted
+
+#### Scenario: The top document and its own frames still get a fix
+
+**Given** the same site
+**When** the top document, or a same-origin iframe, calls `getCurrentPosition`
+**Then** the snapped device fix is returned as before
 
 ---
 

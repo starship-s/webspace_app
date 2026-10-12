@@ -7,11 +7,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const fs = require('node:fs');
-const path = require('node:path');
-
-const repoRoot = path.resolve(__dirname, '..', '..');
-const read = (rel) => fs.readFileSync(path.join(repoRoot, rel), 'utf8');
+const { read } = require('./helpers/source');
 
 test('both platform renderer-death events route to onRendererGone', () => {
   const src = read('lib/services/webview.dart');
@@ -29,7 +25,7 @@ test('onRendererGone is wired to the destroy-and-rebuild recovery', () => {
   const src = read('lib/web_view_model.dart');
   assert.match(
     src,
-    /onRendererGone:\s*\(didCrash\)\s*=>\s*handleRendererGone\(/,
+    /onRendererGone:\s*handleRendererGone,/,
     'the config callback must invoke handleRendererGone',
   );
   // handleRendererGone must DISPOSE the dead instance (the fix), not just log.
@@ -39,19 +35,25 @@ test('onRendererGone is wired to the destroy-and-rebuild recovery', () => {
 });
 
 test('the proactive probe runs on >=2 activation paths (PAUSE-014)', () => {
-  const src = read('lib/main.dart');
-  const refs = (src.match(/_probeRendererAndRecover\(/g) || []).length;
-  // 1 definition + >=2 call sites (resume + every site activation). The
-  // offscreen renderer death — the case the platform event misses — is only
-  // caught by this probe, so dropping a call site re-opens BUG-002.
-  assert.ok(refs >= 3, `expected probe definition + >=2 call sites, found ${refs}`);
+  // The resume and every site activation probe. The offscreen renderer
+  // death, the case the platform event misses, is only caught by this probe,
+  // so dropping a call site re-opens BUG-002.
+  const lifecycle = read('lib/controllers/app_lifecycle_controller.dart');
+  assert.match(lifecycle, /probeRenderer\(_sites\.models\[probeIdx\], trigger: 'resume'\)/,
+    'the resume must probe the site on screen');
+  assert.match(read('lib/controllers/site_activation_controller.dart'),
+    /_host\.probeRenderer\(target, trigger: 'site-switch'\)/,
+    'every activation must probe its target');
+  assert.match(read('lib/screens/webspace_page.dart'),
+    /probeRenderer\(WebViewModel model, \{required String trigger\}\) =>\s*_s\._lifecycle\.probeRenderer\(/,
+    'the activation host must hand the probe to the lifecycle controller');
 });
 
 test('nested InAppWebViewScreen wires renderer-gone recovery (BUG-002 gap #1)', () => {
   const src = read('lib/screens/inappbrowser.dart');
   assert.match(
     src,
-    /onRendererGone:\s*\(didCrash\)\s*=>\s*_handleRendererGone\(/,
+    /onRendererGone:\s*_handleRendererGone,/,
     'nested WebViewConfig must wire onRendererGone',
   );
   // The handler must REMOUNT the dead webview (bump the key), not just log.
@@ -59,11 +61,13 @@ test('nested InAppWebViewScreen wires renderer-gone recovery (BUG-002 gap #1)', 
   assert.match(def, /_rendererGen\+\+/, 'recovery must bump the remount key');
   // And a proactive probe on resume (the offscreen case the event misses).
   assert.match(src, /didChangeAppLifecycleState/, 'nested screen must hook resume');
-  assert.match(src, /rendererProbeIndicatesGone/, 'nested probe must use the gone predicate');
+  assert.match(src, /_surface\.rendererGone\(/, 'nested probe must use the shared probe');
+  assert.match(read('lib/controllers/surface_repaint_controller.dart'),
+    /rendererProbeIndicatesGone\(result\)/, 'the shared probe must use the gone predicate');
 });
 
 test('rendererProbeIndicatesGone treats only null as gone', () => {
-  const src = read('lib/web_view_model.dart');
+  const src = read('lib/services/webview_controller.dart');
   // A regression that flags 0 / -1 / positive height as "gone" would reload-loop
   // a healthy page. The predicate must be exactly `== null`.
   assert.match(

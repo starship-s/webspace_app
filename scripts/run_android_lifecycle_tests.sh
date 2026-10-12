@@ -17,26 +17,40 @@
 # whose Dart entrypoint is the *test* main, so this tier always rebuilds
 # and installs the default-entrypoint debug APK before driving it.
 set -euo pipefail
+. "$(dirname "$0")/lib/android_tier.sh"
 
 # Hard wall-clock cap, like the sibling script: a webview mount can
-# deadlock below every polling deadline.
+# deadlock below every polling deadline. Scenario P spends a fixed
+# WS_PUSH_BACKGROUND_SECS in the background by design, so the cap carries it.
 if [ "${WS_LIFECYCLE_WRAPPED:-}" != "1" ]; then
-  exec env WS_LIFECYCLE_WRAPPED=1 timeout -k 30s 25m "$0" "$@"
+  exec env WS_LIFECYCLE_WRAPPED=1 timeout -k 30s 30m "$0" "$@"
 fi
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 
-device_id="${1:-$(adb devices | grep -w 'device' | head -1 | awk '{print $1}' || true)}"
-if [ -z "$device_id" ]; then
-  echo "ERROR: no connected Android device/emulator found" >&2
-  adb devices >&2
-  exit 1
-fi
+pick_device "${1:-}"
 export ANDROID_SERIAL="$device_id"
 
-pkg="org.codeberg.theoden8.webspace"
-component="$pkg/.MainActivity"
+# `initWith(debug)` -- so the diag seed, the reload extra and the repaint
+# suppression all still work. Default stays debug; set the mode to profile to
+# run the tier against the closer artifact. See docs/bugs/001-white-screen.md
+# gap #13.
+build_mode="${WS_LIFECYCLE_BUILD_MODE:-debug}"
+case "$build_mode" in
+  debug|profile) ;;
+  *) echo "ERROR: WS_LIFECYCLE_BUILD_MODE must be debug or profile" >&2; exit 1 ;;
+esac
+
+# The debug build type suffixes the applicationId (android/app/build.gradle)
+# but not the namespace, so `pkg/.Class` shorthand would resolve to a class
+# that does not exist -- components are spelled out in full. Only debug carries
+# the suffix: Flutter creates profile with `initWith(debug)` while applying its
+# plugin, which is before the `debug {}` block below sets the suffix, so a
+# profile build keeps the unsuffixed id.
+ns="org.codeberg.theoden8.webspace"
+if [ "$build_mode" = "debug" ]; then pkg="$ns.debug"; else pkg="$ns"; fi
+component="$pkg/$ns.MainActivity"
 artifacts="$root/build/white_screen_adb"
 classify="$root/scripts/classify_window_pixels.py"
 dark=123524
@@ -60,6 +74,9 @@ if [ -n "$home_pkg" ] && [ "$home_pkg" != "$pkg" ]; then
   adb shell am force-stop "$home_pkg" 2>/dev/null || true
 fi
 adb shell am broadcast -a android.intent.action.CLOSE_SYSTEM_DIALOGS >/dev/null 2>&1 || true
+# A failure dump reads logcat after a deadline of up to 180s; the ring has to
+# still hold the load that deadline was waiting on.
+adb logcat -G 16M >/dev/null 2>&1 || true
 
 www="$(mktemp -d)"
 server_log="$www/server.log"
@@ -67,9 +84,17 @@ server_pid=""
 
 cleanup() {
   if [ -n "$server_pid" ]; then kill "$server_pid" 2>/dev/null || true; fi
+  for scale in window_animation_scale transition_animation_scale \
+               animator_duration_scale; do
+    eval "restore=\${saved_$scale:-}"
+    [ -n "$restore" ] && adb shell settings put global "$scale" "$restore" \
+      >/dev/null 2>&1 || true
+  done
   adb shell settings put global always_finish_activities 0 >/dev/null 2>&1 || true
   adb shell settings put global hide_error_dialogs 0 >/dev/null 2>&1 || true
   adb shell svc power stayon false >/dev/null 2>&1 || true
+  adb shell service call SurfaceFlinger 1008 i32 0 >/dev/null 2>&1 || true
+  adb unroot >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -81,6 +106,7 @@ page '#123524' 'magenta.html' > "$www/dark.html"
 page '#8c1d5a' > "$www/magenta.html"
 page '#ffffff' > "$www/white.html"
 page '#1d3f8c' > "$www/blue.html"
+page '#123524' > "$www/slow.html"
 
 # Same dark fill, plus a JS Notification on every load: a forced
 # background refresh reloads the page, so a new OS notification is the
@@ -110,11 +136,121 @@ cat > "$www/notif.html" <<'EOF'
 </script></body></html>
 EOF
 
+# A notification site the way real ones work: its unread count lives on the
+# server, the page shows it in its title, and the page posts a notification
+# only when the server sends something down the connection it holds open,
+# never on load. Scenario F's page notifies on every load, which no real site
+# does, so it could only ever prove that a reload happened.
+cat > "$www/push.html" <<'EOF'
+<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Push</title>
+<style>html,body{margin:0;height:100%;background:#1d3f8c;}</style></head><body><script>
+(function () {
+  try { fetch('/push-load?' + Date.now(), {cache: 'no-store'}); } catch (e) {}
+  if (typeof Notification !== 'undefined' && Notification.permission !== 'granted') {
+    try { Notification.requestPermission(); } catch (e) {}
+  }
+  var unread = 0;
+  function show(n) { unread = n; document.title = n > 0 ? '(' + n + ') Push' : 'Push'; }
+  fetch('/count', {cache: 'no-store'})
+    .then(function (r) { return r.text(); })
+    .then(function (t) { show(parseInt(t, 10) || 0); })
+    .catch(function () {});
+  var es = new EventSource('/events');
+  es.onmessage = function (e) {
+    show(unread + 1);
+    try { new Notification('ws-push', {body: e.data, tag: e.data}); } catch (err) {}
+  };
+})();
+</script></body></html>
+EOF
+
 python3 - "$www" > "$server_log" 2>&1 <<'EOF' &
-import http.server, os, sys
+import http.server, os, sys, threading, time
+from urllib.parse import parse_qs, urlparse
+
 os.chdir(sys.argv[1])
-srv = http.server.ThreadingHTTPServer(('0.0.0.0', 0),
-                                      http.server.SimpleHTTPRequestHandler)
+
+# Server-sent events for push.html. `/push?m=<text>` (from the host) counts
+# one unread message and sends <text> to every open `/events` stream, and
+# answers with how many streams were open, so the harness can tell "the page
+# was listening and did nothing" from "nothing was listening". `/record?m=`
+# counts one without sending it anywhere: a message that arrived while the
+# page could not hear it. `/count` is what a page learns on load.
+events = []
+streams = [0]
+unread = [0]
+cond = threading.Condition()
+
+
+class Handler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        # `slow.html` stalls before the first byte. BUG-001's blank is the gap
+        # between a reload discarding the painted frame and the replacement
+        # committing, and a 200-byte page off localhost closes that gap faster
+        # than a 1 Hz screencap sampler can see -- which is the regime the app
+        # is never wrong in. A slow commit is the regime the bug was reported
+        # in, and the one Attempts 9/10/11 are all about.
+        if self.path.startswith('/slow'):
+            time.sleep(5)
+        if self.path.startswith('/events'):
+            return self.stream_events()
+        if self.path.startswith('/push?'):
+            return self.push(send=True)
+        if self.path.startswith('/record?'):
+            return self.push(send=False)
+        if self.path.startswith('/count'):
+            with cond:
+                count = unread[0]
+            return self.reply(str(count))
+        return super().do_GET()
+
+    def push(self, send):
+        text = parse_qs(urlparse(self.path).query).get('m', [''])[0]
+        with cond:
+            unread[0] += 1
+            if send:
+                events.append(text)
+                cond.notify_all()
+            open_streams = streams[0]
+        self.reply(str(open_streams if send else unread[0]))
+
+    def reply(self, text):
+        body = text.encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/plain')
+        self.send_header('Cache-Control', 'no-store')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def stream_events(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        with cond:
+            cursor = len(events)
+            streams[0] += 1
+        try:
+            self.wfile.write(b'retry: 1000\n\n')
+            self.wfile.flush()
+            while True:
+                with cond:
+                    cond.wait_for(lambda: len(events) > cursor, timeout=15)
+                    fresh = events[cursor:]
+                    cursor = len(events)
+                chunk = b''.join(b'data: ' + e.encode() + b'\n\n' for e in fresh)
+                self.wfile.write(chunk or b': keepalive\n\n')
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass
+        finally:
+            with cond:
+                streams[0] -= 1
+
+
+srv = http.server.ThreadingHTTPServer(('0.0.0.0', 0), Handler)
 print(srv.server_address[1], flush=True)
 srv.serve_forever()
 EOF
@@ -132,6 +268,14 @@ if ! [[ "$port" =~ ^[0-9]+$ ]]; then
 fi
 base="http://10.0.2.2:$port"
 echo "Serving diag pages from $base (host pid $server_pid)"
+# Prove the server serves before blaming the app for a blank screen: a page the
+# emulator never received renders as a white error document, which is
+# indistinguishable from an unpainted surface in a screenshot.
+if ! curl -sf -o /dev/null "http://127.0.0.1:$port/dark.html"; then
+  echo "ERROR: page server did not serve dark.html to the host" >&2
+  cat "$server_log" >&2
+  exit 1
+fi
 
 # Per-run unique siteIds: no keyed state (cookies, containers, nav-state)
 # can bleed across runs, and the harness knows the id to activate. A plain
@@ -144,6 +288,18 @@ dark_site_id="ws-$run_tag-dark"
 white_site_id="ws-$run_tag-white"
 notif_site_id="ws-$run_tag-notif"
 blue_site_id="ws-$run_tag-blue"
+b2_site_id="ws-$run_tag-b2"
+b3_site_id="ws-$run_tag-b3"
+
+# Every trigger SurfaceRepaintController.nudge takes, for the control that has to see a
+# blank. Naming only the reload-path ones left `metrics-resume` live, and
+# didChangeMetrics fires throughout a reload: it nudged 17 times and the
+# control measured nothing. A control is only a control if nothing Dart-side
+# can repaint behind it.
+all_repaint_triggers="route-return,metrics-resume,memory-pressure,resume,manual"
+all_repaint_triggers="$all_repaint_triggers,activate,fullscreen-toggle,fullscreen-exit"
+all_repaint_triggers="$all_repaint_triggers,back,tab-overlay-hide,tab-overlay-show,system-bars"
+all_repaint_triggers="$all_repaint_triggers,controller-attach,reload,commit-settled"
 
 site_json() { # $1 = page basename, $2 = siteId, $3 = extra site fields (optional)
   printf '{"name":"Diag","url":"%s/%s","siteId":"%s"%s}' \
@@ -159,9 +315,14 @@ seed_pair_b64() { # $1/$2 = first page + siteId, $3/$4 = second page + siteId
     "$(site_json "$1" "$2")" "$(site_json "$3" "$4")" | base64 | tr -d '\n'
 }
 
-echo "== Building default-entrypoint fdebug APK"
-fvm flutter build apk --debug --flavor fdebug -t lib/main.dart
-apk="build/app/outputs/flutter-apk/app-fdebug-debug.apk"
+# The shipped artifact is AOT-compiled and its webviews are created with
+# `isInspectable: false` (webview.dart gates that on kDebugMode, and it is the
+# only build-mode-dependent WebView setting in the app). A debug build has
+# neither property, so no scenario here has ever driven the webview users get.
+# `profile` flips both and stays debuggable -- Flutter's profile build type is
+echo "== Building default-entrypoint fdebug APK ($build_mode)"
+fvm flutter build apk "--$build_mode" --flavor fdebug -t lib/main.dart
+apk="build/app/outputs/flutter-apk/app-fdebug-$build_mode.apk"
 if [ ! -f "$apk" ]; then
   echo "ERROR: $apk not produced" >&2
   exit 1
@@ -191,13 +352,181 @@ wait_for_pixels() { # $1 = slug, $2 = deadline secs, rest = classifier expectati
       echo "FAIL: $slug did not reach the expected pixels within ${deadline}s" >&2
       echo "  last classification: $out" >&2
       adb exec-out screencap -p > "$artifacts/fail-$slug.png" 2>/dev/null || true
-      adb logcat -d -t 500 > "$artifacts/fail-$slug.logcat.txt" 2>/dev/null || true
+      adb logcat -d > "$artifacts/fail-$slug.logcat.txt" 2>/dev/null || true
       printf '%s\n' "$out" > "$artifacts/fail-$slug.classify.json" || true
+      # A blank frame alone does not say which bug it is: an app that is alive
+      # and unpainted is BUG-001, a dead one or a system dialog over the window
+      # is infrastructure, and the two are indistinguishable in a screenshot
+      # nobody downloads. Say which, in the log, where it is already being read.
+      echo "  app pid: $(adb shell pidof "$pkg" 2>/dev/null | tr -d '\r' || true)" >&2
+      echo "  focus: $(adb shell dumpsys window 2>/dev/null \
+        | grep -m1 -i 'mCurrentFocus' | tr -d '\r' || true)" >&2
+      echo "  page server access log (did the emulator fetch the page?):" >&2
+      tail -15 "$server_log" | sed 's/^/    /' >&2 || true
+      # A white frame is also what Chromium's error page looks like. These say
+      # whether the load failed, with what status and headers, and whether a
+      # proxy override or the router was in its path at that moment.
+      echo "  main-frame load failures:" >&2
+      adb logcat -d -s flutter:V 2>/dev/null | grep -F 'main-frame ' | tail -5 \
+        | sed 's/^/    /' >&2 || true
+      echo "  last SurfaceDiag lines:" >&2
+      adb logcat -d 2>/dev/null | grep -F 'SurfaceDiag' | tail -8 \
+        | sed 's/^/    /' >&2 || true
+      # SurfaceDiag only speaks once a repaint is traced, so an empty list above
+      # says nothing about whether the app got that far. These two do: the Dart
+      # side's own output, and anything that killed or refused the activity.
+      echo "  last app log lines:" >&2
+      adb logcat -d -s flutter:V 2>/dev/null | tail -25 | sed 's/^/    /' >&2 || true
+      echo "  crashes / activity errors:" >&2
+      adb logcat -d 2>/dev/null \
+        | grep -E "AndroidRuntime|FATAL|ANR in|Force finishing|$pkg.*(died|killed)" \
+        | tail -10 | sed 's/^/    /' >&2 || true
       exit 1
     fi
     sleep 1
   done
 }
+
+# `am start -W` blocks until the launch reports complete; a start that never
+# reports would burn the whole emulator step. Cap it and let the pixel check
+# decide -- it produces the screenshot and logcat a bare hang does not.
+capped_start() {
+  timeout 120 adb shell am start -W "$@" \
+    || echo "  (am start -W did not return in 120s; continuing to pixels)"
+}
+
+wait_for_logcat() { # $1 = slug, $2 = deadline secs, $3 = literal pattern
+  local slug="$1" deadline="$2" pattern="$3" start now
+  start=$(date +%s)
+  while :; do
+    if adb logcat -d 2>/dev/null | grep -qF -- "$pattern"; then
+      echo "  $slug: logged '$pattern'"
+      return 0
+    fi
+    now=$(date +%s)
+    if [ $((now - start)) -ge "$deadline" ]; then
+      echo "FAIL: $slug never logged '$pattern' within ${deadline}s" >&2
+      adb logcat -d -t 2000 > "$artifacts/fail-$slug.logcat.txt" 2>/dev/null || true
+      adb exec-out screencap -p > "$artifacts/fail-$slug.png" 2>/dev/null || true
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+# Which composition mode the engine picked for the platform view decides
+# whether this tier can observe BUG-001 at all: if Flutter composites the
+# webview into its own frames, its frame loop redraws it and the gap cannot
+# occur here by construction, which would make every negative result this
+# tier produced a statement about the emulator rather than about the bug.
+# The mode itself is settled in Dart: hybrid composition by default
+# (`useHybridComposition: true`, routed to `initExpensiveAndroidView`), texture
+# layer only with the PAUSE-032 experiment on, which this tier never turns on.
+# So this dump is the runtime witness for it, not the decision. Never fail on
+# it: the layer list is the fact.
+dump_composition_mode() {
+  local out="$artifacts/composition-mode.txt" layers
+  layers="$(adb shell dumpsys SurfaceFlinger --list 2>/dev/null | tr -d '\r' || true)"
+  {
+    echo "# dumpsys SurfaceFlinger --list"
+    printf '%s\n' "$layers"
+    echo
+    echo "# SurfaceFlinger layer records mentioning $pkg, with composition types"
+    adb shell dumpsys SurfaceFlinger 2>/dev/null | tr -d '\r' \
+      | grep -E "$pkg|composition type" | tail -80
+    echo
+    echo "# platform-view chatter in logcat"
+    adb logcat -d 2>/dev/null | tr -d '\r' \
+      | grep -iE 'platformview|hybrid composition|FlutterImageView|virtual display' \
+      | tail -40
+  } > "$out" 2>&1 || true
+  # The host facts that decide whether a green here means anything. Every one
+  # of these differs between this emulator and a phone, and each is a candidate
+  # explanation for why the emulator repaints a surface nothing asked it to.
+  # Recorded, not asserted: the tier must not go red because a runner image
+  # changed, but a bug report that cites a green run should be able to say what
+  # it ran on. See docs/bugs/001-white-screen.md gap #13.
+  # Matched nothing on the first run: the engine's banner is not the phrase this
+  # guessed at, or it never reaches logcat here. Dump the candidate lines rather
+  # than pattern-match a message whose wording is unverified.
+  {
+    echo "  host: renderer lines: $(adb logcat -d 2>/dev/null | tr -d '\r' \
+      | grep -iE 'impeller|vulkan|opengl|angle|swiftshader' | tail -3 \
+      | tr '\n' '|' || true)"
+    echo "  host: isolation engine: $(adb logcat -d 2>/dev/null | tr -d '\r' \
+      | grep -F '[Container' | tail -1 | sed 's/.*\[Container[^]]*\] *//' || true)"
+    echo "  host: system webview: $(adb shell dumpsys webviewupdate 2>/dev/null \
+      | tr -d '\r' | grep -m1 -i 'current webview package (name, version)' || true)"
+    echo "  host: animation scales (window/transition/animator): \
+$(adb shell settings get global window_animation_scale 2>/dev/null | tr -d '\r') \
+$(adb shell settings get global transition_animation_scale 2>/dev/null | tr -d '\r') \
+$(adb shell settings get global animator_duration_scale 2>/dev/null | tr -d '\r')"
+    echo "  host: app build mode: $build_mode"
+    echo "  host: build: $(adb shell getprop ro.build.version.release 2>/dev/null | tr -d '\r') \
+api $(adb shell getprop ro.build.version.sdk 2>/dev/null | tr -d '\r') \
+$(adb shell getprop ro.product.model 2>/dev/null | tr -d '\r')"
+  } | tee "$artifacts/host-summary.txt"
+  # Outside the summary: nine lines of layer names would swamp the six facts
+  # the replay exists to carry, and they are already in $out. An
+  # android.webkit.WebView draws through a functor into whatever surface
+  # contains it and never owns a layer here, in either mode, so these names say
+  # which surfaces the app has, not which one the page renders into.
+  echo "  composition: SurfaceFlinger layers naming $pkg"
+  printf '%s\n' "$layers" | grep -F "$pkg" | head -12 | sed 's/^/    /' \
+    || echo "    (none)"
+  echo "    full dump: $out"
+}
+
+# The pixel assertions below are close to vacuous on this host. Scenario B3-A
+# suppressed all fourteen `SurfaceRepaintController.nudge` triggers *and* the second
+# repaint path in `_probeRendererAndRecover`, and every surface still came back
+# painted -- so this tier would stay green with the repaint machinery deleted.
+# What it can still check, host-independently, is the wiring: that the app
+# ASKED for a repaint on the path just driven. That is the thing that actually
+# keeps recurring (a new entry path reaches a surface without passing a
+# chokepoint), and it is read from the app's own trace rather than from the
+# compositor. the repaint trace is developer-mode gated and the diag seed turns
+# developer mode on, so the lines are there in every seeded run.
+nudge_hits() { # $1 = trigger label
+  adb logcat -d 2>/dev/null | grep -cF "trigger=$1" || true
+}
+
+assert_nudged() { # $1 = slug, $2 = trigger label, $3 = count before the action
+  local slug="$1" trigger="$2" before="$3" deadline
+  # RepaintLogThrottle.burstWindow is 2s; the first line of a burst is emitted
+  # immediately, so this only has to outlast a loaded runner.
+  deadline=$(( $(date +%s) + 20 ))
+  while [ "$(nudge_hits "$trigger")" -le "$before" ]; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: $slug painted, but the app never asked it to" >&2
+      echo "  No new 'trigger=$trigger' line within 20s. The pixels above prove" >&2
+      echo "  nothing on this emulator -- it repaints an unnudged surface on its" >&2
+      echo "  own (B2/B3-A) -- so a path that stopped nudging shows up here and" >&2
+      echo "  nowhere else. See docs/bugs/001-white-screen.md gap #16." >&2
+      echo "  SurfaceDiag tail:" >&2
+      adb logcat -d 2>/dev/null | grep -F 'SurfaceDiag' | tail -15 \
+        | sed 's/^/    /' >&2
+      adb logcat -d -t 2000 > "$artifacts/fail-$slug.logcat.txt" 2>/dev/null || true
+      exit 1
+    fi
+    sleep 1
+  done
+  echo "  $slug: repaint requested (trigger=$trigger)"
+}
+
+# Animations, on, for this tier only. The emulator step runs with
+# `disable-animations: true`, which zeroes all three scales, and BUG-001 lives
+# in activity and route transitions: an unanimated transition has a different
+# surface-transaction ordering than the one a phone performs. Every other tier
+# in this emulator session has already run by now, and cleanup restores what
+# was there. `wait_for_pixels` polls to a deadline, so a frame sampled mid
+# transition costs a retry, not a failure.
+for scale in window_animation_scale transition_animation_scale \
+             animator_duration_scale; do
+  value="$(adb shell settings get global "$scale" 2>/dev/null | tr -d '\r')"
+  eval "saved_$scale=\$value"
+  adb shell settings put global "$scale" 1.0 >/dev/null 2>&1 || true
+done
 
 adb shell input keyevent KEYCODE_WAKEUP
 adb shell input keyevent 82
@@ -210,12 +539,15 @@ adb shell am start -W -n "$component" \
   --es ws_diag_seed "$(seed_b64 dark.html "$dark_site_id")" \
   --es siteId "$dark_site_id"
 wait_for_pixels cold-start-dark 180 --expect-dominant "$dark"
+dump_composition_mode
 
 echo "== Scenario B: warm start repaints the re-attached surface (PAUSE-020)"
 adb shell input keyevent 3
 sleep 5
+resume_nudges_before="$(nudge_hits resume)"
 adb shell am start -W -n "$component"
 wait_for_pixels warm-start-dark 90 --expect-dominant "$dark"
+assert_nudged warm-start-nudged resume "$resume_nudges_before"
 
 echo "== Scenario C: back into a bfcached entry repaints (PAUSE-018)"
 size="$(adb shell wm size | sed -n 's/.*: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | head -1)"
@@ -223,8 +555,10 @@ w="${size% *}"
 h="${size#* }"
 adb shell input tap "$((w / 2))" "$((h / 2))"
 wait_for_pixels forward-nav-magenta 90 --expect-dominant "$magenta"
+back_nudges_before="$(nudge_hits back)"
 adb shell input keyevent 4
 wait_for_pixels back-nav-dark 90 --expect-dominant "$dark"
+assert_nudged back-nav-nudged back "$back_nudges_before"
 
 echo "== Scenario D: activity recreation ends painted"
 adb shell settings put global always_finish_activities 1
@@ -317,17 +651,78 @@ echo "  app pid while backgrounded: ${baseline_pid:-none}"
 # NOTIF-005-A schedules unique periodic work (webspace-notification-refresh)
 # whenever a notification site exists; WorkManager backs it with a
 # JobScheduler job. No job = the scheduling contract itself broke.
-job_ids="$(adb shell dumpsys jobscheduler 2>/dev/null \
-  | grep "$pkg/androidx.work" \
-  | sed -n 's/.*#u[0-9a]*\/\([0-9]\{1,\}\):.*/\1/p' | sort -u)"
-if [ -z "$job_ids" ]; then
-  echo "FAIL: no WorkManager job scheduled for $pkg (NOTIF-005-A)" >&2
-  dump_bg_diagnostics no-workmanager-job
-  exit 1
-fi
-echo "  forcing WorkManager job(s): $(echo "$job_ids" | tr '\n' ' ')"
-for id in $job_ids; do
-  adb shell cmd jobscheduler run -f "$pkg" "$id" || true
+#
+# Polled rather than read once after the fixed sleep above: the enqueue is
+# two hops from the keyevent (lifecycle -> platform channel ->
+# enqueueUniquePeriodicWork), and WorkManager writes its own DB and
+# registers with JobScheduler on a background executor, so how long the job
+# takes to become visible to dumpsys is a property of runner load, not of
+# the contract. Three seconds is usually enough and occasionally is not,
+# which is the coin flip #577 set out to remove. The deadline keeps the
+# assertion honest: a job that never appears still fails the scenario, just
+# 60s later than it used to.
+deadline=$(( $(date +%s) + 60 ))
+while :; do
+  # `|| true` on both stages: grep exits 1 when the app has no androidx.work
+  # entry yet, and under `set -o pipefail` that non-zero would propagate out
+  # of the command substitution and kill the script at the assignment
+  # instead of letting the poll (and the diagnostics below) run.
+  job_lines="$(adb shell dumpsys jobscheduler 2>/dev/null \
+    | grep "$pkg/androidx.work" || true)"
+  job_ids="$(printf '%s\n' "$job_lines" \
+    | sed -n 's/.*#u[0-9a]*\/\([0-9]\{1,\}\):.*/\1/p' | sort -u || true)"
+  [ -n "$job_ids" ] && break
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "FAIL: no WorkManager job scheduled for $pkg within 60s (NOTIF-005-A)" >&2
+    # "no job at all" and "a job dumpsys words differently than the id
+    # pattern expects" both reach here with job_ids empty, and only the raw
+    # lines separate them.
+    if [ -n "$job_lines" ]; then
+      echo "  androidx.work lines present but no id parsed from:" >&2
+      printf '    %s\n' "$job_lines" >&2
+    else
+      echo "  no $pkg/androidx.work line in dumpsys jobscheduler at all" >&2
+    fi
+    dump_bg_diagnostics no-workmanager-job
+    exit 1
+  fi
+  sleep 2
+done
+echo "  WorkManager job(s) scheduled: $(echo "$job_ids" | tr '\n' ' ')"
+
+# The job exists, but it cannot be driven with `cmd jobscheduler run -f`:
+# that only bypasses JobScheduler's constraints, while WorkManager still
+# refuses a periodic WorkSpec whose next run time has not arrived ("executed
+# before schedule") and reschedules instead, so nothing reaches the worker.
+# Which of those two cases the forced job landed in depended on whether the
+# periodic work's first slot had already been spent, i.e. on a race. The
+# debug-build receiver enqueues a one-shot of the same worker, which runs the
+# leg this scenario is about; the schedule itself is asserted above.
+#
+# Both legs log under one tag. Read it filtered and counted rather than
+# sliced by timestamp: `adb logcat -t '<time>'` cannot carry a space through
+# adb's argument joining, and clearing the buffer would cost every later
+# scenario its history.
+bg_log() { adb logcat -d -s WebspaceBgRefresh:I 2>/dev/null | tr -d '\r' || true; }
+bg_log_hits() { bg_log | grep -c "$1" || true; }
+
+triggers_before="$(bg_log_hits 'debug trigger: enqueueing')"
+worker_runs_before="$(bg_log_hits 'NotificationRefreshWorker fired')"
+echo "  triggering a one-shot refresh via the debug receiver"
+adb shell am broadcast -n "$pkg/$ns.NotificationRefreshDebugReceiver" >/dev/null
+
+# `am broadcast` reports the same result whether or not a receiver matched,
+# so confirm delivery instead of spending the 90s notification deadline on a
+# release APK that never declared the receiver.
+deadline=$(( $(date +%s) + 20 ))
+while [ "$(bg_log_hits 'debug trigger: enqueueing')" -le "$triggers_before" ]; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "FAIL: the debug refresh receiver never fired — is the installed APK" \
+         "a debug build (src/debug declares the receiver)?" >&2
+    dump_bg_diagnostics no-debug-receiver
+    exit 1
+  fi
+  sleep 1
 done
 
 deadline=$(( $(date +%s) + 90 ))
@@ -340,20 +735,29 @@ while :; do
   if [ "$(date +%s)" -ge "$deadline" ]; then
     now_beacons="$(beacon_hits)"
     now_pid="$(app_pid)"
-    echo "FAIL: no new notification within 90s of forcing the refresh job" >&2
+    # "the worker never ran" and "the worker ran but Dart never reloaded" are
+    # the same silence from outside, and reading the second for the first is
+    # what made the last failure unreadable. The worker's own log line splits
+    # them.
+    worker_runs_now="$(bg_log_hits 'NotificationRefreshWorker fired')"
+    echo "FAIL: no new notification within 90s of the refresh trigger" >&2
     echo "  notification identities unchanged (page loads: $baseline_beacons -> $now_beacons)" >&2
     if [ "$now_beacons" -gt "$baseline_beacons" ]; then
       echo "  the site DID reload in the background — the break is downstream," \
            "in the polyfill -> NotificationService -> flutter_local_notifications leg" >&2
     elif [ -z "$now_pid" ] || [ "$now_pid" != "$baseline_pid" ]; then
-      echo "  the app process is GONE (pid ${baseline_pid:-none} -> ${now_pid:-none}) —" \
-           "the OS reclaimed it while backgrounded, so the worker had no engine to" \
-           "dispatch to. NOTIF-005-A accepts that; this is emulator memory pressure," \
-           "not the dispatch leg." >&2
+      echo "  the app process is GONE (pid ${baseline_pid:-none} -> ${now_pid:-none}):" \
+           "the OS reclaimed it while backgrounded, so the worker had to start an" \
+           "engine of its own (NOTIF-016); Scenario P2 covers that leg directly." >&2
+    elif [ "$worker_runs_now" -le "$worker_runs_before" ]; then
+      echo "  the worker never ran — the break is in the trigger, before" \
+           "NotificationRefreshWorker.doWork (WorkManager never dispatched it)" >&2
     else
       echo "  the site did NOT reload — the break is upstream," \
            "in the worker -> engine dispatch -> onBackgroundRefresh leg" >&2
     fi
+    echo "  WebspaceBgRefresh logcat:" >&2
+    bg_log | tail -20 | sed 's/^/    /' >&2
     dump_bg_diagnostics notif-refresh
     exit 1
   fi
@@ -365,6 +769,43 @@ done
 adb shell am start -W -n "$component"
 wait_for_pixels notif-foreground-dark 90 --expect-dominant "$dark"
 
+echo "== Scenario F2: a refresh tick in the foreground must not touch the visible site"
+# Android's WorkManager tick (NOTIF-005-A) fires whenever the Flutter engine
+# is reachable, the foreground included, and the handler took no active-site
+# exclusion until f02d4af: it was written when only iOS's BGAppRefreshTask
+# reached it, where the app is suspended by definition. So the page the user
+# was reading was reloaded on the worker's schedule, with no user action behind
+# it. Scenario F fires this same receiver while the app is BACKGROUNDED, the
+# leg that was always correct, so nothing drove the leg that broke.
+fg_beacons_before="$(beacon_hits)"
+fg_triggers_before="$(bg_log_hits 'debug trigger: enqueueing')"
+adb shell am broadcast -n "$pkg/$ns.NotificationRefreshDebugReceiver" >/dev/null
+deadline=$(( $(date +%s) + 20 ))
+while [ "$(bg_log_hits 'debug trigger: enqueueing')" -le "$fg_triggers_before" ]; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "FAIL: the debug refresh receiver never fired with the app foregrounded" >&2
+    dump_bg_diagnostics no-debug-receiver-foreground
+    exit 1
+  fi
+  sleep 1
+done
+# The worker dispatches asynchronously; a reload would beacon well inside this.
+sleep 20
+fg_beacons_after="$(beacon_hits)"
+if [ "$fg_beacons_after" -gt "$fg_beacons_before" ]; then
+  echo "FAIL: the refresh tick reloaded the site the user is looking at"        "(page loads $fg_beacons_before -> $fg_beacons_after)" >&2
+  echo "  This is the v0.3.1 behaviour: _refreshNotificationSites must skip"        "the active site (ForegroundPollEngine) when the app is resumed." >&2
+  echo "  WebspaceBgRefresh logcat:" >&2
+  bg_log | tail -10 | sed 's/^/    /' >&2
+  dump_bg_diagnostics foreground-refresh-reloaded-active
+  exit 1
+fi
+echo "  visible site not reloaded (page loads unchanged at $fg_beacons_after)"
+# Even with the reload correctly skipped, the surface must still be painted:
+# a green above with a blank screen here would mean the tick blanked it by
+# some other route.
+wait_for_pixels notif-foreground-tick-stays-painted 30 --expect-dominant "$dark"
+
 # ---- Warm home-shortcut taps (HS-002 / HS-006 / INTEG-013) ----
 #
 # A tap on a pinned tile while the app is running is delivered as
@@ -374,6 +815,243 @@ wait_for_pixels notif-foreground-dark 90 --expect-dominant "$dark"
 # the in-process suite (integration_test/shortcut_behavior_test.dart)
 # cannot cover these two.
 
+echo "== Scenario P: a message the server holds reaches the user from the background (NOTIF-011..014)"
+# What users mean by "notifications work": a site they are not looking at,
+# while WebSpace is not on screen, gets a message and the phone shows it. The
+# notification site sits behind a plain active site, which is the arrangement
+# NOTIF-011 is about (the JS pause is process-global). The app then stays in
+# the background past the cached-app freezer's debounce, and the server
+# records a message no open stream carries: what a frozen page, or one whose
+# connection was dropped, never hears. With no foreground service (NOTIF-005-A)
+# the background wake is what has to reach the user, so this drives it and
+# requires its post; the page never posts on load, so a reload alone passes
+# nothing.
+push_site_id="ws-$run_tag-push"
+push_loads() { grep -c 'GET /push-load' "$server_log" || true; }
+sse_connects() { grep -c 'GET /events' "$server_log" || true; }
+push_event() { curl -sf "http://127.0.0.1:$port/push?m=$1" || echo 0; }
+record_message() { curl -sf "http://127.0.0.1:$port/record?m=$1" || echo 0; }
+wake_posts() { adb logcat -d 2>/dev/null | grep -cE 'background wake done: .*unread fallback posts=1' || true; }
+background_secs="${WS_PUSH_BACKGROUND_SECS:-75}"
+
+adb shell am force-stop "$pkg"
+connects_before="$(sse_connects)"
+push_seed="$(printf '{"sites":[%s,%s]}' \
+  "$(site_json dark.html "$dark_site_id")" \
+  "$(site_json push.html "$push_site_id" ',"notificationsEnabled":true')" \
+  | base64 | tr -d '\n')"
+capped_start -n "$component" --es ws_diag_seed "$push_seed" --es siteId "$dark_site_id"
+wait_for_pixels push-plain-site-on-screen 180 --expect-dominant "$dark"
+
+deadline=$(( $(date +%s) + 90 ))
+while [ "$(sse_connects)" -le "$connects_before" ]; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "FAIL: the notification site never opened its event stream (was it auto-loaded?)" >&2
+    tail -15 "$server_log" | sed 's/^/    /' >&2 || true
+    dump_bg_diagnostics push-no-stream
+    exit 1
+  fi
+  sleep 2
+done
+echo "  event stream open (page loads so far: $(push_loads))"
+
+wait_for_new_notification() { # $1 = slug, $2 = deadline secs, $3 = baseline keys
+  local deadline fresh
+  deadline=$(( $(date +%s) + $2 ))
+  while :; do
+    fresh="$(comm -13 <(printf '%s\n' "$3") <(notif_keys))"
+    if [ -n "$fresh" ]; then
+      echo "  $1: posted $(printf '%s\n' "$fresh" | head -1)"
+      return 0
+    fi
+    [ "$(date +%s)" -ge "$deadline" ] && return 1
+    sleep 2
+  done
+}
+
+# Foreground, site offscreen: the live path, before any lifecycle step. It
+# also raises the page's title to "(1) Push", which is what the app records as
+# the user's baseline when it leaves the screen.
+keys="$(notif_keys)"
+open_streams="$(push_event "fg-$run_tag")"
+if ! wait_for_new_notification push-foreground 30 "$keys"; then
+  echo "FAIL: a message to the offscreen notification site posted nothing while the app was visible" >&2
+  echo "  open event streams when sent: $open_streams" >&2
+  dump_bg_diagnostics push-foreground
+  exit 1
+fi
+sleep 2
+
+# Leaving the screen is not memory pressure (PAUSE-034). Android reports
+# TRIM_MEMORY_UI_HIDDEN on every exit and Flutter forwards it as
+# didHaveMemoryPressure, which used to clear the offscreen site's cache on one
+# exit and dispose it on the next. One round trip before the long background
+# makes this run two exits, so that cascade would unload the notification site.
+pressure_ignored() { adb logcat -d 2>/dev/null | grep -cF 'memory pressure while' || true; }
+pressure_unloads() { adb logcat -d 2>/dev/null | grep -cF 'unloaded (memory pressure)' || true; }
+ignored_before="$(pressure_ignored)"
+unloads_before="$(pressure_unloads)"
+adb shell input keyevent 3
+sleep 3
+capped_start -n "$component"
+wait_for_pixels push-round-trip-dark 90 --expect-dominant "$dark"
+sleep 2
+
+adb shell input keyevent 3
+pid_before="$(app_pid)"
+echo "  backgrounded for ${background_secs}s (freezer debounce:" \
+  "$(adb shell device_config get activity_manager_native_boot freeze_debounce_timeout 2>/dev/null | tr -d '\r' || true))"
+sleep "$background_secs"
+adb logcat -d 2>/dev/null | grep -F "App background:" | tail -1 | sed 's/^/  /' || true
+if [ "$(pressure_unloads)" -gt "$unloads_before" ]; then
+  echo "FAIL: leaving the screen unloaded a site as memory pressure (PAUSE-034)" >&2
+  adb logcat -d 2>/dev/null | grep -E 'memory pressure|App background:' | tail -8 \
+    | sed 's/^/    /' >&2 || true
+  dump_bg_diagnostics push-background-pressure
+  exit 1
+fi
+if [ "$(pressure_ignored)" -le "$ignored_before" ]; then
+  echo "FAIL: two exits from the screen reported no memory pressure; the check" \
+       "above proved nothing. If Flutter stopped forwarding UI_HIDDEN, revisit" \
+       "PAUSE-034 rather than deleting this" >&2
+  dump_bg_diagnostics push-no-background-pressure
+  exit 1
+fi
+echo "  two exits from the screen: $(( $(pressure_ignored) - ignored_before )) memory-pressure" \
+  "report(s), nothing unloaded"
+
+unread_now="$(record_message "bg-$run_tag")"
+echo "  server recorded a message nothing carried (unread now: $unread_now)"
+keys="$(notif_keys)"
+loads_before="$(push_loads)"
+wake_posts_before="$(wake_posts)"
+triggers_before="$(bg_log_hits 'debug trigger: enqueueing')"
+adb shell am broadcast -n "$pkg/$ns.NotificationRefreshDebugReceiver" >/dev/null
+deadline=$(( $(date +%s) + 20 ))
+while [ "$(bg_log_hits 'debug trigger: enqueueing')" -le "$triggers_before" ]; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "FAIL: the debug refresh receiver never fired for the backgrounded app" >&2
+    dump_bg_diagnostics push-no-debug-receiver
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! wait_for_new_notification push-wake 90 "$keys"; then
+  now_pid="$(app_pid)"
+  echo "FAIL: the background wake did not tell the user about the recorded message within 90s" >&2
+  echo "  page loads: $loads_before -> $(push_loads)" >&2
+  if [ -z "$now_pid" ] || [ "$now_pid" != "$pid_before" ]; then
+    echo "  the app process is gone (pid ${pid_before:-none} -> ${now_pid:-none});" \
+         "the worker's own engine had to check the site (NOTIF-016, Scenario P2)" >&2
+  elif [ "$(push_loads)" -le "$loads_before" ]; then
+    echo "  the wake never reloaded the page (worker -> engine -> onBackgroundRefresh)" >&2
+  else
+    echo "  the page reloaded but nothing was posted: the wake returned before" \
+         "the load settled (NOTIF-013) or skipped the unread fallback (NOTIF-014)" >&2
+  fi
+  adb logcat -d 2>/dev/null | grep -E "App background:|background wake done|refresh —" \
+    | tail -10 | sed 's/^/    /' >&2 || true
+  bg_log | tail -10 | sed 's/^/    /' >&2
+  dump_bg_diagnostics push-wake
+  exit 1
+fi
+loads_after="$(push_loads)"
+if [ "$loads_after" -le "$loads_before" ]; then
+  echo "FAIL: a notification appeared but the wake never reloaded the page" \
+       "(page loads $loads_before -> $loads_after); it did not come from the wake" >&2
+  dump_bg_diagnostics push-no-reload
+  exit 1
+fi
+deadline=$(( $(date +%s) + 20 ))
+while [ "$(wake_posts)" -le "$wake_posts_before" ]; do
+  if [ "$(date +%s)" -ge "$deadline" ]; then
+    echo "FAIL: the wake did not log its unread fallback post (NOTIF-014)" >&2
+    adb logcat -d 2>/dev/null | grep -F "background wake done" | tail -3 | sed 's/^/    /' >&2 || true
+    dump_bg_diagnostics push-no-fallback-log
+    exit 1
+  fi
+  sleep 1
+done
+echo "  delivered by the background wake (page loads $loads_before -> $loads_after)"
+
+echo "== Scenario P2: the wake reaches the site after Android reclaimed the process (NOTIF-016)"
+# The arrangement users are actually in most of the time: WebSpace left the
+# screen long enough ago that Android killed its process. The worker used to
+# find no Flutter engine and return, so nothing was checked until the app was
+# opened again. Now it starts an engine of its own, with no activity, whose
+# startup builds no site webview, and the wake checks the notification site
+# headless. Two wakes: the first records the unread baseline (P's process was
+# a seeded demo run, which persists none), the second must post for the
+# message recorded between them, against the baseline the first one's
+# engine persisted and the second one's engine read back (NOTIF-014).
+headless_wakes() { adb logcat -d 2>/dev/null | grep -cE 'background wake done: 0 live, 1 headless, 0 skipped' || true; }
+engine_starts() { bg_log_hits 'starting one for the wake'; }
+
+kill_app_process() {
+  local deadline
+  adb shell am kill "$pkg" >/dev/null 2>&1 || true
+  deadline=$(( $(date +%s) + 15 ))
+  while [ -n "$(app_pid)" ]; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: the backgrounded app process survived am kill" >&2
+      dump_bg_diagnostics push-cold-kill
+      exit 1
+    fi
+    sleep 1
+  done
+}
+
+run_cold_wake() { # $1 = slug; returns once the wake's engine logged its wake
+  local starts_before wakes_before deadline
+  starts_before="$(engine_starts)"
+  wakes_before="$(headless_wakes)"
+  adb shell am broadcast -n "$pkg/$ns.NotificationRefreshDebugReceiver" >/dev/null
+  deadline=$(( $(date +%s) + 150 ))
+  while [ "$(headless_wakes)" -le "$wakes_before" ]; do
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "FAIL: $1: no headless wake within 150s of the trigger" >&2
+      if [ "$(engine_starts)" -le "$starts_before" ]; then
+        echo "  the worker never started an engine of its own" >&2
+      else
+        echo "  the worker's engine started but its wake checked no site headless" >&2
+      fi
+      bg_log | tail -15 | sed 's/^/    /' >&2
+      adb logcat -d 2>/dev/null | grep -E "background wake|wake site" \
+        | tail -10 | sed 's/^/    /' >&2 || true
+      dump_bg_diagnostics "$1"
+      exit 1
+    fi
+    sleep 2
+  done
+  echo "  $1: the worker's engine checked the site headless"
+}
+
+kill_app_process
+record_message "cold1-$run_tag" >/dev/null
+run_cold_wake push-cold-baseline
+
+record_message "cold2-$run_tag" >/dev/null
+keys="$(notif_keys)"
+wake_posts_before="$(wake_posts)"
+kill_app_process
+run_cold_wake push-cold-post
+if ! wait_for_new_notification push-cold 30 "$keys"; then
+  echo "FAIL: the headless wake after a reclaimed process posted nothing for the" \
+       "message recorded since the last wake" >&2
+  adb logcat -d 2>/dev/null | grep -E "background wake|wake site" \
+    | tail -10 | sed 's/^/    /' >&2 || true
+  dump_bg_diagnostics push-cold-post
+  exit 1
+fi
+if [ "$(wake_posts)" -le "$wake_posts_before" ]; then
+  echo "FAIL: a notification appeared but the headless wake did not log its" \
+       "unread fallback post (NOTIF-014)" >&2
+  dump_bg_diagnostics push-cold-no-fallback-log
+  exit 1
+fi
+echo "  delivered by a wake in the worker's own engine"
+
 echo "== Scenario G: warm shortcut tap switches sites (HS-002)"
 adb shell am force-stop "$pkg"
 adb shell am start -W -n "$component" \
@@ -382,8 +1060,10 @@ adb shell am start -W -n "$component" \
   --es siteId "$dark_site_id"
 wait_for_pixels shortcut-cold-dark 180 --expect-dominant "$dark"
 
+activate_nudges_before="$(nudge_hits activate)"
 adb shell am start -W -n "$component" --es siteId "$blue_site_id"
 wait_for_pixels shortcut-warm-switch-blue 90 --expect-dominant "$blue"
+assert_nudged shortcut-warm-switch-nudged activate "$activate_nudges_before"
 
 echo "== Scenario H: warm tap leaves the running session intact (HS-006)"
 # Back to the dark site, drive it off its initUrl (the full-page link),
@@ -398,4 +1078,195 @@ sleep 5
 adb shell am start -W -n "$component" --es siteId "$dark_site_id"
 wait_for_pixels shortcut-warm-preserves-session 90 --expect-dominant "$magenta"
 
+# Scenario B2 asks a question the rest of the suite structurally cannot: does
+# ANYTHING below Dart repaint the surface when the window comes back?
+#
+# Every warm-start repaint the app has keys on a Dart-side signal — the
+# `_onResumed` tail nudge (PAUSE-015) and the `didChangeMetrics` re-nudge
+# (PAUSE-020). BUG-001 gap #5 is that `didChangeMetrics` is a *proxy* for the
+# SurfaceView reattach, not the reattach: Flutter can dedupe identical window
+# metrics and the callback tracks the main FlutterView. On a device where it
+# does not fire, Attempt 8 is a no-op — and Scenario B above cannot tell that
+# device from a healthy one, because on the emulator the proxy always fires.
+#
+# Suppressing the Dart triggers by name simulates that device exactly. Both
+# resume-time paths go, the nudge funnel and the renderer probe (its
+# offsetHeight read forces the layout that schedules the missing paint, so it
+# repaints whether or not the funnel ran). What is left is whatever the native
+# layer does on its own. Modeled as `Fix="proxy"` vs `Fix="attach"` in
+# formal/warmstart.tla.
+#
+# EXPECTED RED against a fork with no native attach/visibility repaint hook.
+# That red IS the reproduction: evidence that the surface depends on a Dart
+# proxy nobody has confirmed fires. It turns green when the fork gains the hook
+# (upstream starship-s 643cf23 + 1a8ed58 add exactly that), at which point this
+# becomes its regression guard.
+#
+# OPT-IN, because a scenario that is red by design would drown the signal from
+# every other scenario in this tier. Set WS_RUN_NATIVE_REPAINT_PROBE=1 to run
+# it — the PR that bumps the fork pin turns it on for good.
+if [ "${WS_RUN_NATIVE_REPAINT_PROBE:-0}" != "1" ]; then
+  echo "== Scenario B2: SKIPPED (set WS_RUN_NATIVE_REPAINT_PROBE=1 to run)"
+else
+  echo "== Scenario B2: warm start with the Dart resume nudges suppressed"
+  echo "   (BUG-001 gap #5: does the native layer repaint on its own?)"
+  # Its own siteId, not the dark site's. This runs last, after Scenario H has
+  # deliberately left the dark site's session navigated to the magenta page:
+  # the seed replaces the site list but not the per-siteId nav state, so
+  # reusing $dark_site_id restored magenta and the scenario failed in setup
+  # without ever testing a repaint. A siteId nothing has touched has no state
+  # to restore. (`pm clear` would also work, but mid-suite it left `am start
+  # -W` blocked past the step budget.)
+  adb shell am force-stop "$pkg"
+  capped_start -n "$component" \
+    --es ws_diag_seed "$(seed_b64 dark.html "$b2_site_id")" \
+    --es ws_diag_suppress_repaint "resume,metrics-resume" \
+    --es siteId "$b2_site_id"
+  wait_for_pixels b2-cold-start-dark 180 --expect-dominant "$dark"
+  adb shell input keyevent 3
+  sleep 5
+  # No seed extra on the return: the suppression is already armed in-process,
+  # and reseeding would restart the app rather than warm-start it.
+  # Clear first so the only drop we can match is this resume's, not the cold
+  # start's. Without this assertion a green B2 is unreadable: "the native layer
+  # repainted" and "the suppression never armed" produce the same dark frame.
+  adb logcat -c 2>/dev/null || true
+  capped_start -n "$component"
+  wait_for_logcat b2-resume-nudge-suppressed 60 "trigger=resume suppressed"
+  # Two independent Dart paths repaint on resume, both under the trigger name
+  # `resume`: the nudge funnel, and the renderer probe, whose offsetHeight read
+  # forces the layout that schedules the missing paint. Asserting only the
+  # first is how this scenario passed while the second quietly did the work.
+  wait_for_logcat b2-resume-probe-suppressed 60 "trigger=resume probe suppressed"
+  wait_for_pixels b2-warm-start-native-repaint 90 --expect-dominant "$dark"
+  # The seed turns developer mode on, so every repaint path that was NOT
+  # suppressed also traced. Print the slice: a dark frame only proves the
+  # native layer repainted if nothing Dart-side did it instead, and the trace
+  # is the only thing that can say which path ran.
+  adb logcat -d 2>/dev/null | grep -F 'SurfaceDiag' \
+    > "$artifacts/b2-surfacediag.txt" || true
+  echo "   SurfaceDiag trace across the warm start:"
+  sed 's/^/     /' "$artifacts/b2-surfacediag.txt" || true
+fi
+
+# Scenario B3 adds refresh to the entry paths this tier drives. Refresh is one
+# of many -- the report says "many things" without naming them -- but it is the
+# one no scenario could reach, because
+# it lives in the overflow menu and adb cannot drive it; `ws_diag_reload` calls
+# the same `reloadAndRepaint` funnel. B2 found the emulator repaints a
+# warm-started surface on its own, and a warm start carries a window visibility
+# change that a reload does not, so a reload is the entry path where nothing
+# below Dart has an obvious reason to repaint.
+#
+# Both arms load `slow.html`, which stalls 5s before its first byte. The first
+# attempt used the instant localhost page and proved nothing: the replacement
+# committed inside a single sampler tick, so the blank window the bug is about
+# never existed to be photographed. A slow commit is the regime the bug was
+# reported in and the one Attempts 9/10/11 all address.
+#
+# The live test runs FIRST so a failing control cannot abort it -- it is the arm
+# that can find a real bug, and it is the user's reported symptom.
+echo "== Scenario B3-B: rapid reloads of a slow page stay painted (PAUSE-027)"
+adb shell am force-stop "$pkg"
+capped_start -n "$component" \
+  --es ws_diag_seed "$(seed_b64 slow.html "$b3_site_id")" \
+  --es siteId "$b3_site_id"
+wait_for_pixels b3b-cold-start-dark 180 --expect-dominant "$dark"
+adb shell input keyevent 3
+sleep 3
+adb logcat -c 2>/dev/null || true
+# Five reloads 120ms apart against a 5s page: each lands while the previous is
+# still in flight, so four commits are aborted before the fifth lands. That is
+# the shape that spent the old one-shot latch on an aborted load and left the
+# surface blank (BUG-001 / PAUSE-027).
+capped_start -n "$component" --es ws_diag_reload "5"
+sleep 20
+wait_for_pixels b3b-rapid-reload-stays-painted 60 --expect-dominant "$dark"
+adb logcat -d 2>/dev/null | grep -F 'SurfaceDiag' \
+  > "$artifacts/b3b-surfacediag.txt" || true
+echo "   SurfaceDiag trace across the rapid reloads:"
+sed 's/^/     /' "$artifacts/b3b-surfacediag.txt" || true
+
+# The blank control, OPT-IN and not run in CI. With all fourteen repaint
+# triggers suppressed and the trace showing nothing else fired, the surface
+# still came back painted after a commit that landed 5s behind the reload
+# (2026-09-04). That is the second path, after B2's warm start, where this
+# emulator repaints the platform view with no Dart help at all -- so the arm
+# cannot go red here and a green from it would mean nothing.
+#
+# It is kept because it is still the right experiment, just not for this
+# device: run it against hardware that actually goes white and it answers
+# BUG-001 gap #11, whether the nudge is what prevents the blank. Nothing in
+# the app is needed beyond a debug build:
+#
+#   WS_RUN_BLANK_CONTROL=1 bash scripts/run_android_lifecycle_tests.sh <serial>
+#
+# See docs/bugs/001-white-screen.md, gap #11.
+if [ "${WS_RUN_BLANK_CONTROL:-0}" != "1" ]; then
+  echo "== Scenario B3-A: SKIPPED (set WS_RUN_BLANK_CONTROL=1 on a device that reproduces)"
+else
+  echo "== Scenario B3-A: a committed reload with its repaint suppressed must blank"
+  adb shell am force-stop "$pkg"
+  capped_start -n "$component" \
+    --es ws_diag_seed "$(seed_b64 slow.html "$b3_site_id")" \
+    --es ws_diag_suppress_repaint "$all_repaint_triggers" \
+    --es siteId "$b3_site_id"
+  wait_for_pixels b3-cold-start-dark 180 --expect-dominant "$dark"
+  # Force GPU composition for this arm. The emulator repainting a surface
+  # nothing asked it to repaint is the whole reason no arrangement of this
+  # tier goes red, and hardware overlays are the part of the composition path
+  # most likely to be doing it: an overlay-composed layer is re-scanned out
+  # every frame from whatever the buffer last held. `1008` is the raw binder
+  # code the "Disable HW overlays" developer option used before SurfaceFlinger
+  # moved to AIDL; shell also lacks ACCESS_SURFACE_FLINGER, so try as root.
+  adb root >/dev/null 2>&1 || true
+  adb wait-for-device
+  adb shell service call SurfaceFlinger 1008 i32 1 >/dev/null 2>&1 || true
+  # The call is silent on failure and the first attempt was accepted and
+  # discarded, so the arm ran with overlays fully on and its red meant nothing.
+  # Verify the precondition instead of assuming it: a layer still reported as
+  # DEVICE is composed by the hardware composer, and the experiment did not
+  # happen. Skip rather than fail -- a red here would claim a result we do not
+  # have, which is the mistake this scenario exists to avoid.
+  device_layers="$(adb shell dumpsys SurfaceFlinger 2>/dev/null \
+    | grep -c 'composition type=DEVICE' | tr -d '[:space:]' || true)"
+  echo "   layers still on hardware overlays: ${device_layers:-unknown}"
+  if [ "${device_layers:-1}" != "0" ]; then
+    echo "   SKIPPED: forcing GPU composition did not take. The 1008 binder code"
+    echo "   does not reach SurfaceFlinger on this API level, so the overlay"
+    echo "   hypothesis is untested, not disproved."
+    adb unroot >/dev/null 2>&1 || true
+    adb wait-for-device
+    exit 0
+  fi
+  adb shell input keyevent 3
+  sleep 3
+  adb logcat -c 2>/dev/null || true
+  capped_start -n "$component" --es ws_diag_reload "1"
+  wait_for_logcat b3-reload-nudge-suppressed 90 "trigger=reload suppressed"
+  # Reload fires 1s after resume, the page commits ~5s later. Sample past that:
+  # the question is whether the committed document reached the surface without
+  # the Dart nudge, not whether a loading page is briefly blank.
+  sleep 15
+  wait_for_pixels b3-blank-after-suppressed-reload 25 --expect-blank
+fi
+
 echo "White-screen lifecycle + shortcut tier passed."
+# Last, on purpose. The original sits ~370 lines up in a passing run, past the
+# tail a reader (or a log-fetch API) gets; printed second-to-last it still fell
+# outside a 148-line tail. A green is only worth anything alongside what it was
+# green on, so this is the final thing the tier says.
+echo "== What this run was green on"
+sed 's/^/  /' "$artifacts/host-summary.txt" 2>/dev/null || true
+# Also on the run's summary page. The job log is not a reliable place to read
+# one line from: the runner appends 135-240 lines of post-job cleanup after the
+# last thing this script prints, and how many depends on whether the caches
+# happened to save, so no fixed tail reaches it.
+if [ -n "${GITHUB_STEP_SUMMARY:-}" ] && [ -s "$artifacts/host-summary.txt" ]; then
+  {
+    echo "### White-screen tier: what this run was green on"
+    echo '```'
+    cat "$artifacts/host-summary.txt"
+    echo '```'
+  } >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+fi

@@ -1,23 +1,33 @@
-// Camera + microphone shims in one realm (MIC-012).
+// Camera + microphone + screen-sharing shims in one realm (MIC-012,
+// SHARE-012).
 //
 // A combined audio+video getUserMedia is served by BOTH shims and comes back
 // as one stream carrying a track from each. The camera's deactivation stop
 // (CAM-012) ends the device tracks it handed out and skips substituted ones —
 // so it has to recognise a track the *other* shim substituted, or switching
 // sites would kill the simulated microphone. The shims share one
-// `globalThis.__wsSyntheticTracks` set for exactly this.
+// shared capture registry for exactly this.
 //
 // Both injection orders are exercised: the outer shim is the one that sees
 // the other's track, and which one that is depends only on the order
 // webview.dart happens to add the user scripts.
+//
+// The screen-sharing shim joins the same realm and patches the same
+// `MediaStreamTrack.prototype` accessors, so three wrappers end up chained.
+// Each must answer only for the tracks it created: a chain that leaks one
+// shim's answer onto another's track would give a shared surface a camera's
+// `facingMode`, or a camera a `displaySurface` — the exact tell the
+// presentation requirements exist to avoid.
 
 const test = require('node:test');
 const { afterEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { makeDom, runInDom, readFixture } = require('./helpers/load_shim');
+const CAPTURE = require('./helpers/capture_shims');
+const { makeDom, runInDom } = require('./helpers/load_shim');
 
-const CAMERA = readFixture('camera_stream/shim.js');
-const MICROPHONE = readFixture('microphone_stream/shim.js');
+const CAMERA = CAPTURE.CAMERA;
+const MICROPHONE = CAPTURE.MICROPHONE;
+const SCREEN_SHARE = CAPTURE.SCREEN_SHARE;
 
 const IMAGE_SOURCE = { kind: 'image', dataUrl: 'data:image/png;base64,AAAA' };
 const AUDIO_SOURCE = { dataUrl: 'data:audio/wav;base64,QUJD' };
@@ -31,7 +41,11 @@ afterEach(() => {
 
 // A realm with both capture surfaces stubbed. `order` decides which shim is
 // injected last, i.e. which one ends up wrapping the other.
-function setupBothShims({ cameraMode = 'virtual', order = 'camera-first' } = {}) {
+function setupBothShims({
+  cameraMode = 'virtual',
+  order = 'camera-first',
+  withScreenShare = false,
+} = {}) {
   const dom = makeDom();
   const window = dom.window;
   const calls = { realGum: 0 };
@@ -121,6 +135,8 @@ function setupBothShims({ cameraMode = 'virtual', order = 'camera-first' } = {})
         case 'webMicrophoneMode': return Promise.resolve('virtual');
         case 'webMicrophoneRequest':
           return Promise.resolve({ mode: 'virtual', source: AUDIO_SOURCE });
+        case 'webScreenShareRequest':
+          return Promise.resolve({ mode: 'virtual', source: IMAGE_SOURCE });
         default: return Promise.resolve(null);
       }
     },
@@ -129,6 +145,8 @@ function setupBothShims({ cameraMode = 'virtual', order = 'camera-first' } = {})
   const scripts = order === 'camera-first'
     ? [CAMERA, MICROPHONE]
     : [MICROPHONE, CAMERA];
+  // Injected last in production, so it wraps the other two.
+  if (withScreenShare) scripts.push(SCREEN_SHARE);
   for (const s of scripts) runInDom(dom, s);
   _openDoms.push(dom);
   return { dom, window, calls };
@@ -179,11 +197,51 @@ for (const order of ['camera-first', 'microphone-first']) {
       audio: true,
       video: true,
     });
-    // The set is what makes the exemption readable across shims; assert the
-    // membership directly so a regression names the cause, not the symptom.
+    // Both halves were substituted, so the shared registry must hold neither
+    // as device-backed: the stop finds nothing and both tracks stay live.
+    assert.equal(window.__wsStopRealCapture(), 0);
     for (const t of stream.getTracks()) {
-      assert.equal(window.__wsSyntheticTracks.has(t), true,
-        `the ${t.kind} track must be registered as substituted`);
+      assert.equal(t.readyState, 'live',
+        `the ${t.kind} track was substituted and must survive the stop`);
     }
+  });
+}
+
+for (const order of ['camera-first', 'microphone-first']) {
+  test(`[${order}] a shared surface survives the capture stop`, async () => {
+    const { window } = setupBothShims({ order, withScreenShare: true });
+    const stream = await window.navigator.mediaDevices.getDisplayMedia({
+      video: true,
+    });
+    const track = stream.getVideoTracks()[0];
+    assert.equal(window.__wsStopRealCapture(), 0);
+    assert.equal(track.readyState, 'live',
+      'the simulated surface is a local file; a site switch must not end it');
+  });
+
+  test(`[${order}] each shim answers only for its own tracks`, async () => {
+    // Three getSettings wrappers are chained on one prototype. If any of them
+    // answered for a track it did not create, a shared surface would report a
+    // camera's facingMode (or vice versa) and the substitution would be
+    // readable by shape.
+    const { window } = setupBothShims({ order, withScreenShare: true });
+    const camera = (await window.navigator.mediaDevices.getUserMedia({
+      video: true,
+    })).getVideoTracks()[0];
+    const surface = (await window.navigator.mediaDevices.getDisplayMedia({
+      video: true,
+    })).getVideoTracks()[0];
+
+    const cam = camera.getSettings();
+    assert.equal(cam.facingMode, 'environment');
+    assert.equal(cam.displaySurface, undefined,
+      'a camera must not report a display surface');
+    assert.equal(camera.label, 'Integrated Camera');
+
+    const scr = surface.getSettings();
+    assert.equal(scr.displaySurface, 'monitor');
+    assert.equal(scr.facingMode, undefined,
+      'a shared screen has no facing mode');
+    assert.equal(surface.label, 'Screen');
   });
 }

@@ -15,10 +15,7 @@ import 'dart:math';
 /// sites that have explicitly opted it in via
 /// [WebViewModel.enabledGlobalScriptIds]. Global scripts have no master
 /// switch; per-site opt-in is the only enable control.
-enum UserScriptInjectionTime {
-  atDocumentStart,
-  atDocumentEnd,
-}
+enum UserScriptInjectionTime { atDocumentStart, atDocumentEnd }
 
 /// Trusted CDN domains for user script external dependencies.
 /// URLs matching these domains are fetched without user confirmation.
@@ -44,101 +41,6 @@ const Set<String> scriptFetchWhitelist = {
   'ga.jspm.io',
 };
 
-/// Result of validating a URL for script fetching.
-enum ScriptFetchUrlStatus {
-  /// URL is on the trusted whitelist — fetch without confirmation.
-  whitelisted,
-  /// URL is valid http/https but not whitelisted — requires user confirmation.
-  requiresConfirmation,
-  /// URL scheme is blocked (javascript:, data:, blob:, file://) or invalid.
-  blocked,
-}
-
-/// Validate a URL for script fetching and classify it.
-///
-/// Returns [ScriptFetchUrlStatus.whitelisted] for trusted CDN domains,
-/// [ScriptFetchUrlStatus.requiresConfirmation] for other http/https URLs,
-/// and [ScriptFetchUrlStatus.blocked] for dangerous or invalid URLs.
-ScriptFetchUrlStatus classifyScriptFetchUrl(String url) {
-  final Uri uri;
-  try {
-    uri = Uri.parse(url);
-  } catch (_) {
-    return ScriptFetchUrlStatus.blocked;
-  }
-
-  final scheme = uri.scheme.toLowerCase();
-
-  // Only allow http and https
-  if (scheme != 'http' && scheme != 'https') {
-    return ScriptFetchUrlStatus.blocked;
-  }
-
-  final host = uri.host.toLowerCase();
-  if (host.isEmpty) return ScriptFetchUrlStatus.blocked;
-
-  // SSRF guard: window.__wsFetch is a page-reachable global, so any script
-  // on a user-script-enabled site (including third-party page scripts) can
-  // drive this fetch. Block loopback / private / link-local literal hosts so
-  // it can't reach localhost services, the LAN, or cloud metadata
-  // (169.254.169.254). Hostnames that resolve to those ranges are not caught
-  // here (DNS rebinding); this blocks the direct IP-literal vector.
-  if (_isPrivateOrLoopbackHost(host)) {
-    return ScriptFetchUrlStatus.blocked;
-  }
-
-  // Check whitelist: exact match or subdomain match
-  for (final domain in scriptFetchWhitelist) {
-    if (host == domain || host.endsWith('.$domain')) {
-      return ScriptFetchUrlStatus.whitelisted;
-    }
-  }
-
-  return ScriptFetchUrlStatus.requiresConfirmation;
-}
-
-/// True if [host] is a loopback, private (RFC1918), unique-local, or
-/// link-local literal address (IPv4 or IPv6), or the `localhost` name.
-/// Used to fail-closed SSRF-style fetches from the page-reachable bridge.
-bool _isPrivateOrLoopbackHost(String host) {
-  if (host == 'localhost' || host.endsWith('.localhost')) return true;
-
-  // IPv6 literal (Uri.host strips the surrounding brackets).
-  if (host.contains(':')) {
-    final h = host.split('%').first; // drop any zone id
-    if (h == '::1' || h == '::') return true;
-    // fc00::/7 unique-local, fe80::/10 link-local.
-    if (h.startsWith('fc') || h.startsWith('fd')) return true;
-    if (h.startsWith('fe8') ||
-        h.startsWith('fe9') ||
-        h.startsWith('fea') ||
-        h.startsWith('feb')) {
-      return true;
-    }
-    return false;
-  }
-
-  // IPv4 dotted-quad.
-  final parts = host.split('.');
-  if (parts.length == 4) {
-    final octets = <int>[];
-    for (final p in parts) {
-      final v = int.tryParse(p);
-      if (v == null || v < 0 || v > 255) return false; // not an IPv4 literal
-      octets.add(v);
-    }
-    final a = octets[0], b = octets[1];
-    if (a == 0) return true; // 0.0.0.0/8
-    if (a == 127) return true; // loopback
-    if (a == 10) return true; // private
-    if (a == 172 && b >= 16 && b <= 31) return true; // private
-    if (a == 192 && b == 168) return true; // private
-    if (a == 169 && b == 254) return true; // link-local + cloud metadata
-  }
-  return false;
-}
-
-/// Generate a stable unique identifier for a user script.
 String _generateUserScriptId() {
   final now = DateTime.now().microsecondsSinceEpoch;
   final random = Random().nextInt(999999);
@@ -152,16 +54,31 @@ class UserScriptConfig {
   final String id;
   String name;
   String source;
+
   /// Optional URL to fetch script source from (e.g., CDN-hosted library).
   /// Fetched at the Dart level, bypassing page CSP restrictions.
   String? url;
+
   /// Cached content downloaded from [url].
   String? urlSource;
   UserScriptInjectionTime injectionTime;
+
   /// Master switch. For global scripts this disables the script on all
   /// sites regardless of per-site opt-in; for site scripts this simply
   /// controls whether the script is injected.
   bool enabled;
+
+  /// Whether this script needs the privileged bridge: DOM insertions routed
+  /// past the page's CSP, and `window.__wsFetch` for cross-origin reads the
+  /// same-origin policy denies. Libraries like DarkReader do not work without
+  /// it; an ordinary user script does not need it.
+  ///
+  /// Off by default because the bridge cannot be handed to one script alone.
+  /// It installs page-realm globals and prototype wrappers, so everything else
+  /// running on that page — the site's own code, a third-party ad, an XSS
+  /// payload — reaches it too. That is the cost this flag makes visible: the
+  /// site's CSP and same-origin policy stop applying while it is on.
+  bool bypassSitePolicy;
 
   UserScriptConfig({
     String? id,
@@ -171,6 +88,7 @@ class UserScriptConfig {
     this.urlSource,
     this.injectionTime = UserScriptInjectionTime.atDocumentEnd,
     this.enabled = true,
+    this.bypassSitePolicy = false,
   }) : id = id ?? _generateUserScriptId();
 
   /// The full script to inject: URL source (if any) followed by user source.
@@ -184,27 +102,49 @@ class UserScriptConfig {
     return source;
   }
 
-  Map<String, dynamic> toJson() => {
-        'id': id,
-        'name': name,
-        'source': source,
-        if (url != null) 'url': url,
-        if (urlSource != null) 'urlSource': urlSource,
-        'injectionTime': injectionTime.index,
-        'enabled': enabled,
-      };
+  /// This script with [enabled] forced on, every other field kept. Copied
+  /// through [toJson] so a field added there cannot be dropped here.
+  UserScriptConfig asEnabled() =>
+      UserScriptConfig.fromJson({...toJson(), 'enabled': true});
 
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'name': name,
+    'source': source,
+    if (url != null) 'url': url,
+    if (urlSource != null) 'urlSource': urlSource,
+    'injectionTime': injectionTime.index,
+    'enabled': enabled,
+    'bypassSitePolicy': bypassSitePolicy,
+  };
+
+  /// A field of the wrong type reads as absent, so a script the user wrote
+  /// is not lost to one odd value beside it.
   factory UserScriptConfig.fromJson(Map<String, dynamic> json) {
+    T? field<T>(String key) {
+      final value = json[key];
+      return value is T ? value : null;
+    }
+
+    final url = field<String>('url');
+    final urlSource = field<String>('urlSource');
     return UserScriptConfig(
-      id: json['id'] as String?,
-      name: json['name'] ?? 'Untitled',
-      source: json['source'] ?? '',
-      url: json['url'],
-      urlSource: json['urlSource'],
+      id: field<String>('id'),
+      name: field<String>('name') ?? 'Untitled',
+      source: field<String>('source') ?? '',
+      url: url,
+      urlSource: urlSource,
       injectionTime: json['injectionTime'] == 0
           ? UserScriptInjectionTime.atDocumentStart
           : UserScriptInjectionTime.atDocumentEnd,
-      enabled: json['enabled'] ?? true,
+      enabled: field<bool>('enabled') ?? true,
+      // Migration: the bridge used to be installed for any site with any user
+      // script. A script written before this flag existed and backed by a
+      // fetched library is the case it was built for (US-DR-001), so keep it
+      // working; a plain script keeps the site's CSP instead of silently
+      // having lost it all along.
+      bypassSitePolicy: field<bool>('bypassSitePolicy') ??
+          ((url?.isNotEmpty ?? false) || (urlSource?.isNotEmpty ?? false)),
     );
   }
 }

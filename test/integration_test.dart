@@ -1,7 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/web_view_model.dart';
-import 'package:webspace/services/webview.dart';
 import 'dart:io';
+import 'package:webspace/services/cookie_manager.dart';
 
 void main() {
   group('WebViewModel Integration Tests', () {
@@ -58,7 +58,7 @@ void main() {
       expect(json['initUrl'], 'http://localhost:5000');
 
       // Deserialize and verify
-      final restored = WebViewModel.fromJson(json, null);
+      final restored = WebViewModel.fromJson(json, stateSetterF: null);
       expect(restored.pageTitle, 'Test Page - WebSpace');
       expect(restored.name, 'Test Page - WebSpace');
       expect(restored.initUrl, 'http://localhost:5000');

@@ -2,23 +2,27 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/l10n/gen/app_localizations.dart';
 import 'package:webspace/screens/site_permissions.dart';
-import 'package:webspace/settings/camera.dart';
+import 'package:webspace/settings/capture.dart';
 import 'package:webspace/settings/location.dart';
-import 'package:webspace/settings/microphone.dart';
 import 'package:webspace/settings/site_permission_state.dart';
+import 'package:webspace/widgets/site_permission_chip.dart';
 
 SitePermissionValues _values({
+  bool archived = false,
   CameraAccessMode camera = CameraAccessMode.ask,
   MicrophoneAccessMode microphone = MicrophoneAccessMode.ask,
+  ScreenShareMode screenShare = ScreenShareMode.ask,
   LocationMode location = LocationMode.off,
   bool notifications = false,
   bool? protectedContent,
 }) =>
     SitePermissionValues(
-      cameraMode: camera,
-      virtualCameraSource: null,
-      microphoneMode: microphone,
-      virtualMicrophoneSource: null,
+      archived: archived,
+      captures: CaptureGrants(
+        camera: (mode: camera, source: null),
+        microphone: (mode: microphone, source: null),
+        screenShare: (mode: screenShare, source: null),
+      ),
       notificationsEnabled: notifications,
       backgroundAudioEnabled: false,
       protectedContentAllowed: protectedContent,
@@ -75,23 +79,23 @@ void main() {
     expect(find.text('Blocked'), findsWidgets);
   });
 
-  testWidgets('the microphone sheet shows Allowed as unavailable',
+  testWidgets('the microphone sheet offers a real grant (MIC-002)',
       (tester) async {
-    // The greyed row is the guarantee made visible: WebSpace has no
-    // real-microphone mode at all. Omitting it would hide the reassurance,
-    // which is what the old hint-popup did.
+    // Previously a greyed row explaining that no real-microphone mode
+    // existed. The mode exists now, so the row has to be selectable: an inert
+    // "Allowed" would tell the user the opposite of what the app does.
     await _pump(tester, values: _values());
     await tester.tap(find.text('Microphone access'));
     await tester.pumpAndSettle();
 
     final allowed = tester.widget<RadioListTile<SitePermissionState>>(
       find.ancestor(
-        of: find.text('Allowed').last,
+        of: find.text('Always allow').last,
         matching: find.byType(RadioListTile<SitePermissionState>),
       ),
     );
-    expect(allowed.onChanged, isNull, reason: 'Allowed must be inert');
-    expect(find.textContaining('never opens a real microphone'), findsOneWidget);
+    expect(allowed.onChanged, isNotNull, reason: 'Allowed must be selectable');
+    expect(find.textContaining('never opens a real microphone'), findsNothing);
   });
 
   testWidgets('a capability another setting owns is inert and says why',
@@ -134,7 +138,7 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('Always block'));
     await tester.pumpAndSettle();
-    expect(reported?.cameraMode, CameraAccessMode.block);
+    expect(reported?.captures.camera.mode, CameraAccessMode.block);
   });
 
   testWidgets('timezone sits inside the location sheet, not in the list',
@@ -193,5 +197,37 @@ void main() {
     );
     expect(field.onChanged, isNull,
         reason: 'forced to follow the spoofed geo, so it must be inert');
+  });
+
+  testWidgets('an archived site shows its grants held off and locked',
+      (tester) async {
+    await _pump(
+      tester,
+      values: _values(
+        archived: true,
+        camera: CameraAccessMode.real,
+        microphone: MicrophoneAccessMode.real,
+        screenShare: ScreenShareMode.virtual,
+        notifications: true,
+      ),
+    );
+    final chips = tester
+        .widgetList<SitePermissionChip>(find.byType(SitePermissionChip))
+        .toList();
+    for (final title in const [
+      'Camera access',
+      'Microphone access',
+      'Screen sharing',
+    ]) {
+      final row = find.ancestor(
+          of: find.text(title), matching: find.byType(ListTile));
+      final chip = tester.widget<SitePermissionChip>(find.descendant(
+          of: row, matching: find.byType(SitePermissionChip)));
+      expect(chip.state, SitePermissionState.blocked, reason: title);
+      expect(chip.dimmed, isTrue, reason: title);
+      expect(tester.widget<ListTile>(row).onTap, isNull, reason: title);
+    }
+    expect(chips, isNotEmpty);
+    expect(find.text('Fixed for sites in an archive'), findsWidgets);
   });
 }

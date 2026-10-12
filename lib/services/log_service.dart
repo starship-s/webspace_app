@@ -9,6 +9,106 @@ enum LogLevel { debug, info, warning, error }
 /// in-app dev-tools log view when the runtime toggle is on.
 enum LogSensitivity { normal, sensitive }
 
+/// Every subsystem that writes to the app log. The label is what an entry
+/// shows and what Dev Tools filters by.
+enum LogTag {
+  app('App'),
+  archive('Archive'),
+  backgroundLog('BackgroundLog'),
+  backgroundTask('BackgroundTask'),
+  blockBloom('BlockBloom'),
+  blockStats('BlockStats'),
+  boot('Boot'),
+  camera('Camera'),
+  clearUrls('ClearURLs'),
+  container('Container'),
+  containerCookieManager('ContainerCookieManager'),
+  contentBlocker('ContentBlocker'),
+  cookie('Cookie'),
+  cookieIsolation('CookieIsolation'),
+  cookieManager('CookieManager'),
+  cookieStorage('CookieStorage'),
+  demoData('DemoData'),
+  devTools('DevTools'),
+  developerMode('DeveloperMode'),
+  diagSeed('DiagSeed'),
+  dnsBlock('DnsBlock'),
+  download('Download'),
+  experimental('Experimental'),
+  externalUrl('ExternalUrl'),
+  firefoxUa('FirefoxUA'),
+  htmlCache('HtmlCache'),
+  htmlImport('HtmlImport'),
+  httpAuth('HttpAuth'),
+  httpAuthStore('HttpAuthStore'),
+  icon('Icon'),
+  import('Import'),
+  lifecycle('Lifecycle'),
+  linkIntent('LinkIntent'),
+  localCdn('LocalCDN'),
+  mediaSession('MediaSession'),
+  microphone('Microphone'),
+  nav('Nav'),
+  navigation('Navigation'),
+  net('Net'),
+  notification('Notification'),
+  passkey('Passkey'),
+  popupWindow('PopupWindow'),
+  proxy('Proxy'),
+  proxyPwdStore('ProxyPwdStore'),
+  proxyRelay('ProxyRelay'),
+  resumeReload('ResumeReload'),
+  searchList('SearchList'),
+  settingsBackup('SettingsBackup'),
+  shortcut('Shortcut'),
+  siteIcon('SiteIcon'),
+  siteUnload('SiteUnload'),
+  startup('Startup'),
+  surfaceDiag('SurfaceDiag'),
+  tabs('Tabs'),
+  test('Test'),
+  theme('Theme'),
+  title('Title'),
+  tls('TLS'),
+  tor('Tor'),
+  torGeoIp('TorGeoIP'),
+  /// tor's own output, kept apart from [tor] (the runtime's lifecycle) so a
+  /// reader can tell what the app decided from what tor said.
+  torLog('TorLog'),
+  tz('TZ'),
+  userScript('UserScript'),
+  webIntercept('WebIntercept'),
+  webSearch('WebSearch'),
+  webView('WebView'),
+  webViewLifecycle('WebViewLifecycle'),
+  webViewState('WebViewState'),
+  webspaceSwitch('WebspaceSwitch');
+
+  const LogTag(this.label);
+
+  final String label;
+
+  void debug(String message, {bool sensitive = false}) =>
+      _write(LogLevel.debug, message: message, sensitive: sensitive);
+
+  void info(String message, {bool sensitive = false}) =>
+      _write(LogLevel.info, message: message, sensitive: sensitive);
+
+  void warning(String message, {bool sensitive = false}) =>
+      _write(LogLevel.warning, message: message, sensitive: sensitive);
+
+  void error(String message, {bool sensitive = false}) =>
+      _write(LogLevel.error, message: message, sensitive: sensitive);
+
+  void _write(LogLevel level,
+          {required String message, required bool sensitive}) =>
+      LogService.instance.log(this,
+          message: message,
+          level: level,
+          sensitivity:
+              sensitive ? LogSensitivity.sensitive : LogSensitivity.normal);
+}
+
 class LogEntry {
   final DateTime timestamp;
   final String tag;
@@ -41,14 +141,14 @@ class LogService extends ChangeNotifier {
   }
 
   void log(
-    String tag,
-    String message, {
+    LogTag tag, {
+    required String message,
     LogLevel level = LogLevel.debug,
     LogSensitivity sensitivity = LogSensitivity.normal,
   }) {
     final entry = LogEntry(
       timestamp: DateTime.now(),
-      tag: tag,
+      tag: tag.label,
       message: message,
       level: level,
       sensitivity: sensitivity,
@@ -63,11 +163,50 @@ class LogService extends ChangeNotifier {
       if (_entries.length > maxEntries) {
         _entries.removeAt(0);
       }
-      if (kDebugMode) {
+      // Not release: a shipped build keeps its log ring in memory for Dev
+      // Tools and puts nothing in logcat. Profile is in scope because the
+      // adb tiers read these lines out of logcat, and profile is the build
+      // mode that gets them an AOT, non-inspectable webview.
+      if (!kReleaseMode) {
         debugPrint('[${entry.tag}/${entry.level.name}] ${entry.message}');
       }
     }
     notifyListeners();
+  }
+
+  /// The most recent entries carrying one of [tags], oldest first.
+  ///
+  /// Walks backwards through both rings instead of merging and sorting
+  /// them: this feeds a live view that rebuilds on every new entry, and
+  /// sorting 2000 of them per line is not that. [scan] bounds the walk so a
+  /// quiet tag cannot make the cost the size of the ring.
+  List<LogEntry> recent(Set<LogTag> tags, {int limit = 6, int scan = 400}) {
+    final labels = {for (final t in tags) t.label};
+    final out = <LogEntry>[];
+    var i = _entries.length - 1;
+    var j = _sensitiveEntries.length - 1;
+    var seen = 0;
+    while (out.length < limit && seen < scan && (i >= 0 || j >= 0)) {
+      final a = i >= 0 ? _entries[i] : null;
+      final b = j >= 0 ? _sensitiveEntries[j] : null;
+      final LogEntry next;
+      if (a == null) {
+        next = b!;
+        j--;
+      } else if (b == null) {
+        next = a;
+        i--;
+      } else if (a.timestamp.isAfter(b.timestamp)) {
+        next = a;
+        i--;
+      } else {
+        next = b;
+        j--;
+      }
+      seen++;
+      if (labels.contains(next.tag)) out.add(next);
+    }
+    return out.reversed.toList();
   }
 
   List<LogEntry> get entries => List.unmodifiable(_entries);

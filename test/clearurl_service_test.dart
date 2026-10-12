@@ -157,6 +157,25 @@ void main() {
         );
         expect(result, equals('https://target.com/page'));
       });
+
+      // The capture group is whatever the matched page put in the
+      // redirector's parameter, and the caller navigates to what cleanUrl
+      // returns — on the TOP frame, via `loadUrl`, which on Android takes any
+      // scheme. A `javascript:` target would run in the document doing the
+      // navigating.
+      test('a non-http(s) redirect target is never returned', () {
+        for (final target in const [
+          'javascript%3Aalert(document.cookie)',
+          'data%3Atext%2Fhtml%2C%3Cscript%3Ealert(1)%3C%2Fscript%3E',
+          'file%3A%2F%2F%2Fetc%2Fpasswd',
+          'intent%3A%2F%2Fscan%23Intent%3Bscheme%3Dzxing%3Bend',
+        ]) {
+          final url = 'https://redirect.example.com/go?url=$target';
+          final result = service.cleanUrl(url);
+          expect(result, equals(url),
+              reason: 'the rewrite must fall through, not hand back $target');
+        }
+      });
     });
 
     group('rawRules', () {
@@ -395,6 +414,46 @@ void main() {
         const url = 'https://example.com/safety/go?url=https%3A%2F%2Fevil.com%2F';
         expect(service.cleanUrl(url), equals(url));
       });
+    });
+  });
+
+  group('strippedParamLabel (STATS-008)', () {
+    test('names the removed keys, sorted', () {
+      expect(
+        ClearUrlService.strippedParamLabel(
+          'https://example.com/p?utm_source=x&id=7&fbclid=y',
+          cleaned: 'https://example.com/p?id=7',
+        ),
+        equals('fbclid, utm_source'),
+      );
+    });
+
+    test('is empty when the whole query went away with nothing named', () {
+      expect(
+        ClearUrlService.strippedParamLabel(
+          'https://example.com/p',
+          cleaned: 'https://example.com/p',
+        ),
+        isEmpty,
+      );
+    });
+
+    test('a redirection rule names nothing: no key was stripped', () {
+      expect(
+        ClearUrlService.strippedParamLabel(
+          'https://www.google.com/url?q=https%3A%2F%2Fexample.org%2Fpage',
+          cleaned: 'https://example.org/page',
+        ),
+        isEmpty,
+      );
+    });
+
+    test('a completeProvider block names nothing', () {
+      expect(
+        ClearUrlService.strippedParamLabel('https://tracker.example/p?a=1',
+            cleaned: ''),
+        isEmpty,
+      );
     });
   });
 }

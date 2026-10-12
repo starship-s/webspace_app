@@ -5,9 +5,9 @@
 
 > **Note:** This is the fallback engine, used when
 > [`ContainerNative.isSupported()`](../../../lib/services/container_native.dart)
-> is `false` — i.e. iOS, macOS, and Android System WebView <110. On
-> Android System WebView 110+, the app uses native per-site profiles
-> instead; see
+> is `false` — i.e. Windows, web, iOS <17, macOS <14, WPE WebKit
+> <2.40, and an Android System WebView not reporting `MULTI_PROFILE`.
+> Everywhere else the app uses native per-site profiles instead; see
 > [openspec/specs/per-site-containers/spec.md](../per-site-containers/spec.md).
 > Engine selection is a single cached `bool _useProfiles` in
 > [`_WebSpacePageState`](../../../lib/main.dart) resolved at startup;
@@ -55,7 +55,13 @@ Only ONE webview per second-level domain SHALL be active at a time.
 
 ### Requirement: ISO-002 - Cookie Capture on Unload
 
-The system SHALL capture cookies before unloading a webview due to domain conflict.
+The system SHALL capture cookies before unloading a webview, whatever the
+reason it is unloaded (domain conflict, webspace switch, proxy or Tor
+exit-country mismatch, the loaded-site cap, memory pressure, a home reset).
+Every activation empties the shared jar after saving it for the loaded sites
+only, so a site unloaded without the capture loses what it set since its own
+activation. All unloads go through `SiteUnloadEngine.unload`. Lineage:
+[BUG-026](../../../docs/bugs/026-legacy-unload-drops-session.md).
 
 #### Scenario: Capture cookies before switch
 
@@ -63,6 +69,13 @@ The system SHALL capture cookies before unloading a webview due to domain confli
 **When** Site A is unloaded due to domain conflict
 **Then** Site A's current cookies are captured from CookieManager
 **And** cookies are persisted to secure storage by siteId
+
+#### Scenario: Capture cookies before a webspace switch unload
+
+**Given** Site A was activated, and the user then signed in on it
+**When** the user switches to a webspace without A, which unloads it
+**And** then activates another site
+**Then** A's sign-in cookies are in secure storage under A's siteId
 
 ### Requirement: ISO-003 - Cookie Restoration on Load
 
@@ -83,8 +96,8 @@ a capture → nuke → restore cycle:
    restore every other still-loaded site's cookies (parallel-loaded sites
    share the same native jar).
 
-All async steps SHALL check `_setCurrentIndexVersion` and early-return if a
-newer `_setCurrentIndex` invocation has started, to prevent concurrent
+All async steps SHALL check `SiteRuntime.activationVersion` and early-return if a
+newer `setCurrentIndex` invocation has started, to prevent concurrent
 cookie mutations from interleaving under rapid tab switching.
 
 #### Scenario: Restore cookies on activation
@@ -155,6 +168,17 @@ The system SHALL clear domain cookies from CookieManager between site switches o
 
 Incognito sites SHALL NOT trigger or be affected by domain conflicts.
 
+Every guard in `CookieIsolationEngine` SHALL read
+`WebViewModel.effectiveIncognito`, never the stored `incognito` field.
+`effectiveIncognito` is forced true for archive-tier sites, and the engine
+is the only writer of `CookieSecureStorage` that runs underneath
+`_persistSites`'s `!isArchiveTier` filter — so a raw read put an
+archive site's non-Secure cookies into plaintext SharedPreferences
+(`cookies_fallback`) keyed by its cleartext `siteId`, breaking ARCH-001
+byte-identity the moment an archive was opened. The hazard is called out
+verbatim in `cookie_secure_storage.dart`. The engine stays free of Flutter
+imports; `effectiveIncognito` is a pure getter on the model.
+
 #### Scenario: Incognito site coexists with regular site
 
 **Given** Site A (regular) is active on `github.com`
@@ -162,6 +186,60 @@ Incognito sites SHALL NOT trigger or be affected by domain conflicts.
 **When** Site B is selected
 **Then** Site A remains loaded (no conflict)
 **And** both sites can be active simultaneously
+
+#### Scenario: Archive-tier site is treated as incognito by the engine
+
+**Given** an archive-tier site with `incognito == false`
+**When** `unloadSiteForDomainSwitch`, `restoreCookiesForSite`, or
+`preDeleteCookieCleanup` runs with it in `models`
+**Then** it is skipped as an incognito site at every guard
+**And** `storage.saveCookiesForSite` is never called with a non-empty list
+for its `siteId`
+
+### Requirement: ISO-013 - Base Domain Resolution Never Guesses Low
+
+`getBaseDomain` decides which sites share a cookie container and, through
+`getNormalizedDomain`, which navigations count as same-site. Collapsing two
+unrelated registrants onto one base domain is therefore a container merge
+and a same-site-navigation grant at once, so the resolution SHALL err
+towards *more* isolation, never less.
+
+There SHALL be no vendored public suffix list — a PSL file is a committed
+derivative (CLAUDE.md) and a build-time fetch is out of scope. Instead:
+
+- The multi-part-TLD table SHALL carry the well-known **private** suffixes
+  whose registrant hands subdomains to mutually untrusting third parties:
+  `github.io`, `pages.dev`, `workers.dev`, `vercel.app`, `netlify.app`,
+  `web.app`, `firebaseapp.com`, `appspot.com`, `azurewebsites.net`,
+  `herokuapp.com`, `myshopify.com`, `blogspot.com`, `wordpress.com`.
+- When a host's last two labels look like a ccTLD registry suffix the table
+  does not list (a two-letter TLD under a generic second level such as
+  `co`, `com`, `net`, `org`, `edu`, `gov`, `ac`, `ne`, `or`, `go`), the pair
+  SHALL be treated as if it were a public suffix rather than as the
+  registrable domain. With no label above it that degrades to host equality.
+
+#### Scenario: Two github.io sites are separate sites
+
+**Given** site A is `https://victim.github.io/` and site B is
+`https://attacker.github.io/`
+**Then** `getBaseDomain` returns `victim.github.io` and
+`attacker.github.io` respectively
+**And** the two sites do not conflict, do not share a container, and a
+navigation from A to B is cross-domain (so
+`NavigationDecisionEngine.decideShouldOverrideUrlLoading` reaches the
+gesture check instead of returning `allow`)
+
+#### Scenario: A private suffix still groups its own subdomains
+
+**Given** `https://www.victim.github.io/`
+**Then** `getBaseDomain` returns `victim.github.io`
+
+#### Scenario: An unlisted registry suffix isolates per host
+
+**Given** `https://a.com.ke/` and `https://b.com.ke/`, where `com.ke` is not
+in the table
+**Then** `getBaseDomain` returns `a.com.ke` and `b.com.ke`
+**And** `https://www.a.com.ke/` still returns `a.com.ke`
 
 ### Requirement: ISO-006 - Per-Site Storage
 
@@ -326,7 +404,7 @@ The boundaries:
   any site
 - **On site switch** — inside `_restoreCookiesForSite`, after capturing
   cookies for other loaded sites
-- **On settings import** — `_setCurrentIndex` during import routes through
+- **On settings import** — `setCurrentIndex` during import routes through
   `_restoreCookiesForSite`, which performs the nuke-and-restore cycle; the
   import path MUST NOT issue a subsequent `deleteAllCookies()` or it would
   wipe the session just restored for the imported active site
@@ -351,8 +429,10 @@ The boundaries:
 
 **Given** the user deletes a site
 **When** the delete flow completes
-**Then** `removeOrphanedCookies` runs with the updated active siteId set
-**And** `removeOrphanedCaches` runs with the updated active siteId set
+**Then** `OrphanSweepEngine` runs every store against the updated site set
+  (the non-incognito one for session stores such as cookies and HTML cache,
+  per incognito-mode INC-006)
+**And** the shared cookie jar is not cleared
 **And** any encrypted-storage or HTML-cache entries not referenced by a
   surviving site are removed
 
@@ -375,12 +455,12 @@ stays at the `_WebSpacePageState` call site.
 - [`SiteActivationEngine.findDomainConflict`](../../../lib/services/site_activation_engine.dart) —
   pure `(targetIndex, models, loadedIndices) → int?` deciding which
   loaded site (if any) must unload before activating the target per
-  ISO-001. Same function is called from `_setCurrentIndex` in
+  ISO-001. Same function is called from `setCurrentIndex` in
   `main.dart` AND the integration-test harness, so the rule can't
   diverge between prod and tests.
 - [`SiteLifecycleEngine.computeDeletionPatch`](../../../lib/services/site_lifecycle_engine.dart) —
   pure index-rewrite transform applied during site deletion (ISO-010);
-  shifts `_loadedIndices` and every webspace's `siteIndices` down when
+  shifts `_sites.loaded` and every webspace's `siteIndices` down when
   an earlier index is removed, so references don't drift.
 
 ### Domain Comparison for Cookie Isolation
@@ -471,11 +551,12 @@ activation through the same path and MUST NOT nuke afterwards.
 ### Orphan GC
 
 Per-siteId encrypted storage and HTML cache accumulate entries for deleted
-sites. `CookieSecureStorage.removeOrphanedCookies(activeSiteIds)` and
-`HtmlCacheService.removeOrphanedCaches(activeSiteIds)` sweep entries whose
-siteId is not in the active set. These run:
-- On app startup (in `_restoreAppState`)
-- On site deletion (in `_deleteSite`)
+sites. `OrphanSweepEngine` sweeps every per-site store, including
+`CookieSecureStorage` and `HtmlCacheService`, for entries whose siteId is
+not live. It runs:
+- After the first paint of a launch (`sweepOrphanStorage`), followed by the
+  legacy global jar clear
+- On site deletion (in `SiteEditingController.deleteSite`)
 - On settings import (in backup restore)
 
 The native cookie jar is GC'd by `deleteAllCookies()` at the same boundaries
@@ -532,7 +613,7 @@ IndexedStack(
 
 ### Modified
 - `lib/web_view_model.dart` - siteId, domain functions, captureCookies(), disposeWebView()
-- `lib/main.dart` - Domain conflict detection, async _setCurrentIndex(), _unloadSiteForDomainSwitch()
+- `lib/main.dart` - Domain conflict detection, async setCurrentIndex(), _unloadSite()
 - `lib/services/webview.dart` - deleteAllCookies() method on CookieManager
 - `lib/services/cookie_secure_storage.dart` - loadCookiesForSite(), saveCookiesForSite(), removeOrphanedCookies()
 

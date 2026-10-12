@@ -216,16 +216,16 @@ SharedPreferences and gives each test a deterministic starting state.
 #### Scenario: Persistence is skipped
 
 - **Given** `isDemoMode = true`
-- **When** the app would otherwise save any setting via
-  `_save<X>` methods in `_WebSpacePageState`
-- **Then** the write is short-circuited by the `if (isDemoMode) return;`
-  guard
+- **When** the app would otherwise save any setting, through a `_save<X>`
+  method in `_WebSpacePageState` or an app pref through `AppPref.set`
+- **Then** the write is short-circuited by the `isDemoMode` guard (for app
+  prefs, `test/app_prefs_test.dart`)
 - **And** the test does not pollute SharedPreferences across runs
 
 #### Scenario: Initial state seeded for the test
 
 - **Given** the test pre-seeds
-  `SharedPreferences.setMockInitialValues({kGlobalOutboundProxyKey: jsonEncode({...})})`
+  `SharedPreferences.setMockInitialValues({AppPref.globalOutboundProxy.key: jsonEncode({...})})`
 - **When** `app.main()` runs
 - **Then** `GlobalOutboundProxy.initialize` reads the seeded entry
 - **And** the in-memory `GlobalOutboundProxy.current` reflects the seeded
@@ -453,6 +453,130 @@ either target.
 
 ---
 
+### Requirement: INTEG-015 — Fixture socket errors never fail a test
+
+An integration test that binds a loopback server as a page fixture SHALL
+subscribe through `listenFixture`
+([integration_test/fixture_server.dart](../../../integration_test/fixture_server.dart)),
+or attach an error handler of its own.
+
+An unhandled error on that stream is an uncaught async error, and
+`flutter_test` reports it against whichever test finished last. A socket
+hiccup in the fixture therefore fails an unrelated assertion, under the
+banner "this test failed after it had already completed" — which names
+neither the fixture nor the real cause. The fixture exists so a webview
+has something to load; nothing asserts on its socket.
+
+Gate: [test/js/integration_fixture_errors.test.js](../../../test/js/integration_fixture_errors.test.js).
+
+#### Scenario: A fixture server errors during teardown
+
+**Given** an integration test serving pages from a loopback fixture
+**When** that server's stream emits an error
+**Then** no test fails on account of it
+
+#### Scenario: A new integration test adds a fixture
+
+**Given** a test file that binds an `HttpServer` or `ServerSocket`
+**When** it subscribes without `listenFixture` and without its own
+  `onError`
+**Then** the structural gate fails
+
+---
+
+### Requirement: INTEG-016 — The Linux tier runs deny-by-default outbound
+
+The Linux integration step SHALL run under a deny-by-default egress guard:
+loopback reachable, every other destination recorded and dropped. A run
+SHALL produce a recording of every distinct target the suite tried to
+reach, and in `enforce` mode SHALL fail on any target that
+[`scripts/egress_allowlist.txt`](../../../scripts/egress_allowlist.txt)
+does not cover.
+
+This is the machine half of [LEAK-007](../ip-leakage/spec.md), whose
+enforcement was otherwise the sentence "the code review process SHALL
+fail", and the only place [LEAK-002](../ip-leakage/spec.md)'s single-seam
+claim is checked as a whole rather than one call site at a time. A
+recording proxy cannot do this job: the leak it exists to catch is traffic
+that ignores the proxy configuration, so the gate has to sit below it.
+
+Mechanism, in
+[`scripts/egress_guard_arm.sh`](../../../scripts/egress_guard_arm.sh):
+
+- An nftables `nat`/`output` hook returns on `127.0.0.0/8` and `::1`, and
+  redirects everything else to
+  [`scripts/egress_recorder.py`](../../../scripts/egress_recorder.py),
+  which reads `SO_ORIGINAL_DST` plus the first bytes — a TLS SNI or an
+  HTTP `Host:` names the host even when the request skipped the resolver.
+- `/etc/resolv.conf` points at the same recorder, which answers NXDOMAIN.
+  Names are therefore captured whether or not the nat hook is available.
+- Nothing is forwarded. A blocked request is a fast failure, not a hang:
+  the recorder closes immediately, and the degraded ruleset rejects with
+  `icmpx port-unreachable` rather than `tcp reset`, which in the output
+  hook never reaches the local socket and costs a full connect timeout.
+
+The guard SHALL arm only after every provisioning step, including a debug
+build of the app. From the moment it arms, a toolchain fetch is
+indistinguishable from an app leak, and should be: what the suite needs
+must already be on disk.
+
+Warming is not enough on its own, because some toolchain calls are per
+invocation rather than cacheable. `flutter test` resolves dependencies
+before every run and that resolve asks pub.dev for advisories, so the
+suite runs with `--no-pub` against the dependencies its own earlier step
+resolved. A tool call that cannot be satisfied from disk SHALL be turned
+off rather than allowlisted: an allowlist entry for a toolchain host is a
+hole an app leak can hide in.
+
+The allowlist SHALL be read as a coverage claim, not a mute button. Each
+entry carries a comment naming the code path that makes the request and
+why it may leave; an entry without one is a missing row in LEAK-007's
+matrix. It ships empty, because a hermetic suite contacts nothing.
+
+#### Scenario: The suite contacts a host nobody allowlisted
+
+**Given** the guard armed in `enforce` mode
+**When** any code under test resolves or connects to a destination outside
+  loopback that no allowlist entry covers
+**Then** the step fails
+**And** the report names the host (from the query, the SNI or the `Host:`
+  header) and the address and port it was headed for
+
+#### Scenario: A new outbound path skips the proxy seam
+
+**Given** a Dart-side call added outside `outboundHttp.clientFor(...)`
+**When** an integration scenario exercises it
+**Then** the guard records it, so the choice is to route it through the
+  seam with the right proxy, point it at a loopback fixture, or argue for
+  an allowlist entry — the same three outcomes LEAK-007 requires of review
+
+#### Scenario: Loopback fixtures are untouched
+
+**Given** a scenario serving pages from `integration_test/fixture_server.dart`,
+  or the Dart VM service, or the proxy relay
+**When** the guard is armed
+**Then** none of that traffic is redirected, recorded, or delayed
+
+#### Scenario: The nat hook is unavailable
+
+**Given** a runner where the nat chain cannot be created (no
+  `CAP_NET_ADMIN`, or the container cannot autoload the module)
+**When** the guard arms
+**Then** it degrades to rejecting with counters and says so
+**And** DNS names are still captured, through `/etc/resolv.conf`
+**And** in `enforce` mode any blocked packet fails the step — a run that
+  cannot see where traffic was going MUST NOT pass by reporting that it
+  saw nothing
+
+#### Scenario: The guard is disarmed whatever the suite did
+
+**Given** an integration step that failed, timed out, or was cancelled
+**When** the job continues
+**Then** the ruleset is removed and `/etc/resolv.conf` restored before any
+  later step, so an armed guard never fails an artifact upload
+
+---
+
 ### Requirement: INTEG-010 — Android white-screen pixel scenarios
 
 `integration_test/white_screen_test.dart` SHALL drive the
@@ -491,15 +615,16 @@ actually been — it asserts only that the app renders at all. The
 delay SHALL come from the in-process server holding the response, not
 from a slow network, so the scenario stays deterministic.
 
-The nested-screen scenario SHALL reach the nested route through a
-**script-initiated cross-domain navigation** from a seeded site with
-`blockAutoRedirects` off, and the cross-domain target SHALL be the
+The nested-screen scenario SHALL reach the nested route by submitting a
+**cross-domain address in the seeded site's URL bar** (a script cannot
+open it: every site blocks gesture-less cross-domain navigations,
+NESTED-004), and the cross-domain target SHALL be the
 same in-process server reached under a second loopback address
 (`127.0.0.2` alongside `127.0.0.1`, hence a server bound to
 `anyIPv4`). Two hosts on one server keep the navigation genuinely
 cross-domain — `getBaseDomain` compares IP literals — while keeping a
-network failure impossible, and a scripted navigation keeps the
-scenario off any synthetic touch reaching the platform view.
+network failure impossible, and typed input keeps the scenario off any
+synthetic touch reaching the platform view.
 
 #### Scenario: A late-committing document is repainted promptly
 
@@ -668,17 +793,31 @@ sample (observed as exact per-channel halving of the page colors).
 
 The lifecycle harness SHALL verify the Android background-refresh
 contract (`NOTIF-005-A`,
-[web-push-notifications](../../changes/web-push-notifications/specs/web-push-notifications/spec.md)
+[web-push-notifications](../web-push-notifications/spec.md)
 — still an unarchived change, so its requirements live under `openspec/changes/`)
 end to end from outside the process: a site seeded with
 `notificationsEnabled` whose page posts a JS `Notification` on every
-load, the app backgrounded, and the WorkManager periodic job
-(`webspace-notification-refresh`) forced via
-`adb shell cmd jobscheduler run -f` — the OS notification that
-appears (read via `dumpsys notification`) is proof the full pipeline
-ran with no foreground activity: worker → engine dispatch →
-`onBackgroundRefresh` site reload → `Notification` polyfill →
+load, the app backgrounded, and one `NotificationRefreshWorker` run
+triggered through the debug-build-only `NotificationRefreshDebugReceiver`
+— the OS notification that appears (read via `dumpsys notification`) is
+proof the full pipeline ran with no foreground activity: worker → engine
+dispatch → `onBackgroundRefresh` site reload → `Notification` polyfill →
 `flutter_local_notifications`.
+
+Trigger contract: the periodic job SHALL NOT be driven with
+`adb shell cmd jobscheduler run -f`. Forcing the job bypasses
+JobScheduler's constraints but not WorkManager's own guard, which
+refuses any periodic `WorkSpec` executed before its next run time
+(`WorkerWrapper`: "executed before schedule") and reschedules instead,
+reaching neither the worker nor Dart. Whether a forced run was honoured
+therefore depended on whether the work's first period — due at enqueue
+time while `periodCount == 0` — had already been spent by an unforced
+run, which is a race the harness cannot observe and which read from
+outside as a broken dispatch leg. The receiver enqueues an unconstrained
+one-shot of the same worker, so the leg under test is the real one and
+only the trigger is synthetic; it is declared in the `debug` source set
+alone, so no shippable build carries it. The scheduling half of
+NOTIF-005-A stays asserted separately, from the JobScheduler dump.
 
 Observation contract: "a new notification" SHALL be read as a set
 difference over notification **identities** (the `user|pkg|id|tag|uid`
@@ -722,14 +861,16 @@ tier for the non-background scenarios remains future scope.
   set it produced is the baseline the background assertion diffs
   against
 
-#### Scenario: Forced periodic refresh posts a new notification while backgrounded
+#### Scenario: A background refresh posts a new notification while backgrounded
 
 - **Given** the app is backgrounded (HOME) with the process alive
-- **When** the harness forces the WorkManager job(s)
-- **Then** a notification identity absent from the baseline appears
-  within the polling deadline, and on failure the harness saves the
-  jobscheduler dump, the notification dump, and a logcat tail as
-  artifacts
+- **When** the harness broadcasts to the debug refresh receiver
+- **Then** the receiver's own log line confirms the broadcast was
+  delivered (else the run fails at once naming the installed APK,
+  instead of spending the notification deadline), a notification
+  identity absent from the baseline appears within the polling
+  deadline, and on failure the harness saves the jobscheduler dump,
+  the notification dump, and a logcat tail as artifacts
 
 #### Scenario: A failure names the leg that broke
 
@@ -739,8 +880,13 @@ tier for the non-background scenarios remains future scope.
 - **Then** a risen count reports the break as downstream (the site
   reloaded, the polyfill → `NotificationService` →
   `flutter_local_notifications` leg dropped it) and an unchanged count
-  reports it as upstream (worker → engine dispatch →
-  `onBackgroundRefresh` never reloaded the site)
+  reports it as upstream
+- **And** upstream is split further by the worker's own log line: no
+  `NotificationRefreshWorker fired` names the trigger, before
+  `doWork` ever ran; the line present names the engine-dispatch →
+  `onBackgroundRefresh` leg. The two are the same silence from
+  outside, and reading one for the other is what made an earlier
+  failure unreadable
 
 #### Scenario: The refreshed site still paints on return
 
@@ -764,7 +910,9 @@ the launcher tiles that still reach it. The suite SHALL cover at least
 HS-002/HS-006 (cold launch), HS-004/HS-005 (menu gating, including the
 rebound-site case), HS-001/HS-012 (pin + ledger record), HS-011
 (orphan confirm / reroute / create, and the remembered rebind), and
-HS-013 (delete-time Keep/Reassign/Disable prompt).
+HS-013 (delete-time Keep/Reassign/Disable prompt), and HS-015 (a
+refused pin is reported; a pin that re-enabled a disabled tile is
+reported and hides the item).
 
 The platform channel SHALL be mocked, because a launcher pin dialog and
 a real pinned set are not reachable from in-process; the mock SHALL
@@ -791,13 +939,14 @@ which an in-process test cannot produce. Those two scenarios live in
 lifecycle scenarios, which already own the emulator, the page server,
 and the frame classifier.
 
-#### Scenario: Cold launch opens the pinned site at its home URL
+#### Scenario: Cold launch opens the pinned site where it was left
 
 - **Given** a seeded site whose persisted `currentUrl` drifted away
   from its `initUrl`, and a pending launch carrying its `siteId`
 - **When** the app cold-starts
 - **Then** that site is the activated one, no other site is mounted,
-  and its `currentUrl` is back at `initUrl` (HS-006)
+  and its `currentUrl` is where it was left, with tabs on or off; with
+  Always open Home on it is back at `initUrl` (HS-006)
 - **And** the startup reconcile has recorded the pinned site's url in
   `shortcutUrlLedger` (HS-012)
 
@@ -810,6 +959,15 @@ and the frame classifier.
   site and present for the unpinned one (HS-005), and tapping it
   reaches `pinShortcut` on the channel with that site's id and label
   and records its url in the ledger (HS-001 / HS-012)
+
+#### Scenario: Pin outcomes other than a dialog are reported
+
+- **Given** the native pin first throws, then reports the site's
+  disabled tile re-enabled
+- **When** "Home Shortcut" is tapped each time
+- **Then** the first tap shows that the shortcut could not be added,
+  the second that the existing shortcut was re-enabled, and the menu
+  item is hidden afterwards without a resume (HS-015)
 
 #### Scenario: An orphaned tile's prompt outcome is what gets persisted
 
@@ -922,6 +1080,31 @@ macOS runner exercises the failure assertions for real.
 - **Then** exactly one live reload is issued — not a loop — and the live
   bytes replace the snapshot in the DOM
 
+#### Scenario: The network comes back after the snapshot settles
+
+- **Given** the same construction with `ConnectivityService` reporting
+  offline when the cached parse settles
+- **When** it reports online a moment later
+- **Then** exactly one live reload is issued (PAUSE-033): a snapshot
+  painted on return from the background is not stranded because the first
+  probe raced the firewall letting the app back out
+- **And** where the engine reports the snapshot's own commit to
+  `shouldOverrideUrlLoading` (WKWebView, WPE) the swap is never issued at
+  all, so this scenario and the online one above log `SKIP` naming that
+  rather than fail; they assert on an engine that does not (Android)
+
+#### Scenario: A saved snapshot lays out as the live page did
+
+- **Given** a live page with a doctype, a path-relative stylesheet and a
+  percentage height that only resolves in quirks mode
+- **When** the page settles and the factory saves its snapshot, and the
+  snapshot is then rendered as `initialHtml` at a different URL
+- **Then** the saved bytes start with the doctype and carry a `<base>` at
+  the page's URL, and the rendered snapshot is in standards mode with the
+  stylesheet applied (PAUSE-033). Strict on every engine: the snapshot is
+  the app's own script evaluated through the plugin, which the Chromium
+  tier cannot reach
+
 #### Scenario: A slow response is never reported as a failure
 
 - **Given** a route that sits on the request for several seconds
@@ -987,6 +1170,23 @@ macOS runner exercises the failure assertions for real.
   reproduce a device-specific SurfaceFlinger race (Mali/Adreno). A
   green run means "no blank window on this compositor", not "BUG-001
   cannot happen"; a red run is a real, labeled reproduction.
+- **The egress guard covers the Linux tier only**: `build-android`'s
+  emulator scenarios and `build-apple`'s macOS loop run with an open
+  network. The mechanism does not port directly: the Android host runner
+  needs egress for Gradle mid-suite, so that tier wants Android's own
+  per-UID filter inside the emulator rather than a rule on the host, and
+  macOS would mean `pf` on a runner with no container to scope it to. A
+  path the Linux tier never exercises is therefore still unwatched.
+- **`record` is the shipped default**: the guard reports rather than
+  fails until a run's recording is clean and each surviving entry has been
+  argued into `scripts/egress_allowlist.txt`. Flipping
+  `WS_EGRESS_GUARD` to `enforce` in the workflow is the second half of
+  INTEG-016, and until then a new leak lands as a warning annotation.
+- **What the guard proves is "did not leave", not "was not built"**: it
+  sees the connection, not the intent. A request assembled with the user's
+  cookies and then blocked still counts as a finding, but the recording
+  shows only the destination — the body never reaches the recorder,
+  because nothing is forwarded.
 - **proot is for local dev only**: locally on a non-sid host (eg. a
   Debian bookworm dev container) the harness can run inside a sid
   chroot via `proot -r /var/lib/sid-chroot`, but proot 5.1.0 (bookworm)
@@ -999,11 +1199,29 @@ macOS runner exercises the failure assertions for real.
 
 ## Files
 
+### Created
+- [`scripts/egress_guard_arm.sh`](../../../scripts/egress_guard_arm.sh) /
+  [`scripts/egress_guard_disarm.sh`](../../../scripts/egress_guard_disarm.sh)
+  — INTEG-016: install and remove the deny-by-default ruleset, start and
+  stop the recorder, swap and restore `/etc/resolv.conf`
+- [`scripts/egress_recorder.py`](../../../scripts/egress_recorder.py)
+  — INTEG-016: the sink every redirected connection lands in; attributes
+  by `SO_ORIGINAL_DST`, TLS SNI, HTTP `Host:` and DNS question
+- [`scripts/egress_report.py`](../../../scripts/egress_report.py)
+  — INTEG-016: matches the recording against the allowlist and decides the
+  verdict (exit 3 on unallowlisted egress in `enforce` mode)
+- [`scripts/egress_allowlist.txt`](../../../scripts/egress_allowlist.txt)
+  — INTEG-016: the destinations the suite may contact, each with the
+  reason. Ships empty.
+
 ### Modified
 - [`.github/workflows/build-and-test.yml`](../../../.github/workflows/build-and-test.yml)
   — `build-linux` job's `Install container base + Flutter Linux + WPE WebKit deps`,
   `Install pass-secret-service`, and `Run Linux integration tests` steps;
-  `build-apple` job's `Run macOS integration tests` step (`-d macos`).
+  its `--cap-add=NET_ADMIN`, `Warm the toolchain before arming the egress
+  guard`, `Arm egress guard` and `Disarm egress guard and report` steps
+  (INTEG-016); `build-apple` job's `Run macOS integration tests` step
+  (`-d macos`).
 
 ### Existing
 - [`integration_test/white_screen_test.dart`](../../../integration_test/white_screen_test.dart)
@@ -1026,7 +1244,7 @@ macOS runner exercises the failure assertions for real.
   scenario (NOTIF-005-A); INTEG-013: warm home-shortcut taps. Frame
   classifier:
   [`scripts/classify_window_pixels.py`](../../../scripts/classify_window_pixels.py);
-  launch seeding: [`lib/services/diag_seed.dart`](../../../lib/services/diag_seed.dart)
+  launch seeding: [`lib/diag_seed.dart`](../../../lib/diag_seed.dart)
   (`getDiagSeed` in MainActivity, debuggable builds only; parsing
   unit-tested in [`test/diag_seed_test.dart`](../../../test/diag_seed_test.dart))
 - [`integration_test/camera_test.dart`](../../../integration_test/camera_test.dart)

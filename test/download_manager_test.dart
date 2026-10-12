@@ -12,7 +12,6 @@ void main() {
     expect(s.tasks.first.id, t2.id);
     expect(s.tasks.last.id, t1.id);
     expect(s.hasActive, isTrue);
-    expect(s.activeCount, 2);
   });
 
   test('updateProgress mutates task and notifies listeners', () {
@@ -42,7 +41,7 @@ void main() {
   test('fail sets error message, not active', () {
     final s = DownloadsService.instance;
     final t = s.start(filename: 'x');
-    s.fail(t.id, 'HTTP 500');
+    s.fail(t.id, message: 'HTTP 500');
     expect(t.state, DownloadState.failed);
     expect(t.errorMessage, 'HTTP 500');
   });
@@ -87,7 +86,7 @@ void main() {
     final s = DownloadsService.instance;
     s.updateProgress('missing', bytesDone: 100);
     s.complete('missing');
-    s.fail('missing', 'err');
+    s.fail('missing', message: 'err');
     s.cancel('missing');
     s.dismiss('missing');
     expect(s.tasks, isEmpty);

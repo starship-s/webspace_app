@@ -78,11 +78,11 @@ Blocked patterns:
 
 ### Requirement: NESTED-004 - Block Script-Initiated Cross-Domain Navigations
 
-The system SHALL block cross-domain navigations that lack a user gesture, preventing automatic nested webview creation.
+The system SHALL block cross-domain navigations that lack a user gesture, preventing automatic nested webview creation. This holds on every site: there is no per-site switch to let them through (NESTED-006 is withdrawn).
 
 This replaces the previous hardcoded `_trackingDomains` blocklist (Stripe, analytics domains) with gesture-based detection using `NavigationAction.hasGesture`.
 
-**Note:** A user tap on "Sign in with Google" has `hasGesture = true`, but the resulting script-initiated navigation to `accounts.google.com` may have `hasGesture = false`. This means gesture detection can block user-intended OAuth flows. This is a known limitation — users can disable blocking per-site via the `blockAutoRedirects` toggle (NESTED-006).
+**Note:** A user tap on "Sign in with Google" has `hasGesture = true`, but the resulting script-initiated navigation to `accounts.google.com` may have `hasGesture = false`. This means gesture detection can block user-intended OAuth flows, most often on iOS and macOS, where a script navigation reports no gesture. A flow that starts with a tap on a same-site link (`/auth/google`) still works: the gesture carries into the cross-domain redirect for 10 seconds (NESTED-007). One that navigates by script straight from a button has no workaround; that is the accepted cost of never letting a page leave by script.
 
 #### Scenario: Google One Tap blocked
 
@@ -103,33 +103,57 @@ This replaces the previous hardcoded `_trackingDomains` blocklist (Stripe, analy
 
 ### Requirement: NESTED-005 - Allow Captcha Challenges
 
-The system SHALL allow captcha/challenge URLs regardless of gesture.
+The system SHALL keep a captcha/challenge navigation in the main webview
+rather than routing it to a nested one — a challenge stranded in a nested
+webview sets its clearance cookie where the page that needs it cannot see
+it.
 
 Supported challenges:
 - Cloudflare (`challenges.cloudflare.com`, `cdn-cgi/challenge-platform`, `cf-turnstile`)
 - hCaptcha (`hcaptcha.com`)
 - reCAPTCHA (`/recaptcha/` on `google.com`, `gstatic.com`, `recaptcha.net`, `googleapis.com`)
 
+The allow SHALL be applied **after** the gesture and `blockAutoRedirects`
+verdict, in both interception paths:
+
+- `shouldOverrideUrlLoading` — after `config.shouldOverrideUrlLoading`
+  returns (see [captcha-support](../captcha-support/spec.md) CAPTCHA-008).
+- `NavigationDecisionEngine.decideOnUrlChanged` — after the
+  `blockAutoRedirects && !hasRecentGesture` branch, not before the
+  cross-domain check.
+
+`isCaptchaChallenge` matches a URL *shape*. Consulted first it was a
+bypass: a page could set `location.href` to an attacker origin carrying a
+challenge-shaped path with no gesture, and the parent webview would
+navigate in place — inside the site's own container `ws-<siteId>` — and
+commit the attacker URL as the site's persisted `currentUrl`. A real
+interstitial is served by the site itself, so it is cleared by the
+same-domain check long before the captcha branch is reached.
+
 #### Scenario: Complete Cloudflare challenge
 
 **Given** a site is protected by Cloudflare
-**When** a challenge is triggered
-**Then** the challenge loads in the main webview (not nested)
+**When** a challenge is triggered on the site's own origin
+(`https://site.example/cdn-cgi/challenge-platform/...`)
+**Then** the navigation is same-domain and allowed
+**And** the challenge loads in the main webview (not nested)
 **And** the user can complete the challenge
 
----
+#### Scenario: Cross-domain challenge the user reached loads in place
 
-### Requirement: NESTED-006 - Per-Site Toggle for Auto-Redirect Blocking
+**Given** a site with `blockAutoRedirects` on
+**And** a same-domain gesture within the last 10 seconds
+**When** `onUrlChanged` fires for `https://challenges.cloudflare.com/...`
+**Then** the decision is `allow` (in place, not nested)
+**And** the pending gesture is consumed
 
-The system SHALL provide a per-site setting to disable auto-redirect blocking.
+#### Scenario: Captcha-shaped URL buys no gesture-less cross-origin hop
 
-**Field**: `blockAutoRedirects` (default: `true`)
-
-#### Scenario: User disables blocking for a site
-
-**Given** the user has a site where auto-redirects are needed (e.g., an OAuth callback flow)
-**When** the user disables "Block auto-redirects" in site settings
-**Then** all cross-domain navigations open in nested webviews regardless of gesture
+**Given** a site with `blockAutoRedirects` on and no recent gesture
+**When** the page sets `location.href` to
+`https://attacker.example/cdn-cgi/challenge-platform/x`
+**Then** `decideOnUrlChanged` returns `blockSilent`
+**And** the attacker URL is not committed as the site's `currentUrl`
 
 ---
 
@@ -179,6 +203,82 @@ Implementation: `lib/services/target_blank_rewrite.dart`
 
 ---
 
+### Requirement: NESTED-010 - The Nested Screen Carries the Whole Per-Site Posture
+
+Every per-site field the parent webview applies SHALL reach
+`InAppWebViewScreen`. The posture travels as one `SitePosture`
+([lib/services/site_posture.dart](../../../../../lib/services/site_posture.dart)),
+resolved by `WebViewModel.sitePosture` when the link opens and passed whole
+through `LaunchUrlFunc`, `_WebSpacePageState.launchUrl` and the
+`InAppWebViewScreen` constructor into the nested `WebViewConfig`. Its fields are
+required with no default, so the chain cannot drop one, and the nested screen
+SHALL NOT re-derive a value the resolver already resolved (the umbrella's
+forcing, the archive overrides, the timezone). The one difference the nested
+screen has is `SitePosture.forNested()`: a `real` capture grant is asked again
+(CAM-005 / MIC-005). History: [BUG-025](../../../docs/bugs/025-nested-posture-drift.md).
+
+A dropped field is not a cosmetic gap: `blockedCookies`, the
+camera/microphone modes and their sources, and `protectedContentAllowed`
+were once missing from the chain, and one tap on an outbound link dropped
+them for the rest of that browsing session inside the parent's own
+container.
+
+The nested `shouldOverrideUrlLoading` SHALL run
+`NavigationDecisionEngine.decideShouldOverrideUrlLoading` with
+`initUrl = _currentUrl` — the page shown here, not the opening site's home
+URL, since a nested screen is already one hop out. It SHALL always be set:
+without it, one tap on an outbound link would buy unlimited gesture-less
+cross-origin hops inside the parent's own container (NESTED-004). A nested screen has
+nowhere further to nest, so `blockOpenNested` navigates in place,
+`blockOpenExternal` goes to the system browser, and `blockOutbound` opens
+nothing.
+
+`blockedCookies` SHALL be swept after every load here too — the nested
+webview shares the parent's container, so a blocked cookie re-set through an
+outbound link would otherwise come back. The sweep and its cookie reader are
+wired only when the set is non-empty, so a site with no blocked cookies pays
+no extra jar round-trip.
+
+The camera / microphone / protected-content values the posture carries are
+the `effective*` getters, so an archive-tier or Tracking-Protection forced
+block stays blocked one hop out (ARCH-006, ETP-023).
+
+Regression gate: the compiler, for the chain; `test/site_posture_test.dart`
+holds the nested posture equal to the root's but for the capture grants, and
+fails if anything but the resolver builds a posture.
+
+#### Scenario: A gesture-less redirect in a nested webview is blocked
+
+**Given** the user followed an outbound link into a nested webview
+**When** the nested page script-navigates cross-domain with no gesture
+**Then** `NavigationDecisionEngine.decideShouldOverrideUrlLoading` is run
+with `initUrl` = the nested page's current URL
+**And** the decision is `blockSilent`, so the navigation is cancelled
+
+#### Scenario: A blocked cookie stays blocked one hop out
+
+**Given** the opening site blocks the cookie `sid` on `ads.example`
+**When** a page in the nested webview sets it
+**Then** the nested screen deletes it from the shared container after the
+load, exactly as the parent does
+
+#### Scenario: A spoofed timezone survives the hop
+
+**Given** a site with Tracking Protection on, picked coordinates, and the zone
+those coordinates resolve to stored in `spoofTimezone`
+**When** it opens an outbound link in a nested webview
+**Then** the nested page reports that zone, the same one the site's own
+webview reports (BUG-025)
+
+#### Scenario: A forced camera block survives the hop
+
+**Given** an archive-tier site (`effectiveCameraMode == block`)
+**When** it opens an outbound link and that page calls `getUserMedia`
+**Then** the nested screen's in-memory mode starts at `block`
+**And** no permission popup and no OS camera prompt appear
+
+---
+
 ### Requirement: NESTED-007 - Preserve Same-Domain Navigation
 
 The system SHALL allow normal website navigation within the same domain regardless of gesture.
@@ -195,64 +295,114 @@ Uses normalized domain comparison with aliases (e.g., `mail.google.com` → `goo
 
 ### Requirement: NESTED-009 - Per-Site Open External Links in System Browser
 
-The system SHALL provide a per-site setting that opens a cross-domain link
-not covered by the site's domain claims in the device's default browser
-instead of a nested in-app webview.
+The system SHALL provide a per-site choice of where a cross-domain link not
+covered by the site's domain claims goes: a nested in-app webview, the
+device's default browser, or nowhere.
 
-**Field**: `externalLinksInBrowser` (default: `false`)
+**Field**: `externalLinkMode`: `inApp` (default), `browser` or `block`. It
+replaced the `externalLinksInBrowser` bool; a stored `externalLinksInBrowser:
+true` with no `externalLinkMode` SHALL read as `browser`, and an unknown or
+wrong-typed value as `inApp`. `toJson` SHALL omit the field at `inApp`.
 
-When enabled, a navigation that the cross-domain decision would route to a
-nested webview (NESTED-004 "Direct link click allowed") is instead handed to
-the system browser via `url_launcher`, UNLESS the target matches one of the
-site's `effectiveDomainClaims` (link-intent-routing) — a claimed domain still
-opens in a nested webview. The `blockAutoRedirects` silent block and the
-background-site suppression take precedence, so a gesture-less script redirect
-or a background site never pops the system browser. Archive-tier sites force
-the setting off (`effectiveExternalLinksInBrowser`, ARCH-006): handing a URL to
-another app crosses the archive isolation boundary.
+A navigation that the cross-domain decision would route to a nested webview
+(NESTED-004 "Direct link click allowed") SHALL, when its target matches one of
+the site's `effectiveDomainClaims` (link-intent-routing), open in a nested
+webview in every mode. Otherwise:
 
-This implements discussion #438: "a setting for each site to have any link
-inside a web app that is not a domain claim for that website to open in the
-system's default browser." The complementary request — that links opened
-in-app are not added as domain claims — already holds: in-app navigation never
-mutates `domainClaims`; claims change only through the per-site editor or the
+- `inApp`: it opens in a nested webview (`blockOpenNested`).
+- `browser`: it is handed to the system browser via `url_launcher`
+  (`blockOpenExternal`).
+- `block`: it is cancelled and nothing opens (`blockOutbound`). Only top-level
+  navigations reach the decision, so images, scripts, styles and frames from
+  other domains still load. When the navigation carried a user gesture the app
+  SHALL say so with a short message naming the target host; a gesture-less
+  one SHALL be cancelled without any UI, so a page cannot flood the screen.
+
+The gesture-less silent block (NESTED-004) and the background-site
+suppression take precedence in every mode, so a script redirect or a
+background site never pops the system browser or the blocked message. Archive-tier sites
+SHALL read `browser` as `inApp` (`effectiveExternalLinkMode`, ARCH-006):
+handing a URL to another app crosses the archive isolation boundary. `block`
+crosses nothing and SHALL stay in force for them.
+
+Outbound routing (link-intent-routing LIR-014) is an option of the `inApp`
+mode only.
+
+The browser mode implements discussion #438: "a setting for each site to have
+any link inside a web app that is not a domain claim for that website to open
+in the system's default browser." The block mode implements issue #629: a site
+that cannot take the user to another site. In-app navigation never mutates
+`domainClaims`; claims change only through the per-site editor or the
 user-initiated inbound bind picker (link-intent-routing LIR-010).
 
 #### Scenario: Unclaimed cross-domain link opens in the system browser
 
-**Given** a site `https://example.com` with `externalLinksInBrowser` on
+**Given** a site `https://example.com` in the `browser` mode
 **And** the user taps a link to `https://unclaimed.com` (cross-domain, not a claim)
 **When** `shouldOverrideUrlLoading` runs
 **Then** the navigation is cancelled
 **And** the URL is handed to the device's default browser
 **And** no nested webview opens
 
+#### Scenario: Unclaimed cross-domain link is blocked
+
+**Given** a site `https://example.com` in the `block` mode
+**When** the user taps a link to `https://unclaimed.com`
+**Then** the navigation is cancelled
+**And** neither a nested webview nor the system browser opens
+**And** a short message says the link to `unclaimed.com` was blocked
+**And** the site's page stays as it was
+
+#### Scenario: A blocked script navigation says nothing
+
+**Given** a site in the `block` mode
+**When** a script navigates the page to another domain with no user gesture
+**Then** the navigation is cancelled and no message is shown
+
+#### Scenario: Content from other domains still loads
+
+**Given** a site in the `block` mode whose page embeds an image from `https://cdn.other.com`
+**When** the page loads
+**Then** the image loads: sub-resources are not navigations
+
 #### Scenario: Claimed cross-domain link stays in the app
 
 **Given** a "Google" site whose domain claims include `youtube.com`
-**And** `externalLinksInBrowser` is on
+**And** the site is in the `browser` or `block` mode
 **When** the user taps a `https://youtube.com/...` link
-**Then** the link opens in a nested webview (it matches a domain claim), not the system browser
+**Then** the link opens in a nested webview (it matches a domain claim)
 
 #### Scenario: Setting off preserves legacy routing
 
-**Given** a site with `externalLinksInBrowser` off (the default)
+**Given** a site in the `inApp` mode (the default)
 **When** the user taps a cross-domain link
 **Then** it opens in a nested webview exactly as before
 
+#### Scenario: The old switch migrates
+
+**Given** site JSON written before this change with `externalLinksInBrowser: true`
+**When** it is loaded
+**Then** the site is in the `browser` mode
+**And** its next save writes `externalLinkMode: "browser"` and no `externalLinksInBrowser`
+
 #### Scenario: Gesture-less script redirect is not launched externally
 
-**Given** a site with `externalLinksInBrowser` on and `blockAutoRedirects` on
+**Given** a site in the `browser` mode
 **When** a script fires a cross-domain navigation with no user gesture
 **Then** the navigation is silently cancelled (NESTED-004) and the system browser is NOT opened
 
+#### Scenario: Archive-tier sites never hand a link to another app
+
+**Given** an archive-tier site stored in the `browser` mode
+**When** the user taps an unclaimed cross-domain link
+**Then** it opens in a nested webview
+**And** an archive-tier site in the `block` mode still blocks it
+
 #### Scenario: Nested webview honors the setting
 
-**Given** a claimed cross-domain link opened a nested webview while the setting is on
+**Given** a claimed cross-domain link opened a nested webview while the site is in the `browser` or `block` mode
 **When** the user taps a link in that nested webview pointing to a different domain than the page shown
-**Then** that link opens in the system browser (NESTED-009 applies in nested screens too)
-
----
+**Then** that link opens in the system browser, or is blocked, as the mode says (NESTED-009 applies in nested screens too)
 
 ## Implementation
 
@@ -270,11 +420,12 @@ URL received
   ├─ Same domain? ──────────────────── ALLOW
   │
   ├─ Cross-domain:
-  │   ├─ blockAutoRedirects + no gesture ── CANCEL (silent)
+  │   ├─ no gesture ─────────────────────── CANCEL (silent, every site)
   │   ├─ background site ───────────────── CANCEL (suppressed)
-  │   ├─ externalLinksInBrowser + not a claim ── CANCEL + system browser (NESTED-009)
-  │   ├─ blockAutoRedirects OFF ────────── open nested webview
-  │   └─ has gesture ──────────────────── open nested webview
+  │   ├─ claimed by the site ─────────── open nested webview (every mode)
+  │   ├─ externalLinkMode browser ─────── CANCEL + system browser (NESTED-009)
+  │   ├─ externalLinkMode block ───────── CANCEL, nothing opens (NESTED-009)
+  │   └─ externalLinkMode inApp ──────── open nested webview
   │
   └─ ALLOW
 ```
@@ -307,9 +458,8 @@ static bool _hasUserGesture(NavigationAction action) {
   decision for the `shouldOverrideUrlLoading` callback; returns one of
   `allow` / `blockSilent` / `blockSuppressed` / `blockOpenNested` plus
   an optional `GestureStateUpdate` descriptor. Implements NESTED-004
-  (script-initiated cross-domain blocking), NESTED-006 (per-site
-  `blockAutoRedirects` toggle), and NESTED-007 (same-domain
-  propagation + 10s gesture window).
+  (script-initiated cross-domain blocking, on every site) and NESTED-007
+  (same-domain propagation + 10s gesture window).
 - `NavigationDecisionEngine.decideOnUrlChanged` — same decision
   shape for server-side 3xx redirects that bypass
   `shouldOverrideUrlLoading`. `isCaptchaChallenge` is injected as a
@@ -328,7 +478,7 @@ CLAUDE.md now forbids. Direct engine tests live in
 - `_shouldBlockUrl()` — blocks `about:` (except blank/srcdoc) and service worker patterns
 - `isCaptchaChallenge()` — detects captcha domains and paths; passed to `decideOnUrlChanged` as a callback
 - `shouldOverrideUrlLoading` callback passes `hasGesture` from `NavigationAction`
-- `onCreateWindow` — dismisses all `window.open()` except captcha challenges
+- `onCreateWindow` — dismisses all `window.open()` except captcha challenges; a same-domain target loads in place only with a user gesture (NESTED-013)
 - Registers `targetBlankRewriteScript` always-on at `AT_DOCUMENT_START`
 
 #### `lib/services/target_blank_rewrite.dart`
@@ -339,23 +489,21 @@ CLAUDE.md now forbids. Direct engine tests live in
   registration guarded by `test/target_blank_rewrite_test.dart`.
 
 #### `lib/web_view_model.dart`
-- `blockAutoRedirects` field (default: `true`)
-- `externalLinksInBrowser` field (default: `false`) + `effectiveExternalLinksInBrowser` getter (forced off for archive tier, NESTED-009 / ARCH-006). Serialized only when true (`toJson` omits the default)
-- `shouldOverrideUrlLoading` callback: delegates to `NavigationDecisionEngine`, applies the returned `GestureStateUpdate` to `lastSameDomainGestureTime`, dispatches on the decision enum (log + `launchUrlFunc` for `blockOpenNested`, `launchUrlInSystemBrowser` for `blockOpenExternal`)
+- `externalLinkMode` field (`ExternalLinkMode`, `lib/settings/external_links.dart`, default `inApp`) + `effectiveExternalLinkMode` getter (archive-tier `browser` reads as `inApp`, NESTED-009 / ARCH-006). Serialized only outside the default; `fromJson` reads the legacy `externalLinksInBrowser` bool as `browser`
+- `shouldOverrideUrlLoading` callback: delegates to `NavigationDecisionEngine`, applies the returned `GestureStateUpdate` to `lastSameDomainGestureTime`, dispatches on the decision enum (log + `launchUrlFunc` for `blockOpenNested`, `launchUrlInSystemBrowser` for `blockOpenExternal`, the host hook alone for `blockOutbound`, which shows the blocked message for a tapped link)
 - `onUrlChanged` callback: same pattern; on `blockOpenNested` navigates back to `previousSameDomainUrl` before opening the nested webview
-- `matchesSiteClaim` closure passes `effectiveDomainClaims` to the engine via `LinkRoutingService.urlMatchesAnyClaim` so a claimed cross-domain link stays nested even with `externalLinksInBrowser` on
+- `matchesSiteClaim` closure passes `effectiveDomainClaims` to the engine via `LinkRoutingService.urlMatchesAnyClaim` so a claimed cross-domain link stays nested in every external link mode
 - Serialized in `toJson()` / `fromJson()` with `?? true` for backward compat
 
 #### `lib/services/navigation_decision_engine.dart`
 - `NavigationDecision.blockOpenExternal` — cancel + hand to system browser
-- `decideShouldOverrideUrlLoading` / `decideOnUrlChanged` take optional `externalLinksInBrowser` + `matchesSiteClaim`; when the decision would be `blockOpenNested` and the setting is on and the target is unclaimed, returns `blockOpenExternal`
+- `NavigationDecision.blockOutbound` — cancel, open nothing
+- `decideShouldOverrideUrlLoading` / `decideOnUrlChanged` take optional `externalLinkMode` + `matchesSiteClaim`; a cross-domain target that survives the gesture and background checks nests when claimed, and otherwise nests, goes to the browser, or is blocked, by mode
 - `OnUrlChangedHandled.launchExternalUrl` carries the URL for the caller to launch
 
 #### `lib/screens/inappbrowser.dart`
-- `externalLinksInBrowser` ctor field; nested `WebViewConfig.shouldOverrideUrlLoading` (gated on the setting, null when off) routes user-gesture cross-domain navigations to `launchUrlInSystemBrowser`, judged against the page currently shown
-
-#### `lib/screens/settings.dart`
-- "Block auto-redirects" toggle per site
+- `posture.page.externalLinks` (from the `SitePosture` it is built with); nested `WebViewConfig.shouldOverrideUrlLoading` (always set) delegates to `NavigationDecisionEngine.decideShouldOverrideUrlLoading` against the page currently shown, routes `blockOpenExternal` to `launchUrlInSystemBrowser`, and shows the blocked message for a tapped `blockOutbound`
+- `posture.blocking.blockedCookies` + the forwarded cookie managers drive a post-load sweep; `posture.media` seeds the screen's in-memory capture and protected-content decisions (NESTED-010)
 
 ---
 
@@ -367,10 +515,3 @@ CLAUDE.md now forbids. Direct engine tests live in
 2. Load the page
 3. Verify no nested webview opens for accounts.google.com
 4. Verify the page functions normally
-
-### Manual Test: Per-Site Toggle
-
-1. Open site settings for any site
-2. Toggle "Block auto-redirects" off
-3. Reload the site
-4. Verify script-initiated cross-domain navigations now open nested webviews

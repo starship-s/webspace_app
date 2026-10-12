@@ -1,47 +1,32 @@
 /// Pure-Dart model of the Android surface-repaint nudge (PAUSE-015/017/018),
-/// the runtime counterpart of `formal/kernel.tla`'s repaint machine. It owns
-/// two decisions and no side effects: (1) which transitions re-attach the
-/// visible hybrid-composition SurfaceView and therefore owe a repaint, and
-/// (2) the coalescing tick loop that drives `_nudgeSurfaceRepaint`. The host
-/// supplies the clock (`Future.delayed`) and native repaint side effect; this
-/// class never imports Flutter, so it is unit- and interleaving-testable. See
+/// the runtime counterpart of `formal/kernel.tla`'s repaint machine. Every
+/// (re)attach of the visible hybrid-composition SurfaceView owes a repaint
+/// (activate, resume, a fresh controller, back/forward from bfcache, reload,
+/// first visible commit, a route returning, go home, renderer rebuild:
+/// PAUSE-015/017/018/021/024/031); going to the background does not. That
+/// coverage is gated in test/js/surface_repaint_funnel.test.js. This class owns
+/// the coalescing tick loop that drives native repaint requests and the repaint
+/// owed after an attach, with no side effects: the host supplies the clock
+/// (`Future.delayed`) and native call. It
+/// never imports Flutter, so it is unit- and interleaving-testable. See
 /// test/surface_repaint_engine_test.dart.
 library;
 
-/// Surface lifecycle transitions on the visible site. Every value except
-/// [appBackground] (re)attaches the SurfaceView and must be followed by a
-/// repaint nudge — that is the coverage contract behind BUG-001. A new
-/// surface-attach path MUST be added here and routed through the host nudge.
-enum SurfaceTransition {
-  activate, // _setCurrentIndex (PAUSE-015)
-  resume, // _onResumed (PAUSE-015)
-  controllerAttach, // fresh controller mounts a new SurfaceView (PAUSE-017)
-  back, // bfcache restore reuses the controller (PAUSE-018)
-  forward, // bfcache restore reuses the controller (PAUSE-018)
-  reload, // reload discards the painted frame, recommits later (PAUSE-021)
-  routeReturn, // an opaque route above popped, re-attaching the view (PAUSE-024)
-  goHome, // dispose + rebuild at initUrl (PAUSE-017)
-  rendererRebuilt, // renderer-gone recovery rebuild (PAUSE-017)
-  appBackground, // app going to background: no attach, no repaint owed
-}
-
-/// The action the host applies for one tick, then schedules the next tick
-/// unless [done].
+/// Whether the host should stop the tick loop after this native repaint.
 class RepaintTick {
   final bool done;
   const RepaintTick({required this.done});
 }
 
 class SurfaceRepaintEngine {
-  /// Number of native repaint requests per nudge. Spread across frames because
-  /// a freshly-attached surface may not be composited on the first frame.
+  /// Number of repaint requests per nudge. Spread across frames because a
+  /// freshly-attached surface may not be composited on the first frame.
   static const int ticksPerRequest = 6;
 
   int _ticksRemaining = 0;
   bool _looping = false;
   bool _owed = false;
 
-  /// Whether a tick loop is currently running.
   bool get isLooping => _looping;
 
   /// Whether a blank-surface (re)attach is still owed a repaint. Mirrors
@@ -59,12 +44,12 @@ class SurfaceRepaintEngine {
     _owed = true;
   }
 
-  /// True iff [t] re-attaches the visible surface and so must be followed by a
-  /// repaint. The complete set is the contract; mirrors `Attach` in kernel.tla.
-  static bool mustRepaint(SurfaceTransition t) =>
-      t != SurfaceTransition.appBackground;
-
   bool _commitPending = false;
+
+  /// How long the host holds the commit latch open after an issue
+  /// (PAUSE-027). Long enough to outlast a slow recommit, short enough that
+  /// an unrelated navigation minutes later does not inherit a repaint.
+  static const Duration commitWindow = Duration(seconds: 15);
 
   /// Whether a document has been issued whose commit onto the visible surface
   /// has not yet settled.
@@ -76,34 +61,43 @@ class SurfaceRepaintEngine {
   /// and the replacement commits later (network, parse, script), so the
   /// one-shot nudge fired at issue time can drain before the commit lands —
   /// the same ordering `formal/warmstart.tla` model-checks for the warm-start
-  /// resume. This latch carries the debt across that gap; [consumeLoadSettled]
+  /// resume. This latch carries the debt across that gap; [noteLoadSettled]
   /// pays it.
   ///
-  /// Two callers arm it: a reload ([reloadIssued], PAUSE-021) and a
-  /// freshly-attached surface whose *first* document has not committed yet
-  /// (PAUSE-025).
+  /// Callers arm it: a reload, a re-issued load, and a freshly-attached
+  /// surface whose *first* document has not committed yet (PAUSE-021/025).
+  ///
+  /// Arming opens a *window*, not a one-shot ticket, and the host closes it
+  /// with [closeCommitWindow] after [commitWindow] (PAUSE-027). One issue can
+  /// settle more than once — a redirect chain commits an interstitial first —
+  /// and a reload issued while another is still in flight settles twice: the
+  /// aborted load's settle first, the replacement's after. Disarming on the
+  /// first settle spends the repaint on a document that is already gone and
+  /// leaves the one the user is looking at blank, which is the rapid-refresh
+  /// white screen.
   void noteCommitPending() {
     _commitPending = true;
   }
 
-  /// A reload was issued on the visible webview (PAUSE-021).
-  void reloadIssued() => noteCommitPending();
-
-  /// A main-frame load settled on the visible webview. Returns true iff it
-  /// completes a pending commit, in which case the host MUST nudge: the
-  /// commit is the document's real surface attach. Consumes the latch, so a
-  /// later unrelated navigation does not nudge.
-  bool consumeLoadSettled() {
-    if (!_commitPending) return false;
+  /// Close the commit window: later loads settle without a repaint. Driven by
+  /// the host's bounded timer, restarted on every [noteCommitPending].
+  void closeCommitWindow() {
     _commitPending = false;
+  }
+
+  /// A main-frame load settled on the visible webview. Returns true iff the
+  /// commit window is open, in which case the host MUST nudge: the commit is
+  /// the document's real surface attach. Does not close the window — see
+  /// [noteCommitPending].
+  bool noteLoadSettled() {
+    if (!_commitPending) return false;
     attach();
     return true;
   }
 
   /// Request a nudge. Refills the tick budget and returns whether the host
   /// should START the tick loop (true), or an already-running loop absorbed
-  /// the request (false). Coalescing: concurrent callers never start two
-  /// loops.
+  /// the request (false). Coalescing: concurrent callers never start two loops.
   bool request() {
     _ticksRemaining = ticksPerRequest;
     if (_looping) return false;
@@ -118,15 +112,14 @@ class SurfaceRepaintEngine {
       return const RepaintTick(done: true);
     }
     _ticksRemaining--;
-    // A repaint tick recomposites whatever surface is currently attached, so it
-    // clears any owed repaint. A late attach with no subsequent tick is the
-    // warm-start defect: `owed` stays true (formal/warmstart.tla, Fix="none").
+    // A native repaint request recomposites whatever surface is currently
+    // attached, so it clears any owed repaint. A late attach with no later
+    // request is the warm-start defect (formal/warmstart.tla, Fix="none").
     _owed = false;
     return const RepaintTick(done: false);
   }
 
-  /// Abort the loop with no further ticks (host unmounted or its controller
-  /// disappeared mid-loop).
+  /// Abort the loop with no further ticks (host unmounted mid-loop).
   void abort() {
     _ticksRemaining = 0;
     _looping = false;

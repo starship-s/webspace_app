@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'package:webspace/platform/host_platform.dart';
 
+import 'package:flutter/scheduler.dart' show SchedulerBinding;
 import 'package:flutter/services.dart';
+import 'package:webspace/services/background_log.dart';
 import 'package:webspace/services/log_service.dart';
 
 /// Dart-side bridge to the platform background-task plugins. Implements
@@ -18,8 +20,9 @@ import 'package:webspace/services/log_service.dart';
 ///
 ///   - [scheduleNextRefresh] — submits a `BGAppRefreshTaskRequest` on
 ///     iOS, an `androidx.work` `PeriodicWorkRequest` on Android (15-min
-///     minimum, `NetworkType.CONNECTED`). The system fires whenever it
-///     deems appropriate.
+///     minimum, `NetworkType.CONNECTED`, first run one interval out so a
+///     freshly scheduled refresh does not reload the site the user just
+///     opened). The system fires whenever it deems appropriate.
 ///
 ///   - [cancelScheduledRefreshes] — cancels the iOS request / Android
 ///     unique work. Use when the last notification site goes away.
@@ -54,19 +57,28 @@ class BackgroundTaskService {
     _channel.setMethodCallHandler((call) async {
       switch (call.method) {
         case 'onBackgroundRefresh':
-          LogService.instance.log(
-              'BackgroundTask', 'background refresh fired — reloading notif sites');
+          final lifecycle =
+              SchedulerBinding.instance.lifecycleState?.name ?? 'unknown';
+          BackgroundLog.instance.record(LogTag.backgroundTask,
+              message:
+                  'background refresh fired (app $lifecycle) — reloading notif sites');
+          final watch = Stopwatch()..start();
           try {
             final cb = onBackgroundRefresh;
             if (cb != null) {
               await cb();
             }
+            BackgroundLog.instance.record(LogTag.backgroundTask,
+                message:
+                    'background refresh handled in ${watch.elapsedMilliseconds}ms');
             await bgRefreshDidComplete(success: true);
           } catch (e, st) {
-            LogService.instance.log(
-              'BackgroundTask',
-              'background refresh handler threw: $e\n$st',
+            // The message can quote a page URL; only its type is kept on disk.
+            BackgroundLog.instance.record(
+              LogTag.backgroundTask,
+              message: 'background refresh handler threw ${e.runtimeType}',
               level: LogLevel.error,
+              sensitive: 'background refresh handler threw: $e\n$st',
             );
             await bgRefreshDidComplete(success: false);
           }
@@ -74,18 +86,33 @@ class BackgroundTaskService {
       }
       return null;
     });
+    // Android: an engine the refresh worker started for a wake (NOTIF-016)
+    // sends the refresh only once this handler is installed.
+    if (hostIsAndroid) unawaited(_announceReady());
+  }
+
+  Future<void> _announceReady() async {
+    try {
+      await _channel.invokeMethod('backgroundRefreshReady');
+    } on PlatformException catch (e) {
+      BackgroundLog.instance.record(
+        LogTag.backgroundTask,
+        message: 'backgroundRefreshReady failed: ${e.message}',
+        level: LogLevel.warning,
+      );
+    }
   }
 
   Future<void> beginGracePeriod() async {
     if (!hostIsIOS) return;
     try {
       await _channel.invokeMethod('beginGracePeriod');
-      LogService.instance.log(
-          'BackgroundTask', 'Started ~30s grace period for notification flush');
+      LogTag.backgroundTask.debug(
+          'Started ~30s grace period for notification flush');
     } on PlatformException catch (e) {
-      LogService.instance.log(
-        'BackgroundTask',
-        'beginGracePeriod failed: ${e.message}',
+      BackgroundLog.instance.record(
+        LogTag.backgroundTask,
+        message: 'beginGracePeriod failed: ${e.message}',
         level: LogLevel.warning,
       );
     }
@@ -96,9 +123,9 @@ class BackgroundTaskService {
     try {
       await _channel.invokeMethod('endGracePeriod');
     } on PlatformException catch (e) {
-      LogService.instance.log(
-        'BackgroundTask',
-        'endGracePeriod failed: ${e.message}',
+      BackgroundLog.instance.record(
+        LogTag.backgroundTask,
+        message: 'endGracePeriod failed: ${e.message}',
         level: LogLevel.warning,
       );
     }
@@ -109,9 +136,9 @@ class BackgroundTaskService {
     try {
       await _channel.invokeMethod('scheduleRefresh');
     } on PlatformException catch (e) {
-      LogService.instance.log(
-        'BackgroundTask',
-        'scheduleRefresh failed: ${e.message}',
+      BackgroundLog.instance.record(
+        LogTag.backgroundTask,
+        message: 'scheduleRefresh failed: ${e.message}',
         level: LogLevel.warning,
       );
     }
@@ -122,9 +149,9 @@ class BackgroundTaskService {
     try {
       await _channel.invokeMethod('cancelScheduledRefreshes');
     } on PlatformException catch (e) {
-      LogService.instance.log(
-        'BackgroundTask',
-        'cancelScheduledRefreshes failed: ${e.message}',
+      BackgroundLog.instance.record(
+        LogTag.backgroundTask,
+        message: 'cancelScheduledRefreshes failed: ${e.message}',
         level: LogLevel.warning,
       );
     }
@@ -136,9 +163,9 @@ class BackgroundTaskService {
       await _channel
           .invokeMethod('bgRefreshDidComplete', {'success': success});
     } on PlatformException catch (e) {
-      LogService.instance.log(
-        'BackgroundTask',
-        'bgRefreshDidComplete failed: ${e.message}',
+      BackgroundLog.instance.record(
+        LogTag.backgroundTask,
+        message: 'bgRefreshDidComplete failed: ${e.message}',
         level: LogLevel.warning,
       );
     }
@@ -154,19 +181,19 @@ class BackgroundTaskService {
   /// respect-the-silent-switch default so ordinary sites don't blast
   /// through a muted phone. Android needs no equivalent — WebView audio
   /// keeps playing as long as the process (and its JS) stays alive.
-  Future<void> setBackgroundAudioActive(bool active) async {
+  Future<void> setBackgroundAudioActive({required bool active}) async {
     if (!hostIsIOS) return;
     if (_backgroundAudioActive == active) return;
     _backgroundAudioActive = active;
     try {
       await _channel
           .invokeMethod('setBackgroundAudioActive', {'active': active});
-      LogService.instance.log(
-          'BackgroundTask', 'Background audio session active=$active');
+      BackgroundLog.instance.record(LogTag.backgroundTask,
+          message: 'Background audio session active=$active');
     } on PlatformException catch (e) {
-      LogService.instance.log(
-        'BackgroundTask',
-        'setBackgroundAudioActive failed: ${e.message}',
+      BackgroundLog.instance.record(
+        LogTag.backgroundTask,
+        message: 'setBackgroundAudioActive failed: ${e.message}',
         level: LogLevel.warning,
       );
     } on MissingPluginException {

@@ -1,5 +1,6 @@
 package org.codeberg.theoden8.webspace.proxy
 
+import java.io.File
 import java.io.InputStream
 import java.io.OutputStream
 import java.net.InetAddress
@@ -8,6 +9,7 @@ import java.net.ServerSocket
 import java.net.Socket
 import java.net.URI
 import java.util.concurrent.Executors
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 /**
@@ -22,17 +24,71 @@ import javax.net.ssl.SSLSocketFactory
  * username/password handshake, RFC 1929).
  *
  * Fail-closed by construction: the relay only ever connects to the
- * configured upstream. If the upstream is unreachable or rejects auth, the
- * client gets a `502` and the connection closes — the relay never opens a
- * direct connection to the origin, so a failed proxy cannot leak the IP.
+ * upstream configured for that connection, and for an HTTPS upstream only
+ * past a handshake that verified that upstream's certificate identity
+ * (see [startTls]). If the upstream is unreachable, untrusted, or rejects
+ * auth, the client gets a `502` and the connection closes. There is no
+ * fallback path of any kind, so a failed proxy cannot leak the IP — not
+ * even in router mode, where a *different* connection may legitimately be
+ * routed [UpstreamType.DIRECT] because its own site has no proxy set.
+ *
+ * In router mode it additionally fronts every site at once, selecting the
+ * upstream from the `Proxy-Authorization` credential the WebView presents
+ * (see [startRouter]).
+ *
+ * The listener is bound to loopback, which keeps it off the network but not
+ * away from the device: every other app with `INTERNET` can reach
+ * `127.0.0.1:<port>` too, and this relay answers with the user's upstream
+ * credentials attached. Each accepted connection is therefore checked against
+ * `/proc/net/tcp{,6}`: the peer's connection appears as a row whose local port
+ * is its own and whose remote port is ours, and field 7 names the UID that owns
+ * it. A row owned by anyone but us is another app, and is refused before any
+ * upstream connection is opened.
+ *
+ * **Know what this does and does not cover.** The port pair alone is the row
+ * *any* caller creates, so the UID is the whole discriminator — matching ports
+ * and stopping there would classify every caller as OWN. And the table is only
+ * readable up to API 28: Android 10 denies `/proc/net` outright rather than
+ * filtering it per-UID, so from API 29 the read fails and every peer is
+ * UNKNOWN. The check therefore bites on API 24-28 and is inert above it.
+ * Nothing supported replaces it: `ConnectivityManager.getConnectionOwnerUid`
+ * answers only for the caller's own `VpnService` tunnel, and TCP has no
+ * `SO_PEERCRED`. On API 29+ the ephemeral port is the only thing between a
+ * local app and this relay, and ~15 bits is scannable — that residual exposure
+ * predates this check and is not closed by it.
+ *
+ * Unreadable table means unverifiable, not hostile: failing closed there would
+ * strand proxying on every modern device for a threat that needs a malicious
+ * app already installed.
  *
  * Deliberately free of `android.*` imports so it runs under plain JVM
  * JUnit (no Robolectric). The lifecycle wrapper / method channel lives in
  * [ProxyRelayPlugin].
  */
-class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
+class ProxyRelay(
+    private val logger: ((String) -> Unit)? = null,
+    /**
+     * This process's UID, for the `/proc/net/tcp` peer check. Passed in rather
+     * than read here so the class stays free of `android.*` and JVM-testable.
+     * Null disables the UID half of the check, which then cannot reject.
+     */
+    private val ownUid: Int? = null,
+    private val peerCheck: ((peerPort: Int, relayPort: Int) -> PeerVerdict)? = null,
+) {
 
-    enum class UpstreamType { HTTP, HTTPS, SOCKS5 }
+    /** Whether an accepted peer is one of this process's own sockets. */
+    enum class PeerVerdict { OWN, FOREIGN, UNKNOWN }
+
+    /**
+     * DIRECT exists only for router mode. With `ProxyController` pointed
+     * at the relay, EVERY site's traffic arrives here, including a site
+     * the user left on the system default -- that site has to reach its
+     * origin unproxied. It is reachable only through a route the app
+     * configured as DIRECT and is never a fallback: a site whose proxy is
+     * unreachable still gets a 502, so a failing proxy can no more leak
+     * the device IP than it could before router mode existed.
+     */
+    enum class UpstreamType { HTTP, HTTPS, SOCKS5, DIRECT }
 
     data class UpstreamConfig(
         val type: UpstreamType,
@@ -45,13 +101,34 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
             get() = !username.isNullOrEmpty() && !password.isNullOrEmpty()
     }
 
+    /** One site's upstream, as reached through its credential. */
+    data class Route(val siteId: String, val upstream: UpstreamConfig)
+
     @Volatile
     private var serverSocket: ServerSocket? = null
     @Volatile
     private var config: UpstreamConfig? = null
+    // Router mode. `routerRealm` non-null selects it; `routes` maps the
+    // base64 credential a WebView presents to the upstream it may reach.
+    // Both are replaced wholesale under the class monitor and read as a
+    // single volatile snapshot, never mutated in place, so an accept-thread
+    // reader can never observe a half-applied route table (BUG-007).
+    @Volatile
+    private var routerRealm: String? = null
+    @Volatile
+    private var routes: Map<String, Route> = emptyMap()
+    // Probe observations: nonce -> siteId whose credential carried it.
+    // Replaced wholesale like `routes` so an accept-thread writer and a
+    // channel-thread reader never see a torn map (BUG-007).
+    @Volatile
+    private var probes: Map<String, String> = emptyMap()
     @Volatile
     private var boundPort: Int = -1
+    @Volatile
+    private var boundHost: String = LOOPBACK
     private var acceptThread: Thread? = null
+    @Volatile
+    private var peerCheckUnavailableLogged: Boolean = false
 
     private val pool = Executors.newCachedThreadPool { r ->
         Thread(r, "proxy-relay-worker").apply { isDaemon = true }
@@ -59,6 +136,14 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
 
     val port: Int
         get() = boundPort
+
+    /**
+     * Loopback address the listener is bound to. Random within 127/8 rather
+     * than 127.0.0.1, so finding the relay costs an attacker the address as
+     * well as the port. Handed to `ProxyController` with [port].
+     */
+    val host: String
+        get() = boundHost
 
     @Synchronized
     fun isRunning(): Boolean = serverSocket?.isClosed == false
@@ -73,27 +158,105 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
      */
     @Synchronized
     fun start(cfg: UpstreamConfig): Int {
-        if (isRunning() && cfg == config) {
+        if (isRunning() && cfg == config && routerRealm == null) {
             return boundPort
         }
         stop()
-        val socket = ServerSocket()
-        socket.reuseAddress = true
-        // Pin to IPv4 loopback (127.0.0.1) explicitly. InetAddress
-        // .getLoopbackAddress() can return ::1 on dual-stack JVMs, which
-        // is unreachable from the http://127.0.0.1:<port> rule we hand to
-        // ProxyController — Chromium gets ERR_PROXY_CONNECTION_FAILED
-        // without ever opening a TCP connection to our listener.
-        val bindAddr = InetAddress.getByName("127.0.0.1")
-        socket.bind(InetSocketAddress(bindAddr, 0), BACKLOG)
+        // Always IPv4: InetAddress.getLoopbackAddress() can return ::1 on a
+        // dual-stack JVM, which is unreachable from the http://<ip>:<port> rule
+        // handed to ProxyController — Chromium gets ERR_PROXY_CONNECTION_FAILED
+        // without ever opening a TCP connection to the listener.
+        //
+        // Within that, a random 127/8 address rather than 127.0.0.1. The peer
+        // check below cannot reject anything from API 29 (see the class doc), so
+        // on a modern device the only thing between a local app and the user's
+        // proxy credentials is the difficulty of finding this listener. A port
+        // alone is ~15 bits and scannable in seconds; an address drawn from
+        // 127/8 adds ~24 more and is not. The whole of 127/8 routes to lo, and a
+        // connection to the same port on a different 127/8 address is refused,
+        // so the address is real entropy rather than an alias.
+        val socket = bindLoopback(randomLoopbackHost())
+            // A device that will not route the random address falls back rather
+            // than losing proxying: `selfConnects` proves reachability from this
+            // process, and WebView's network stack shares it.
+            ?: bindLoopback(LOOPBACK)
+            ?: throw IllegalStateException("could not bind a loopback listener")
         serverSocket = socket
         config = cfg
+        boundHost = (socket.inetAddress?.hostAddress) ?: LOOPBACK
         boundPort = socket.localPort
         val t = Thread({ acceptLoop(socket) }, "proxy-relay-accept").apply { isDaemon = true }
         acceptThread = t
         t.start()
-        log("started on ${bindAddr.hostAddress}:$boundPort (upstream type=${cfg.type})")
+        log("started on $boundHost:$boundPort (upstream type=${cfg.type})")
         return boundPort
+    }
+
+    /**
+     * Start (or reconfigure) the relay in router mode, fronting every
+     * site's upstream at once. Returns the loopback port; [host] names the
+     * address it bound.
+     *
+     * Every connection MUST present a `Proxy-Authorization` credential
+     * that [setRoutes] maps to an upstream: a connection without one gets
+     * a 407 naming [realm], and one bearing an unknown credential gets a
+     * 502. Nothing is ever routed without a match and there is no default
+     * upstream, so another app on the device cannot borrow the user's
+     * proxy by connecting to this port even where the peer check cannot
+     * see who is calling.
+     */
+    @Synchronized
+    fun startRouter(realm: String): Int {
+        require(realm.isNotEmpty() && realm.all { it in REALM_ALPHABET }) {
+            "realm must be a non-empty hex nonce"
+        }
+        if (isRunning() && routerRealm == realm) {
+            return boundPort
+        }
+        stop()
+        val socket = bindLoopback(randomLoopbackHost())
+            ?: bindLoopback(LOOPBACK)
+            ?: throw IllegalStateException("could not bind a loopback listener")
+        serverSocket = socket
+        routerRealm = realm
+        boundHost = (socket.inetAddress?.hostAddress) ?: LOOPBACK
+        boundPort = socket.localPort
+        startAcceptLoop(socket)
+        log("started on $boundHost:$boundPort (router mode)")
+        return boundPort
+    }
+
+    /**
+     * Replace the route table. Keys are the base64 `user:pass` credential
+     * a WebView presents; the relay never decodes them, so a token is only
+     * ever compared, never parsed or logged.
+     */
+    @Synchronized
+    fun setRoutes(newRoutes: Map<String, Route>) {
+        routes = java.util.Collections.unmodifiableMap(LinkedHashMap(newRoutes))
+        log("routes updated (${routes.size} site(s): ${routes.values.map { it.siteId }})")
+    }
+
+    @Synchronized
+    private fun recordProbe(nonce: String, siteId: String) {
+        probes = java.util.Collections.unmodifiableMap(LinkedHashMap(probes).apply {
+            put(nonce, siteId)
+        })
+    }
+
+    /** Probe pairs observed so far: nonce -> the siteId that presented it. */
+    @Synchronized
+    fun probeObservations(): Map<String, String> = probes
+
+    @Synchronized
+    fun clearProbeObservations() {
+        probes = emptyMap()
+    }
+
+    private fun startAcceptLoop(socket: ServerSocket) {
+        val t = Thread({ acceptLoop(socket) }, "proxy-relay-accept").apply { isDaemon = true }
+        acceptThread = t
+        t.start()
     }
 
     @Synchronized
@@ -101,8 +264,65 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
         serverSocket?.let { runCatching { it.close() } }
         serverSocket = null
         config = null
+        routerRealm = null
+        routes = emptyMap()
+        probes = emptyMap()
         boundPort = -1
+        boundHost = LOOPBACK
         acceptThread = null
+    }
+
+    /**
+     * Bind a listener on [ip], returning null when the address will not serve
+     * this device — either the bind itself fails, or the socket is bound but
+     * unreachable. Reachability is proven by connecting to it from this
+     * process, which is where WebView's network stack lives too.
+     */
+    private fun bindLoopback(ip: String): ServerSocket? {
+        val socket = ServerSocket()
+        return try {
+            socket.reuseAddress = true
+            socket.bind(InetSocketAddress(InetAddress.getByName(ip), 0), BACKLOG)
+            if (!selfConnects(socket)) {
+                log("loopback address $ip bound but unreachable; falling back")
+                runCatching { socket.close() }
+                null
+            } else {
+                socket
+            }
+        } catch (e: Exception) {
+            log("could not bind $ip: ${e.javaClass.simpleName}")
+            runCatching { socket.close() }
+            null
+        }
+    }
+
+    private fun selfConnects(socket: ServerSocket): Boolean {
+        val addr = InetSocketAddress(socket.inetAddress, socket.localPort)
+        // Off the caller's thread, always. `start`/`startRouter` are reached
+        // from the method channel, which Flutter dispatches on the Android
+        // main thread, and a connect() there throws
+        // NetworkOnMainThreadException. Caught below it reads as "this
+        // address does not serve the device", so every candidate fails, the
+        // 127.0.0.1 fallback fails with it, and the relay never binds at all.
+        // Binding is permitted on the main thread; only the probe is not.
+        val reached = java.util.concurrent.atomic.AtomicBoolean(false)
+        val probe = Thread({
+            try {
+                Socket().use { p ->
+                    p.connect(addr, SELF_TEST_TIMEOUT_MS)
+                    // The accept loop is not running yet, but the kernel
+                    // completes the handshake from the backlog, which is all
+                    // this proves.
+                    reached.set(true)
+                }
+            } catch (e: Exception) {
+                reached.set(false)
+            }
+        }, "proxy-relay-self-test").apply { isDaemon = true }
+        probe.start()
+        probe.join(SELF_TEST_TIMEOUT_MS + SELF_TEST_JOIN_SLACK_MS)
+        return reached.get()
     }
 
     private fun acceptLoop(socket: ServerSocket) {
@@ -117,15 +337,18 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
                 }
                 break
             }
-            val cfg = config
-            if (cfg == null) {
+            if (config == null && routerRealm == null) {
+                runCatching { client.close() }
+                continue
+            }
+            if (!peerAllowed(client.port)) {
                 runCatching { client.close() }
                 continue
             }
             log("accepted connection from ${client.inetAddress.hostAddress}:${client.port}")
             pool.execute {
                 try {
-                    handle(client, cfg)
+                    handle(client)
                 } catch (e: Exception) {
                     log("client handling failed: ${e.javaClass.simpleName}")
                 } finally {
@@ -135,7 +358,30 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
         }
     }
 
-    private fun handle(client: Socket, cfg: UpstreamConfig) {
+    /**
+     * Gate an accepted connection on the peer being one of our own sockets.
+     * An unverifiable verdict is logged once per relay, not per connection.
+     */
+    private fun peerAllowed(peerPort: Int): Boolean {
+        val check: (Int, Int) -> PeerVerdict =
+            peerCheck ?: { p, r -> readPeerVerdict(p, r, ownUid) }
+        return when (check(peerPort, boundPort)) {
+            PeerVerdict.OWN -> true
+            PeerVerdict.FOREIGN -> {
+                log("refused connection from another process (peer port $peerPort)")
+                false
+            }
+            PeerVerdict.UNKNOWN -> {
+                if (!peerCheckUnavailableLogged) {
+                    peerCheckUnavailableLogged = true
+                    log("peer ownership unverifiable (/proc/net/tcp unreadable); accepting local connections")
+                }
+                true
+            }
+        }
+    }
+
+    private fun handle(client: Socket) {
         client.soTimeout = HANDSHAKE_TIMEOUT_MS
         val cin = client.getInputStream()
         val cout = client.getOutputStream()
@@ -148,6 +394,8 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
             writeStatus(cout, 400, "Bad Request")
             return
         }
+        val route = resolveUpstream(headers, cout) ?: return
+        val cfg = route.upstream
         val method = parts[0].uppercase()
         val target = parts[1]
         val isConnect = method == "CONNECT"
@@ -168,9 +416,25 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
             return
         }
 
+        // Attribution self-test (PROXY-015). A probe host is answered here
+        // and NEVER forwarded: no upstream is contacted, so a probe cannot
+        // egress anywhere even if the site's proxy is broken or the route
+        // table is wrong. What it records is the pair the app needs --
+        // which credential arrived carrying which nonce -- so the app can
+        // prove, on THIS device and THIS WebView, that each container
+        // presents its own credential rather than replaying a sibling's.
+        if (host.endsWith(PROBE_SUFFIX)) {
+            val nonce = host.removeSuffix(PROBE_SUFFIX)
+            recordProbe(nonce, route.siteId)
+            log("probe ${route.siteId} (answered locally, no upstream)")
+            writeStatus(cout, 200, "OK")
+            return
+        }
+
         log("upstream connecting via ${cfg.type} ${cfg.host}:${cfg.port} for ${if (isConnect) "CONNECT" else method} $host:$hostPort")
         val upstream: Socket = try {
             when (cfg.type) {
+                UpstreamType.DIRECT -> openDirect(host, hostPort)
                 UpstreamType.SOCKS5 -> openViaSocks5(cfg, host, hostPort)
                 UpstreamType.HTTP, UpstreamType.HTTPS ->
                     openViaHttpProxy(cfg, host, hostPort, isConnect)
@@ -193,7 +457,7 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
                 // the upstream, then splice. SOCKS gives an origin tunnel
                 // (origin-form path, no proxy auth header); an HTTP proxy
                 // wants the absolute-form line plus Proxy-Authorization.
-                val rewritten = if (cfg.type == UpstreamType.SOCKS5) {
+                val rewritten = if (cfg.type != UpstreamType.HTTP && cfg.type != UpstreamType.HTTPS) {
                     rewriteForOriginTunnel(requestLine, target, headers)
                 } else {
                     rewriteForHttpProxy(requestLine, headers, cfg)
@@ -208,6 +472,12 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
         } finally {
             runCatching { upstream.close() }
         }
+    }
+
+    private fun openDirect(host: String, port: Int): Socket {
+        val s = Socket()
+        s.connect(InetSocketAddress(host, port), CONNECT_TIMEOUT_MS)
+        return s
     }
 
     // --- Upstream: SOCKS5 (with optional RFC 1929 username/password) ---
@@ -284,31 +554,60 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
     // --- Upstream: HTTP / HTTPS proxy ---
 
     private fun openViaHttpProxy(cfg: UpstreamConfig, host: String, port: Int, isConnect: Boolean): Socket {
-        var s = Socket()
-        s.connect(InetSocketAddress(cfg.host, cfg.port), CONNECT_TIMEOUT_MS)
-        s.soTimeout = HANDSHAKE_TIMEOUT_MS
-        if (cfg.type == UpstreamType.HTTPS) {
-            s = (SSLSocketFactory.getDefault() as SSLSocketFactory)
-                .createSocket(s, cfg.host, cfg.port, true)
-        }
-        if (isConnect) {
-            // Establish the CONNECT tunnel through the upstream proxy.
-            val authority = "$host:$port"
-            val sb = StringBuilder()
-            sb.append("CONNECT ").append(authority).append(" HTTP/1.1\r\n")
-            sb.append("Host: ").append(authority).append("\r\n")
-            credentialHeader(cfg)?.let { sb.append(it).append("\r\n") }
-            sb.append("\r\n")
-            s.getOutputStream().write(sb.toString().toByteArray(Charsets.ISO_8859_1))
-            s.getOutputStream().flush()
-            val resp = readPreamble(s.getInputStream())
-                ?: throw IllegalStateException("no CONNECT response")
-            val code = resp.first.split(" ").getOrNull(1)?.toIntOrNull() ?: 0
-            if (code != 200) throw IllegalStateException("CONNECT rejected: ${resp.first}")
+        val raw = Socket()
+        raw.connect(InetSocketAddress(cfg.host, cfg.port), CONNECT_TIMEOUT_MS)
+        raw.soTimeout = HANDSHAKE_TIMEOUT_MS
+        var s: Socket = raw
+        try {
+            if (cfg.type == UpstreamType.HTTPS) {
+                s = startTls(raw, cfg)
+            }
+            if (isConnect) {
+                // Establish the CONNECT tunnel through the upstream proxy.
+                val authority = "$host:$port"
+                val sb = StringBuilder()
+                sb.append("CONNECT ").append(authority).append(" HTTP/1.1\r\n")
+                sb.append("Host: ").append(authority).append("\r\n")
+                credentialHeader(cfg)?.let { sb.append(it).append("\r\n") }
+                sb.append("\r\n")
+                s.getOutputStream().write(sb.toString().toByteArray(Charsets.ISO_8859_1))
+                s.getOutputStream().flush()
+                val resp = readPreamble(s.getInputStream())
+                    ?: throw IllegalStateException("no CONNECT response")
+                val code = resp.first.split(" ").getOrNull(1)?.toIntOrNull() ?: 0
+                if (code != 200) throw IllegalStateException("CONNECT rejected: ${resp.first}")
+            }
+        } catch (e: Exception) {
+            runCatching { s.close() }
+            runCatching { raw.close() }
+            throw e
         }
         // Forward (absolute-form) mode replays its rewritten preamble in
         // handle(); nothing more to do here.
         return s
+    }
+
+    /**
+     * Wrap [raw] in TLS to the configured upstream, with hostname
+     * verification.
+     *
+     * An `SSLSocket` straight off the factory validates the certificate
+     * chain but performs NO hostname check — the endpoint-identification
+     * algorithm has to be asked for explicitly. Without it any host that
+     * can present a valid publicly-trusted certificate for a name it owns
+     * completes this handshake and receives the `Proxy-Authorization`
+     * header (and every `CONNECT` target) written immediately afterwards.
+     * Handshaking here rather than lazily on first write keeps that
+     * failure inside the caller's fail-closed path.
+     */
+    private fun startTls(raw: Socket, cfg: UpstreamConfig): SSLSocket {
+        val ssl = (SSLSocketFactory.getDefault() as SSLSocketFactory)
+            .createSocket(raw, cfg.host, cfg.port, true) as SSLSocket
+        ssl.sslParameters = ssl.sslParameters.apply {
+            endpointIdentificationAlgorithm = "HTTPS"
+        }
+        ssl.startHandshake()
+        return ssl
     }
 
     private fun credentialHeader(cfg: UpstreamConfig): String? {
@@ -406,6 +705,66 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
         }
     }
 
+    /**
+     * Pick the upstream for one connection, or answer the client and
+     * return null.
+     *
+     * Router mode is fail-closed by construction: there is no default
+     * upstream to fall back to, so a caller that cannot present a known
+     * credential is answered and dropped rather than routed anywhere. A
+     * missing credential is a 407 (the WebView will re-issue the request
+     * with one); a credential we do not recognise is a 502, not a second
+     * challenge, so a caller that is guessing cannot be walked around the
+     * loop indefinitely.
+     */
+    private fun resolveUpstream(headers: List<String>, cout: OutputStream): Route? {
+        val realm = routerRealm
+            ?: return config?.let { Route(LEGACY_SITE_ID, it) }
+                ?: run { writeStatus(cout, 502, "Bad Gateway"); null }
+        val credential = proxyAuthCredential(headers)
+        if (credential == null) {
+            writeChallenge(cout, realm)
+            return null
+        }
+        val route = routes[credential]
+        if (route == null) {
+            log("rejecting connection bearing an unknown proxy credential")
+            writeStatus(cout, 502, "Bad Gateway")
+            return null
+        }
+        log("routing site ${route.siteId}")
+        return route
+    }
+
+    /**
+     * The base64 blob of a `Proxy-Authorization: Basic <blob>` header, or
+     * null. Never decoded: the blob is the map key, so a credential is
+     * only ever compared, and it cannot reach a log line by accident.
+     */
+    private fun proxyAuthCredential(headers: List<String>): String? {
+        for (h in headers) {
+            if (!h.startsWith("Proxy-Authorization:", true)) continue
+            val value = h.substringAfter(':').trim()
+            if (!value.startsWith("Basic ", true)) continue
+            return value.substring(6).trim().takeIf { it.isNotEmpty() }
+        }
+        return null
+    }
+
+    private fun writeChallenge(out: OutputStream, realm: String) {
+        runCatching {
+            out.write(
+                (
+                    "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+                        "Proxy-Authenticate: Basic realm=\"$realm\"\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "Connection: close\r\n\r\n"
+                    ).toByteArray(Charsets.ISO_8859_1)
+            )
+            out.flush()
+        }
+    }
+
     private fun writeStatus(out: OutputStream, code: Int, reason: String) {
         runCatching {
             out.write("HTTP/1.1 $code $reason\r\nConnection: close\r\n\r\n".toByteArray(Charsets.ISO_8859_1))
@@ -428,9 +787,100 @@ class ProxyRelay(private val logger: ((String) -> Unit)? = null) {
 
     companion object {
         private const val BACKLOG = 64
+        private const val LOOPBACK = "127.0.0.1"
+        private const val SELF_TEST_TIMEOUT_MS = 2_000
+
+        /** Headroom over the connect timeout when joining the probe thread. */
+        private const val SELF_TEST_JOIN_SLACK_MS = 500L
+
+        /**
+         * A random address in 127/8, avoiding 127.0.0.1 itself and the .0/.255
+         * last octets. Drawn from [java.security.SecureRandom] so it is not
+         * predictable from the process's timing.
+         */
+        private fun randomLoopbackHost(): String {
+            val rnd = java.security.SecureRandom()
+            val b = rnd.nextInt(256)
+            val c = rnd.nextInt(256)
+            val d = 1 + rnd.nextInt(254)
+            return if (b == 0 && c == 0 && d == 1) "127.0.0.2" else "127.$b.$c.$d"
+        }
+
+        private val PROC_NET_TCP = listOf("/proc/net/tcp", "/proc/net/tcp6")
+
+        private fun readPeerVerdict(peerPort: Int, relayPort: Int, ownUid: Int?): PeerVerdict =
+            peerVerdict(
+                PROC_NET_TCP.map { path -> runCatching { File(path).readText() }.getOrNull() },
+                peerPort,
+                relayPort,
+                ownUid,
+            )
+
+        /**
+         * Classify a peer against the contents of `/proc/net/{tcp,tcp6}`.
+         *
+         * A connection to the relay shows up as a row whose local port is the
+         * peer's and whose remote port is the relay's. Rows are
+         * `sl local_address rem_address st tx:rx tr:when retrnsmt uid ...` with
+         * `hex-ip:hex-port` addresses, so the owning UID is field 7.
+         *
+         * **The port pair alone proves nothing.** It is the row that *any*
+         * connection to the relay creates, ours or another app's, so matching on
+         * it and stopping there classifies every caller as OWN. [ownUid] is what
+         * actually discriminates: on a table that lists the whole namespace, a
+         * row owned by another UID is another app. When it is null, or the row
+         * carries no parsable UID, the check degrades to the port pair and
+         * cannot reject anything — which is the honest answer, not a pass.
+         *
+         * Split out for a JVM test, which cannot arrange a foreign process to
+         * connect.
+         */
+        fun peerVerdict(
+            tables: List<String?>,
+            peerPort: Int,
+            relayPort: Int,
+            ownUid: Int? = null,
+        ): PeerVerdict {
+            var readable = false
+            for (table in tables) {
+                if (table == null) continue
+                readable = true
+                for (line in table.lineSequence()) {
+                    val fields = line.trim().split(WHITESPACE)
+                    if (fields.size < 3) continue
+                    val local = hexPort(fields[1]) ?: continue
+                    val remote = hexPort(fields[2]) ?: continue
+                    if (local != peerPort || remote != relayPort) continue
+                    val uid = fields.getOrNull(7)?.toIntOrNull()
+                    if (ownUid == null || uid == null) return PeerVerdict.OWN
+                    if (uid == ownUid) return PeerVerdict.OWN
+                }
+            }
+            // Readable, and either no row for this peer or one owned by
+            // somebody else. Both are foreign.
+            return if (readable) PeerVerdict.FOREIGN else PeerVerdict.UNKNOWN
+        }
+
+        private val WHITESPACE = Regex("\\s+")
+
+        private fun hexPort(address: String): Int? {
+            val sep = address.lastIndexOf(':')
+            if (sep < 0) return null
+            return address.substring(sep + 1).toIntOrNull(16)
+        }
+
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val HANDSHAKE_TIMEOUT_MS = 20_000
         private const val MAX_PREAMBLE = 64 * 1024
+        private val REALM_ALPHABET = ('a'..'f') + ('0'..'9')
+
+        // RFC 2606 reserved TLD: a probe host can never resolve, so even
+        // a bug that forwarded one could not reach a real server.
+        const val PROBE_SUFFIX = ".webspace-probe.invalid"
+
+        // Stand-in siteId for single-upstream (non-router) mode, where
+        // there is exactly one route and no attribution to make.
+        const val LEGACY_SITE_ID = "-"
 
         private const val B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 

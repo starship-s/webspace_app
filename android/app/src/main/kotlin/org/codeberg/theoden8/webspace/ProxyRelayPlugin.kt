@@ -2,7 +2,7 @@ package org.codeberg.theoden8.webspace
 
 import android.os.Handler
 import android.os.Looper
-import android.util.Log
+import android.os.Process
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import org.codeberg.theoden8.webspace.proxy.ProxyRelay
@@ -27,12 +27,18 @@ class ProxyRelayPlugin(flutterEngine: FlutterEngine) {
     // in-app Logs tab next to the proxy-apply events — critical for the
     // container-reach diagnostic (zero accepted connections during a
     // proxied page load = ProxyController not reaching the container).
-    private val relay = ProxyRelay { msg ->
-        Log.i(TAG, msg)
-        mainHandler.post {
-            runCatching { channel.invokeMethod("logEvent", mapOf("msg" to msg)) }
-        }
-    }
+    // Dart files these as sensitive (memory-only, never printed): they name
+    // sites and every proxied destination host, so they must not reach logcat.
+    // `logger` by name, not as a trailing lambda: ProxyRelay takes a second
+    // optional parameter, so a trailing lambda binds to whichever one is last.
+    private val relay = ProxyRelay(
+        logger = { msg ->
+            mainHandler.post {
+                runCatching { channel.invokeMethod("logEvent", mapOf("msg" to msg)) }
+            }
+        },
+        ownUid = Process.myUid(),
+    )
 
     init {
         channel.setMethodCallHandler { call, result ->
@@ -45,14 +51,10 @@ class ProxyRelayPlugin(flutterEngine: FlutterEngine) {
                         result.error("INVALID_ARGS", "type, host and port are required", null)
                         return@setMethodCallHandler
                     }
-                    val type = when (typeStr.lowercase()) {
-                        "http" -> ProxyRelay.UpstreamType.HTTP
-                        "https" -> ProxyRelay.UpstreamType.HTTPS
-                        "socks5" -> ProxyRelay.UpstreamType.SOCKS5
-                        else -> {
-                            result.error("INVALID_TYPE", "unsupported upstream type: $typeStr", null)
-                            return@setMethodCallHandler
-                        }
+                    val type = parseType(typeStr)
+                    if (type == null) {
+                        result.error("INVALID_TYPE", "unsupported upstream type: $typeStr", null)
+                        return@setMethodCallHandler
                     }
                     try {
                         val localPort = relay.start(
@@ -64,13 +66,55 @@ class ProxyRelayPlugin(flutterEngine: FlutterEngine) {
                                 password = call.argument<String>("password"),
                             )
                         )
-                        result.success(localPort)
+                        // Host as well as port: the listener binds a random
+                        // 127/8 address, so 127.0.0.1 is the wrong target.
+                        result.success(mapOf("host" to relay.host, "port" to localPort))
                     } catch (e: Exception) {
                         // Bind failure: report it so Dart can fail closed
                         // rather than clearing the override (which would
                         // leak a direct connection).
                         result.error("RELAY_START_FAILED", e.message, null)
                     }
+                }
+                "startRouter" -> {
+                    val realm = call.argument<String>("realm")
+                    if (realm == null) {
+                        result.error("INVALID_ARGS", "realm is required", null)
+                        return@setMethodCallHandler
+                    }
+                    try {
+                        val localPort = relay.startRouter(realm)
+                        result.success(mapOf("host" to relay.host, "port" to localPort))
+                    } catch (e: Exception) {
+                        result.error("RELAY_START_FAILED", e.message, null)
+                    }
+                }
+                "setRoutes" -> {
+                    val raw = call.argument<Map<String, Map<String, Any?>>>("routes")
+                    if (raw == null) {
+                        result.error("INVALID_ARGS", "routes is required", null)
+                        return@setMethodCallHandler
+                    }
+                    val parsed = LinkedHashMap<String, ProxyRelay.Route>(raw.size)
+                    for ((credential, entry) in raw) {
+                        val route = parseRoute(entry)
+                        if (route == null) {
+                            // Fail closed on the whole table rather than
+                            // installing a partial one: a site silently
+                            // missing its route would be answered 502, but a
+                            // site silently mis-parsed could be routed wrong.
+                            result.error("INVALID_ROUTE", "malformed route entry", null)
+                            return@setMethodCallHandler
+                        }
+                        parsed[credential] = route
+                    }
+                    relay.setRoutes(parsed)
+                    result.success(true)
+                }
+                "probeResults" -> result.success(relay.probeObservations())
+                "clearProbeResults" -> {
+                    relay.clearProbeObservations()
+                    result.success(true)
                 }
                 "stop" -> {
                     relay.stop()
@@ -87,8 +131,36 @@ class ProxyRelayPlugin(flutterEngine: FlutterEngine) {
         channel.setMethodCallHandler(null)
     }
 
+    private fun parseType(name: String): ProxyRelay.UpstreamType? =
+        when (name.lowercase()) {
+            "http" -> ProxyRelay.UpstreamType.HTTP
+            "https" -> ProxyRelay.UpstreamType.HTTPS
+            "socks5" -> ProxyRelay.UpstreamType.SOCKS5
+            "direct" -> ProxyRelay.UpstreamType.DIRECT
+            else -> null
+        }
+
+    private fun parseRoute(entry: Map<String, Any?>): ProxyRelay.Route? {
+        val siteId = entry["siteId"] as? String ?: return null
+        val type = parseType(entry["type"] as? String ?: return null) ?: return null
+        val host = entry["host"] as? String ?: return null
+        val port = entry["port"] as? Int ?: return null
+        if (type != ProxyRelay.UpstreamType.DIRECT && (host.isEmpty() || port !in 1..65535)) {
+            return null
+        }
+        return ProxyRelay.Route(
+            siteId = siteId,
+            upstream = ProxyRelay.UpstreamConfig(
+                type = type,
+                host = host,
+                port = port,
+                username = entry["username"] as? String,
+                password = entry["password"] as? String,
+            ),
+        )
+    }
+
     companion object {
-        private const val TAG = "ProxyRelayPlugin"
         const val CHANNEL = "org.codeberg.theoden8.webspace/proxy_relay"
     }
 }

@@ -2,8 +2,18 @@ import 'dart:convert';
 import 'package:webspace/platform/host_platform.dart';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/scheduler.dart' show SchedulerBinding;
+import 'dart:ui' show AppLifecycleState;
+import 'package:flutter/services.dart' show PlatformException;
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import 'package:webspace/services/background_log.dart';
 import 'package:webspace/services/log_service.dart';
+import 'package:webspace/utils/concurrency.dart';
+
+/// Who asked for a notification, for the background log: a page through the
+/// polyfill, the background wake on a silent site's behalf (NOTIF-014), or the
+/// developer-tools test button.
+enum NotificationOrigin { page, unreadFallback, test }
 
 /// The OS-side identity of one posted notification. Android collapses on the
 /// `(tag, id)` pair and iOS/macOS on the identifier, so this pair decides
@@ -46,8 +56,18 @@ class NotificationService {
   int _sequence = DateTime.now().microsecondsSinceEpoch;
 
   final _plugin = FlutterLocalNotificationsPlugin();
+
+  final Map<String, DateTime> _lastPostedAt = {};
+
+  /// When [siteId] last had a notification posted, this process. A
+  /// background wake reads it to tell a site that notified on its own from
+  /// one that stayed silent (NOTIF-014).
+  DateTime? lastPostedAt(String siteId) => _lastPostedAt[siteId];
+
+  /// Called with the siteId after each notification is shown.
+  void Function(String siteId)? onPosted;
   bool _initialized = false;
-  Future<void>? _initInFlight;
+  final SingleFlight<(), void> _init = SingleFlight();
   void Function(String siteId)? onNotificationTapped;
 
   /// Listeners are invoked whenever [permissionGranted] changes (e.g.
@@ -72,21 +92,16 @@ class NotificationService {
 
   void _notifyPermissionListeners() {
     for (final cb in List<VoidCallback>.from(_permissionListeners)) {
-      try {
-        cb();
-      } catch (_) {
-        // Listeners are UI refreshers; never let one throw take down others.
-      }
+      cb();
     }
   }
 
   Future<void> init() {
     if (_initialized) return Future.value();
-    // Memoize the in-flight future so a concurrent caller (e.g. a page's
-    // webNotification handler racing startup) awaits real completion instead
-    // of seeing _initialized flip early and calling _plugin.show() before
-    // _plugin.initialize() has run.
-    return _initInFlight ??= _doInit();
+    // Shared so a concurrent caller (a page's webNotification handler racing
+    // startup) awaits real completion instead of calling _plugin.show()
+    // before _plugin.initialize() has run.
+    return _init.run((), call: _doInit);
   }
 
   Future<void> _doInit() async {
@@ -131,31 +146,118 @@ class NotificationService {
     }
 
     _initialized = true;
-    _initInFlight = null;
-    LogService.instance.log('Notification', 'NotificationService initialized');
+    LogTag.notification.debug('NotificationService initialized');
   }
 
   void _onTap(NotificationResponse response) {
-    if (response.payload == null) return;
-    try {
-      final data = jsonDecode(response.payload!);
-      final siteId = data['siteId'] as String?;
-      if (siteId != null) {
-        LogService.instance.log(
-          'Notification',
-          'Tapped notification for siteId: $siteId',
-          sensitivity: LogSensitivity.sensitive,
-        );
-        onNotificationTapped?.call(siteId);
-      }
-    } catch (e) {
-      LogService.instance.log('Notification', 'Failed to parse tap payload: $e', level: LogLevel.error);
-    }
+    final siteId = siteIdOfPayload(response.payload);
+    if (siteId == null) return;
+    LogTag.notification.debug(
+        'Tapped notification for siteId: $siteId', sensitive: true);
+    onNotificationTapped?.call(siteId);
   }
+
+  /// The site a posted notification belongs to, from the payload [show]
+  /// wrote; null for anything else.
+  @visibleForTesting
+  static String? siteIdOfPayload(String? payload) {
+    if (payload == null) return null;
+    final Object? data;
+    try {
+      data = jsonDecode(payload);
+    } on FormatException catch (e) {
+      LogTag.notification.error('Failed to parse tap payload: $e');
+      return null;
+    }
+    return data is Map && data['siteId'] is String
+        ? data['siteId'] as String
+        : null;
+  }
+
+  /// The site whose notification the user tapped to start this process.
+  /// [onNotificationTapped] only hears taps while the app runs: a tap that
+  /// launches it reaches no callback on Android, and on iOS one that lands
+  /// before [init] is held back the same way, so a cold start reads it here.
+  Future<String?> launchSiteId() async {
+    await init();
+    // Only these report what launched the app; Linux's implementation throws
+    // UnimplementedError for the call.
+    final platform = FlutterLocalNotificationsPlatform.instance;
+    if (platform is! AndroidFlutterLocalNotificationsPlugin &&
+        platform is! IOSFlutterLocalNotificationsPlugin &&
+        platform is! MacOSFlutterLocalNotificationsPlugin) {
+      return null;
+    }
+    final NotificationAppLaunchDetails? details;
+    try {
+      details = await _plugin.getNotificationAppLaunchDetails();
+    } on PlatformException catch (e) {
+      LogTag.notification.error('Failed to read launch details: $e');
+      return null;
+    }
+    if (details == null || !details.didNotificationLaunchApp) return null;
+    return siteIdOfPayload(details.notificationResponse?.payload);
+  }
+
+  /// A prompt needs the app on screen, and on Android the plugin asks through
+  /// the activity, which an engine started for a background wake does not
+  /// have (NOTIF-016): there the request throws. Off screen the state is read,
+  /// never asked for.
+  @visibleForTesting
+  static bool mayPromptForPermission(AppLifecycleState? lifecycle) =>
+      lifecycle == AppLifecycleState.resumed;
 
   Future<void> _ensurePermission() async {
     if (_permissionGranted == true) return;
+    if (!mayPromptForPermission(SchedulerBinding.instance.lifecycleState)) {
+      await _readPermission();
+      return;
+    }
     await requestPermission();
+  }
+
+  /// The OS permission as it stands, read without prompting. Null where the
+  /// platform has no read or the read failed.
+  Future<bool?> osPermission() async {
+    if (!_initialized) await init();
+    try {
+      if (hostIsAndroid) {
+        return await _plugin
+            .resolvePlatformSpecificImplementation<
+                AndroidFlutterLocalNotificationsPlugin>()
+            ?.areNotificationsEnabled();
+      } else if (hostIsIOS) {
+        return (await _plugin
+                .resolvePlatformSpecificImplementation<
+                    IOSFlutterLocalNotificationsPlugin>()
+                ?.checkPermissions())
+            ?.isEnabled;
+      } else if (hostIsMacOS) {
+        return (await _plugin
+                .resolvePlatformSpecificImplementation<
+                    MacOSFlutterLocalNotificationsPlugin>()
+                ?.checkPermissions())
+            ?.isEnabled;
+      }
+    } on PlatformException catch (e) {
+      BackgroundLog.instance.record(
+        LogTag.notification,
+        message: 'OS permission could not be read: ${e.code}',
+        level: LogLevel.warning,
+      );
+    }
+    return null;
+  }
+
+  Future<void> _readPermission() async {
+    final value = await osPermission() ?? false;
+    final changed = _permissionGranted != value;
+    _permissionGranted = value;
+    BackgroundLog.instance.record(
+        LogTag.notification, message: 'OS permission read off screen: '
+            '${value ? "granted" : "not granted"}',
+        level: value ? LogLevel.info : LogLevel.warning);
+    if (changed) _notifyPermissionListeners();
   }
 
   Future<void> show({
@@ -164,15 +266,18 @@ class NotificationService {
     String body = '',
     String? tag,
     String? siteUrl,
+    NotificationOrigin origin = NotificationOrigin.page,
   }) async {
     if (!_initialized) await init();
     await _ensurePermission();
+    final app = SchedulerBinding.instance.lifecycleState?.name ?? 'unknown';
     if (_permissionGranted != true) {
-      LogService.instance.log(
-        'Notification',
-        'Skipped "$title" — OS notification permission denied',
+      BackgroundLog.instance.record(
+        LogTag.notification,
+        message: 'notification dropped (${origin.name}, app $app): '
+            'OS notification permission denied',
         level: LogLevel.warning,
-        sensitivity: LogSensitivity.sensitive,
+        sensitive: 'Skipped "$title" for siteId $siteId',
       );
       return;
     }
@@ -206,11 +311,24 @@ class NotificationService {
 
     final payload = jsonEncode({'siteId': siteId});
 
-    await _plugin.show(id: target.id, title: title, body: body.isNotEmpty ? body : null, notificationDetails: details, payload: payload);
-    LogService.instance.log(
-      'Notification',
-      'Showed notification: "$title" for siteId: $siteId',
-      sensitivity: LogSensitivity.sensitive,
+    try {
+      await _plugin.show(id: target.id, title: title, body: body.isNotEmpty ? body : null, notificationDetails: details, payload: payload);
+    } on PlatformException catch (e) {
+      BackgroundLog.instance.record(
+        LogTag.notification,
+        message: 'notification failed (${origin.name}, app $app): ${e.code}',
+        level: LogLevel.error,
+        sensitive: 'notification "$title" for siteId $siteId failed: ${e.message}',
+      );
+      rethrow;
+    }
+    _lastPostedAt[siteId] = DateTime.now();
+    onPosted?.call(siteId);
+    BackgroundLog.instance.record(
+      LogTag.notification,
+      message: 'notification posted (${origin.name}, '
+          '${tag == null || tag.isEmpty ? 'untagged' : 'tagged'}, app $app)',
+      sensitive: 'Showed notification: "$title" for siteId: $siteId',
     );
   }
 
@@ -237,8 +355,9 @@ class NotificationService {
     }
     final changed = _permissionGranted != granted;
     _permissionGranted = granted;
-    LogService.instance.log(
-        'Notification', 'OS permission: ${granted ? "granted" : "denied"}');
+    BackgroundLog.instance.record(LogTag.notification,
+        message: 'OS permission: ${granted ? "granted" : "denied"}',
+        level: granted ? LogLevel.info : LogLevel.warning);
     if (changed) _notifyPermissionListeners();
     return granted;
   }

@@ -2,6 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!-- EXPORT-001: same declaration, and the same basis, as
+	     ios/Runner/Info.plist, which carries the reasoning. Gated by
+	     scripts/check_export_compliance.sh before an upload. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<!-- Mac App Store validation rejects a bundle without it, and the Finder
+	     and Launchpad file the app under it. -->
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleExecutable</key>
@@ -30,6 +39,8 @@
 	<string>NSApplication</string>
 	<key>NSCameraUsageDescription</key>
 	<string>Used when you allow a website to use the camera (for example to scan a QR code in a banking web app). The camera feed is not stored or transmitted by the app.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Used only when you allow a specific website to use the microphone in that site's permission settings. Audio is delivered to that site's page and is not stored or transmitted by the app, and recording ends as soon as you switch away from the site.</string>
 	<!-- LIR-004: webspace://open?url=... entry point. macOS routes
 	     `open webspace://...` and Services-menu / launchctl URL invocations
 	     through application:openURLs:. -->

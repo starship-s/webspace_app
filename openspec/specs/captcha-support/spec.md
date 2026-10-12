@@ -102,22 +102,193 @@ The WebView MUST support third-party cookies when enabled per-site for captcha s
 
 ---
 
+### Requirement: CAPTCHA-007 - Captcha detection is scoped, never a substring of the whole URL
+
+A URL classified as a captcha challenge is allowed in place and may open a
+popup window, so the classifier decides how much of the navigation
+pipeline a URL skips. It SHALL parse the URL and decide on host and
+**path** only. The two Cloudflare markers (`/cdn-cgi/challenge-platform`,
+`cf-turnstile`) are served from the protected origin itself, so they stay
+host-agnostic but SHALL match `uri.path`; `challenges.cloudflare.com` /
+`hcaptcha.com` stay exact-domain, and `/recaptcha/` stays path-plus-domain.
+
+#### Scenario: An attacker-chosen query string is not a captcha
+
+**Given** a page links to `https://evil.example/x?cf-turnstile`
+**When** the URL is classified
+**Then** it is not a captcha challenge
+
+#### Scenario: A Cloudflare interstitial on the protected origin is a captcha
+
+**Given** a Cloudflare-fronted site serves
+`https://acme.example/cdn-cgi/challenge-platform/h/b/jsd/r/...`
+**When** the URL is classified
+**Then** it is a captcha challenge
+
+---
+
+### Requirement: CAPTCHA-008 - The captcha allow follows the navigation decision
+
+The captcha allow SHALL be applied **after** the navigation verdict, in
+**both** interception paths — a fix to one leaves the other open, since
+`onUrlChanged` catches exactly the server-side and script-driven
+navigations that `shouldOverrideUrlLoading` did not:
+
+- `shouldOverrideUrlLoading` — after `config.shouldOverrideUrlLoading`
+  (the nested-url-blocking engine, see
+  [nested-url-blocking](../nested-url-blocking/spec.md)) has returned.
+- `NavigationDecisionEngine.decideOnUrlChanged` — after the
+  no-gesture branch (NESTED-004).
+
+Taken first, a URL that merely looks like a captcha would skip
+the user-gesture requirement and cross-domain nested routing, and could navigate the parent webview to any origin — inside the
+site's own container, and committed as its persisted `currentUrl`.
+
+#### Scenario: A captcha-shaped URL still goes through the routing decision
+
+**Given** any site (every site blocks gesture-less cross-domain navigations)
+**And** a script-driven navigation to a cross-domain URL whose path
+contains a Cloudflare marker
+**When** `shouldOverrideUrlLoading` runs
+**Then** the navigation decision engine sees the URL
+**And** its verdict is honored before the captcha allow is considered
+
+#### Scenario: The onUrlChanged path enforces the same order
+
+**Given** a site with no recent gesture
+**When** `onUrlChanged` fires for
+`https://attacker.example/cdn-cgi/challenge-platform/x`
+**Then** `decideOnUrlChanged` returns `blockSilent`
+
+#### Scenario: A genuine interstitial is unaffected
+
+**Given** the same site
+**When** `onUrlChanged` fires for
+`https://site.example/cdn-cgi/challenge-platform/h/b/orchestrate`
+**Then** the same-domain check returns `allow` before the captcha branch is
+reached
+
+---
+
+### Requirement: CAPTCHA-009 - The popup inherits the requesting site's posture
+
+The captcha popup created for an `onCreateWindow` window id is the same
+site in a dialog. `createPopupWebView` SHALL build it from the requesting
+webview's `WebViewConfig`: the same `initialUserScripts` (and the Dart
+handlers they call), `userAgent`, `javaScriptEnabled`, `incognito`,
+`thirdPartyCookiesEnabled`, container binding and per-site proxy. With no
+recorded parent config, or with a per-site proxy the platform cannot
+honor, it SHALL render nothing rather than a webview with no posture.
+
+#### Scenario: Popup carries the site's shims and identity
+
+**Given** site "Acme" has tracking protection, a spoofed UA and a
+per-site container
+**When** a captcha flow on "Acme" opens a popup window
+**Then** the popup webview is bound to "Acme"'s container
+**And** it is injected with the same user scripts as "Acme"'s webview
+**And** it reports "Acme"'s user agent
+
+#### Scenario: Popup is not created without a posture to inherit
+
+**Given** `createPopupWebView` is called for a window id with no recorded
+parent config
+**When** the widget is built
+**Then** no webview is created
+
+### Requirement: CAPTCHA-010 - A challenge is claimed by the site, not by a path
+
+`isCaptchaChallenge` SHALL count the two host-agnostic Cloudflare path
+markers (`/cdn-cgi/challenge-platform`, `cf-turnstile`) only on the site's
+own domain (`siteUrl`, the requesting webview's `initialUrl`, or a subdomain
+either way): Cloudflare serves the interstitial from the protected origin
+itself, and any other origin naming the marker in a path is a claim, not a
+challenge. The known captcha hosts (`challenges.cloudflare.com`,
+`hcaptcha.com`, the reCAPTCHA domains) stay host-matched as before. Every
+caller SHALL pass `siteUrl`.
+
+The verification popup SHALL carry a `shouldOverrideUrlLoading` of its own
+(`useShouldOverrideUrlLoading: true`): every document passes the site's DNS
+blocklist and content-blocker document checks, a subframe is then allowed,
+and a main-frame navigation is allowed only to a captcha URL or the site's
+own domain; anything else is cancelled. Gated by
+`test/captcha_detection_test.dart` and `test/js/page_bridge_authority.test.js`.
+
+#### Scenario: Another origin puts the marker in its path
+
+**Given** site "Acme" and a page it embeds from `evil.example`
+**When** that page opens `https://evil.example/cf-turnstile/x`
+**Then** it is not a captcha challenge: no popup opens and the navigation is decided by the ordinary route
+
+#### Scenario: The popup cannot be steered away from the challenge
+
+**Given** the "Verification" popup is open for a Cloudflare challenge on "Acme"
+**When** script in it navigates the popup's top document to `https://attacker.example/`
+**Then** the navigation is cancelled
+**And** a navigation to `https://challenges.cloudflare.com/...` or back to `acme.example` proceeds
+
+---
+
 ## Known Limitations
 
-### Cloudflare Turnstile Cross-Origin Access
+Everything below is a *posture* limitation: the challenge loads and runs, and
+then withholds its token. The symptom is always the same indefinite
+"Verifying…", it never reaches an error handler, and no tier of this repo's
+tests can observe it — the verdict is a server-side judgement over a
+fingerprint. Lineage and open gaps:
+[docs/bugs/013-captcha-verification-stalls.md](../../../docs/bugs/013-captcha-verification-stalls.md).
 
-Some Cloudflare Turnstile implementations attempt **direct cross-origin frame access** which is blocked by the browser's Same-Origin Policy. This is a fundamental browser security feature that:
+### Reading the console line
 
-1. **Cannot be bypassed** via WebView settings
-2. **Affects all WebView-based browsers** (not just this app)
-3. **Is intentional** - preventing cross-origin frame access is a core security feature
+```
+Uncaught SecurityError: Failed to read the 'cookie' property from 'Document': Access is denied for this document.
+```
 
-**Error message:**
+This is **not** the cookie policy. Blocking third-party cookies, or all cookies,
+makes `document.cookie` return `""` and throw nothing at all; chromium words the
+sandbox and `data:` cases differently again. The quoted string is the branch for
+a document whose *origin* cannot hold cookies, so it points at how that document
+was created, not at a setting. The five branches are pinned under a real engine
+by `test/browser/document_cookie_denied.test.js`; on Android the app's own way
+into this branch is the `loadDataWithBaseURL` first paint behind
+`usesCachedHtml`.
+
+### Third-party cookies
+
+A challenge is a cross-site document the site embeds and waits on, so a
+third-party-cookie block applies to it: the challenge's own storage is dropped,
+silently, with nothing raised for the site or the app to notice.
+
+`thirdPartyCookiesEnabled` is `false` for a new site, and
+`effectiveThirdPartyCookiesEnabled` forces it `false` while Tracking Protection
+is on — so the setting that fixes this is both off by default and unreachable
+without turning ETP off for the site first. Chrome, Brave and Hermit all admit
+these cookies; Brave carries an explicit storage exception for Cloudflare
+challenge frames.
+
+**Workaround:** Tracking Protection off for the site, then Third-party cookies
+on.
+
+### Anti-fingerprinting noise
+
+The ETP shim salts Canvas / WebGL / audio readbacks **per call site**, so two
+reads of one surface in the same document disagree. A captcha vendor reads that
+inconsistency as a stronger signal than any single spoofed value. There is no
+per-site escape short of turning ETP off.
+
+### Same-origin policy
+
+A challenge frame reaching for its parent's document is refused by SOP, and the
+console says so:
+
 ```
 Blocked a frame with origin "https://challenges.cloudflare.com" from accessing a frame with origin "https://example.com"
 ```
 
-**Workaround:** Users can try enabling third-party cookies for the affected site.
+This is normal, every vendor's code handles it, and it happens in a stock
+browser too. It is **not** a cause of a stall and MUST NOT be read as one — it
+was recorded as the cause here from 2026-01 to 2026-09 and sent four rounds of
+fixes at the navigation path while the failure was in the storage path.
 
 ---
 

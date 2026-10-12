@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
+import 'package:webspace/widgets/site_menu.dart';
 import 'package:webspace/main.dart' as app;
 import 'package:webspace/demo_data.dart';
 
@@ -62,10 +63,10 @@ const Duration _DRAWER_TIMEOUT = Duration(seconds: 5);
 /// convertFlutterSurfaceToImage() only captures Flutter-rendered content.
 /// On iOS, useNative is ignored since Flutter screenshots work fine with webviews.
 Future<void> _takeThemedScreenshots(
-  IntegrationTestWidgetsFlutterBinding binding,
-  WidgetTester tester,
-  String baseName,
-  String currentTheme, {
+  IntegrationTestWidgetsFlutterBinding binding, {
+  required WidgetTester tester,
+  required String baseName,
+  required String currentTheme,
   bool useNative = false,
 }) async {
   final themeSuffix = currentTheme == 'light' ? '-light' : '-dark';
@@ -175,7 +176,7 @@ void main() {
           print('Selecting SearXNG site');
           await tester.tap(searxFinder);
 
-          // Pump to process the tap event and trigger Navigator.pop + _setCurrentIndex
+          // Pump to process the tap event and trigger Navigator.pop + setCurrentIndex
           await tester.pump();
           
           // Wait for drawer closing animation to complete
@@ -198,7 +199,7 @@ void main() {
 
           // Screenshot 1: Open Settings from toolbar menu
           print('Opening toolbar menu to access Settings...');
-          final popupMenuButton = find.byType(PopupMenuButton<String>);
+          final popupMenuButton = find.byType(PopupMenuButton<SiteMenuAction>);
           if (popupMenuButton.evaluate().isNotEmpty) {
             print('Found popup menu button, tapping...');
             await tester.tap(popupMenuButton.first);
@@ -214,7 +215,10 @@ void main() {
               await Future.delayed(const Duration(seconds: 2));
 
               // Screenshot 1: Settings screen
-              await _takeThemedScreenshots(binding, tester, '01-site-settings', currentTheme);
+              await _takeThemedScreenshots(binding,
+                  tester: tester,
+                  baseName: '01-site-settings',
+                  currentTheme: currentTheme);
               print('Screenshot 1 captured successfully (settings screen)');
 
               // Go back to webview
@@ -292,7 +296,10 @@ void main() {
           await Future.delayed(const Duration(seconds: 2));
 
           // Screenshot 2: Work webspace drawer
-          await _takeThemedScreenshots(binding, tester, '02-work-sites-drawer', currentTheme);
+          await _takeThemedScreenshots(binding,
+              tester: tester,
+              baseName: '02-work-sites-drawer',
+              currentTheme: currentTheme);
           print('Screenshot 2 captured successfully');
           await tester.pump();
           await Future.delayed(const Duration(seconds: 2));
@@ -303,7 +310,10 @@ void main() {
           await Future.delayed(const Duration(seconds: 2));
 
           // Screenshot 3: Work webspace sites
-          await _takeThemedScreenshots(binding, tester, '03-work-webspace', currentTheme);
+          await _takeThemedScreenshots(binding,
+              tester: tester,
+              baseName: '03-work-webspace',
+              currentTheme: currentTheme);
           await tester.pumpAndSettle(const Duration(seconds: 3));
         }
 
@@ -390,7 +400,10 @@ void main() {
             }
 
             // Screenshot 4: Sites selected
-            await _takeThemedScreenshots(binding, tester, '04-workspace-sites-selected', currentTheme);
+            await _takeThemedScreenshots(binding,
+                tester: tester,
+                baseName: '04-workspace-sites-selected',
+                currentTheme: currentTheme);
             await Future.delayed(const Duration(seconds: 1));
 
             // Look for save button (check icon in AppBar)

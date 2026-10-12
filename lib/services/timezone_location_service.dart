@@ -3,10 +3,12 @@ import 'dart:convert';
 
 import 'package:archive/archive.dart';
 import 'package:flutter/foundation.dart';
-import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:webspace/platform/host_platform.dart';
+import 'package:webspace/services/host_storage.dart';
+import 'package:webspace/services/outbound_http.dart';
+import 'package:webspace/utils/concurrency.dart';
 import 'log_service.dart';
 
 /// Default download URL: the latest `timezones-now` GeoJSON zip from
@@ -19,6 +21,7 @@ const String _defaultUrl =
 const String _cacheFileName = 'tz_polygons.geojson';
 const String _urlPrefKey = 'tz_polygons_url';
 const String _lastUpdatedPrefKey = 'tz_polygons_last_updated';
+const String _zoneCountPrefKey = 'tz_polygons_zone_count';
 
 /// One zone's polygon set, prepared for fast point-in-polygon lookup.
 class _ZoneEntry {
@@ -32,8 +35,8 @@ class _ZoneEntry {
   // every lookup would do PiP against ~hundreds of zones.
   final double minLng, minLat, maxLng, maxLat;
 
-  _ZoneEntry(this.tzid, this.polygons, this.minLng, this.minLat,
-      this.maxLng, this.maxLat);
+  _ZoneEntry(this.tzid, {required this.polygons, required this.minLng, required this.minLat,
+      required this.maxLng, required this.maxLat});
 }
 
 /// Singleton service for downloading, caching, and querying a GeoJSON
@@ -55,6 +58,7 @@ class TimezoneLocationService {
 
   List<_ZoneEntry>? _zones;
   bool _loadAttempted = false;
+  final SingleFlight<(), int> _countingFromFile = SingleFlight();
 
   /// True iff a polygon dataset is parsed and ready for lookups.
   bool get isReady => _zones != null && _zones!.isNotEmpty;
@@ -82,13 +86,6 @@ class TimezoneLocationService {
     return prefs.getString(_urlPrefKey) ?? _defaultUrl;
   }
 
-  /// Persist a new download URL. Does not trigger a download — the user
-  /// must press "Download" again to fetch from the new URL.
-  Future<void> setUrl(String url) async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_urlPrefKey, url);
-  }
-
   /// Last successful download timestamp, or null if never downloaded.
   Future<DateTime?> getLastUpdated() async {
     final prefs = await SharedPreferences.getInstance();
@@ -97,10 +94,42 @@ class TimezoneLocationService {
     return DateTime.tryParse(s);
   }
 
+  /// Whether a dataset file is on disk, loaded into memory or not.
+  Future<bool> hasCachedDataset() async {
+    try {
+      return await hostFileExists(await _cachePath());
+    } on Exception {
+      return false;
+    }
+  }
+
+  /// Zone count of the dataset on disk, or null when none is cached. Answers
+  /// without loading the dataset into memory, which only the lookup paths do.
+  Future<int?> cachedZoneCount() async {
+    if (!await hasCachedDataset()) return null;
+    final zones = _zones;
+    if (zones != null) return zones.length;
+    final prefs = await SharedPreferences.getInstance();
+    final stored = prefs.getInt(_zoneCountPrefKey);
+    if (stored != null) return stored;
+    // Downloaded before the count was stored. The parse runs off-isolate and
+    // only the number comes back, so the polygons are not kept in memory.
+    final path = await _cachePath();
+    try {
+      final count = await _countingFromFile.run(
+          (), call: () => compute(_readAndCountZones, path));
+      await prefs.setInt(_zoneCountPrefKey, count);
+      return count;
+    } catch (e) {
+      LogTag.tz.error('Failed to count tz cache: $e');
+      return 0;
+    }
+  }
+
   /// Load the cached dataset from disk if present. Idempotent — subsequent
-  /// calls return the already-loaded set. Called lazily on first lookup
-  /// and eagerly at app startup so the UI knows whether the dataset is
-  /// ready before the user opens settings.
+  /// calls return the already-loaded set. Called only by the paths that look
+  /// zones up (per-site settings, the post-paint startup refresh), so the
+  /// dataset is usually not in memory; status display uses [cachedZoneCount].
   Future<bool> loadFromCacheIfPresent() async {
     if (_zones != null) return true;
     if (_loadAttempted) return false;
@@ -114,13 +143,13 @@ class TimezoneLocationService {
       // the main isolate while the caller still awaits readiness, so
       // tz-from-location spoofing stays armed before any webview builds.
       _zones = await compute(_readAndParseZones, path);
-      LogService.instance
-          .log('TZ', 'Loaded ${_zones?.length ?? 0} zones from cache');
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_zoneCountPrefKey, _zones!.length);
+      LogTag.tz.debug('Loaded ${_zones?.length ?? 0} zones from cache');
       _notifyListeners();
       return _zones != null;
     } catch (e) {
-      LogService.instance
-          .log('TZ', 'Failed to load tz cache: $e', level: LogLevel.error);
+      LogTag.tz.error('Failed to load tz cache: $e');
       return false;
     }
   }
@@ -130,19 +159,26 @@ class TimezoneLocationService {
   /// large (tens of megabytes); callers should show progress UI.
   Future<bool> download({Duration timeout = const Duration(minutes: 5)}) async {
     final url = await getUrl();
+    final uri = Uri.tryParse(url);
+    if (uri == null) {
+      LogTag.tz.error('Not a URL: $url');
+      return false;
+    }
+    LogTag.tz.debug('Downloading $url');
+    final fetched = await fetchViaAppProxy(
+      uri,
+      tag: LogTag.tz,
+      timeout: timeout,
+      headers: const {
+        'User-Agent': 'Webspace (+https://github.com/theoden8/webspace_app)'
+      },
+    );
+    final response = switch (fetched) {
+      Fetched(:final response) => response,
+      FetchRefused() || FetchFailed() => null,
+    };
+    if (response == null) return false;
     try {
-      LogService.instance.log('TZ', 'Downloading $url');
-      final response = await http.get(
-        Uri.parse(url),
-        headers: const {'User-Agent': 'Webspace (+https://github.com/theoden8/webspace_app)'},
-      ).timeout(timeout);
-      if (response.statusCode != 200) {
-        LogService.instance.log(
-            'TZ', 'Download failed: HTTP ${response.statusCode}',
-            level: LogLevel.error);
-        return false;
-      }
-
       String body;
       if (url.toLowerCase().endsWith('.zip')) {
         // timezone-boundary-builder release zips name the inner file
@@ -169,10 +205,8 @@ class TimezoneLocationService {
         }
         gj ??= largestJson;
         if (gj == null) {
-          LogService.instance.log('TZ',
-              'Zip contains no .geojson or .json file (entries: '
-              '${archive.files.where((f) => f.isFile).map((f) => f.name).join(", ")})',
-              level: LogLevel.error);
+          LogTag.tz.error('Zip contains no .geojson or .json file (entries: '
+              '${archive.files.where((f) => f.isFile).map((f) => f.name).join(", ")})');
           return false;
         }
         body = utf8.decode(gj.content as List<int>);
@@ -182,19 +216,20 @@ class TimezoneLocationService {
 
       // Write through to disk first so a parse failure leaves the file
       // recoverable (the user can edit it / re-download).
-      await hostWriteFileText(await _cachePath(), body);
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove(_zoneCountPrefKey);
+      await hostWriteFileText(await _cachePath(), contents: body);
 
       _zones = await compute(_parseZones, body);
-      final prefs = await SharedPreferences.getInstance();
       await prefs.setString(
           _lastUpdatedPrefKey, DateTime.now().toIso8601String());
-      LogService.instance.log('TZ',
+      await prefs.setInt(_zoneCountPrefKey, _zones!.length);
+      LogTag.tz.debug(
           'Downloaded and parsed ${_zones?.length ?? 0} zones from $url');
       _notifyListeners();
       return true;
-    } catch (e) {
-      LogService.instance
-          .log('TZ', 'Download error: $e', level: LogLevel.error);
+    } on Exception catch (e) {
+      LogTag.tz.error('Download error: $e');
       return false;
     }
   }
@@ -207,9 +242,9 @@ class TimezoneLocationService {
       await hostDeleteFile(await _cachePath());
       final prefs = await SharedPreferences.getInstance();
       await prefs.remove(_lastUpdatedPrefKey);
+      await prefs.remove(_zoneCountPrefKey);
     } catch (e) {
-      LogService.instance
-          .log('TZ', 'Clear error: $e', level: LogLevel.error);
+      LogTag.tz.error('Clear error: $e');
     }
     _notifyListeners();
   }
@@ -221,7 +256,7 @@ class TimezoneLocationService {
   /// Uses bbox prefilter + ray-cast PiP. Not blazing fast on the first
   /// matching zone scan, but the result is stable and we only call this
   /// once per webview creation per site, not on every JS call.
-  String? lookup(double latitude, double longitude) {
+  String? lookup(double latitude, {required double longitude}) {
     final zones = _zones;
     if (zones == null || zones.isEmpty) return null;
     for (final z in zones) {
@@ -230,10 +265,10 @@ class TimezoneLocationService {
       for (final rings in z.polygons) {
         if (rings.isEmpty) continue;
         // Outer ring contains the point AND no hole contains it.
-        if (!_pointInRing(rings.first, longitude, latitude)) continue;
+        if (!_pointInRing(rings.first, x: longitude, y: latitude)) continue;
         var inHole = false;
         for (var i = 1; i < rings.length; i++) {
-          if (_pointInRing(rings[i], longitude, latitude)) {
+          if (_pointInRing(rings[i], x: longitude, y: latitude)) {
             inHole = true;
             break;
           }
@@ -248,7 +283,8 @@ class TimezoneLocationService {
   /// closed polygon. Robust enough for IANA zone polygons; we don't
   /// special-case the antimeridian because the dataset already splits
   /// zones that cross it.
-  static bool _pointInRing(Float64List ring, double x, double y) {
+  static bool _pointInRing(Float64List ring,
+      {required double x, required double y}) {
     var inside = false;
     final n = ring.length;
     if (n < 6) return false;
@@ -256,7 +292,8 @@ class TimezoneLocationService {
       final xi = ring[i], yi = ring[i + 1];
       final xj = ring[j], yj = ring[j + 1];
       final intersects = ((yi > y) != (yj > y)) &&
-          (x < (xj - xi) * (y - yi) / ((yj - yi) == 0 ? 1e-30 : (yj - yi)) + xi);
+          (x <
+              (xj - xi) * (y - yi) / ((yj - yi) == 0 ? 1e-30 : (yj - yi)) + xi);
       if (intersects) inside = !inside;
     }
     return inside;
@@ -268,6 +305,8 @@ class TimezoneLocationService {
 /// the polygon build both stay off the main isolate.
 List<_ZoneEntry> _readAndParseZones(String path) =>
     _parseZones(hostReadFileTextSync(path));
+
+int _readAndCountZones(String path) => _readAndParseZones(path).length;
 
 /// Benchmark/test hook: parse a GeoJSON body synchronously on the calling
 /// isolate and return the zone count. Lets a `flutter test` profile the parse
@@ -332,7 +371,12 @@ List<_ZoneEntry> _parseZones(String body) {
     }
 
     if (polygons.isEmpty) continue;
-    zones.add(_ZoneEntry(tzid, polygons, minLng, minLat, maxLng, maxLat));
+    zones.add(_ZoneEntry(tzid,
+        polygons: polygons,
+        minLng: minLng,
+        minLat: minLat,
+        maxLng: maxLng,
+        maxLat: maxLat));
   }
   return zones;
 }

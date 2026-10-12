@@ -1,6 +1,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/domain_claim.dart';
 import 'package:webspace/services/link_intent_dispatch_engine.dart';
+import 'package:webspace/services/outbound_preference.dart';
 import 'package:webspace/web_view_model.dart' show getNormalizedDomain;
 
 class _Site implements DispatchableSite {
@@ -346,6 +347,316 @@ void main() {
       expect(action, isNot(isA<DispatchOpenNested>()));
       expect(action, isNot(isA<DispatchCreateSite>()));
       expect(action, isA<DispatchCreateSiteFromHtml>());
+    });
+  });
+
+  group('LinkIntentDispatchEngine.openInChosen — search origin (LIR-030)', () {
+    _Site ddg({bool incognito = false, bool alwaysOpenHome = false}) => _Site(
+          siteId: 'ddg',
+          initUrl: 'https://duckduckgo.com/',
+          domainClaims: [DomainClaim.baseDomain('duckduckgo.com')],
+          incognito: incognito,
+          alwaysOpenHome: alwaysOpenHome,
+        );
+    final query = Uri.parse('https://duckduckgo.com/?q=flutter+tabs');
+
+    test('a search never resets the search site', () {
+      for (final site in [
+        ddg(incognito: true),
+        ddg(alwaysOpenHome: true),
+      ]) {
+        final action = LinkIntentDispatchEngine.openInChosen(
+          inbound: query,
+          site: site,
+          origin: InboundOrigin.search,
+        ) as DispatchOpenInMain;
+        expect(action.url, query.toString());
+        expect(action.disposeBeforeLoad, isFalse);
+        expect(action.wipeContainer, isFalse);
+        expect(action.clearInMemoryCookies, isFalse);
+      }
+    });
+
+    test('a search opens a new tab exactly when tabs are on', () {
+      for (final tabs in [true, false]) {
+        final action = LinkIntentDispatchEngine.openInChosen(
+          inbound: query,
+          site: ddg(),
+          origin: InboundOrigin.search,
+          tabsEnabled: tabs,
+        ) as DispatchOpenInMain;
+        expect(action.newTab, tabs);
+      }
+    });
+
+    test('a pick from the share picker keeps the LIR-011 reset and no tab', () {
+      final action = LinkIntentDispatchEngine.openInChosen(
+        inbound: query,
+        site: ddg(incognito: true),
+        tabsEnabled: true,
+      ) as DispatchOpenInMain;
+      expect(action.wipeContainer, isTrue);
+      expect(action.newTab, isFalse);
+    });
+
+    test('a search address off the site\'s domain nests with its posture', () {
+      final searx = _Site(
+        siteId: 'searx',
+        initUrl: 'https://searx.example/',
+        domainClaims: const [],
+      );
+      final action = LinkIntentDispatchEngine.openInChosen(
+        inbound: query,
+        site: searx,
+        origin: InboundOrigin.search,
+        tabsEnabled: true,
+      );
+      expect(action, isA<DispatchOpenNested>());
+    });
+  });
+
+  group('LinkIntentDispatchEngine.routeToTab (LIR-032, LIR-034)', () {
+    final ddg = _Site(
+      siteId: 'ddg',
+      initUrl: 'https://duckduckgo.com/',
+      domainClaims: [DomainClaim.baseDomain('duckduckgo.com')],
+    );
+    final gh = _Site(
+      siteId: 'gh',
+      initUrl: 'https://github.com/',
+      domainClaims: [DomainClaim.baseDomain('github.com')],
+    );
+    final workGh = _Site(
+      siteId: 'work-gh',
+      initUrl: 'https://github.com/work',
+      domainClaims: [DomainClaim.baseDomain('github.com')],
+    );
+    final pages = _Site(
+      siteId: 'cb',
+      initUrl: 'https://codeberg.org/',
+      domainClaims: [DomainClaim.baseDomain('codeberg.page')],
+    );
+
+    DispatchAction? route(
+      String url, {
+      List<_Site>? hosts,
+      List<OutboundPreference> prefs = const [],
+      bool tabs = true,
+      bool routing = true,
+      bool containers = true,
+      bool kiosk = false,
+      bool gesture = true,
+    }) =>
+        LinkIntentDispatchEngine.routeToTab(
+          url: Uri.parse(url),
+          urlNavigationDomain: getNormalizedDomain(url),
+          tabsEnabled: tabs,
+          routeOutboundLinks: routing,
+          containersActive: containers,
+          kioskLocked: kiosk,
+          hadGesture: gesture,
+          source: ddg,
+          sourcePrefs: prefs,
+          hosts: () => hosts ?? [ddg, gh],
+        );
+
+    test('routing on: a link into one of the user\'s sites runs as that site',
+        () {
+      final action = route('https://github.com/x');
+      expect(action, isA<DispatchOpenInTab>());
+      expect((action as DispatchOpenInTab).siteId, 'gh');
+      expect(action.url, 'https://github.com/x');
+    });
+
+    test('routing off: the same link opens as a tab running as the source',
+        () {
+      final action = route('https://github.com/x', routing: false);
+      expect((action as DispatchOpenInTab).siteId, 'ddg');
+      expect(action.url, 'https://github.com/x');
+    });
+
+    test('routing off never asks, whatever several sites could run it', () {
+      final action =
+          route('https://github.com/x', routing: false, hosts: [ddg, gh, workGh]);
+      expect((action as DispatchOpenInTab).siteId, 'ddg');
+    });
+
+    test('routing off still needs one of the user\'s sites to run the link',
+        () {
+      // A tab anchored in a domain none of the sites runs would have nothing
+      // to move to when the switch comes on: it stays a nested screen.
+      expect(route('https://medium.com/x', routing: false), isNull);
+      expect(route('https://codeberg.page/docs',
+              routing: false, hosts: [ddg, pages]),
+          isNull);
+    });
+
+    test('tabs off, the legacy engine, a locked kiosk or no gesture: no tab',
+        () {
+      for (final routing in [true, false]) {
+        expect(route('https://github.com/x', routing: routing, tabs: false),
+            isNull);
+        expect(
+            route('https://github.com/x', routing: routing, containers: false),
+            isNull);
+        expect(route('https://github.com/x', routing: routing, kiosk: true),
+            isNull);
+        expect(route('https://github.com/x', routing: routing, gesture: false),
+            isNull);
+      }
+    });
+
+    test('only http(s) links with a host become tabs', () {
+      expect(route('mailto:someone@github.com'), isNull);
+      expect(route('file:///github.com/x'), isNull);
+    });
+
+    test('a site that is not the user\'s stays nested', () {
+      expect(route('https://medium.com/x'), isNull);
+    });
+
+    test('a claim outside a site\'s navigation domain makes no tab', () {
+      expect(route('https://codeberg.page/docs', hosts: [ddg, pages]), isNull);
+    });
+
+    test('the source itself is never the destination', () {
+      expect(route('https://duckduckgo.com/?q=x', hosts: [ddg]), isNull);
+    });
+
+    test('two sites that can run it ask', () {
+      final action = route('https://github.com/x', hosts: [ddg, gh, workGh]);
+      expect(action, isA<DispatchShowPicker>());
+      final picker = action as DispatchShowPicker;
+      expect(picker.asTab, isTrue);
+      expect(picker.source, 'ddg');
+      expect(picker.winnerSiteIds, unorderedEquals(['gh', 'work-gh']));
+    });
+
+    test('the source\'s preference decides between them', () {
+      final action = route(
+        'https://github.com/x',
+        hosts: [ddg, gh, workGh],
+        prefs: [
+          OutboundPreference(
+            claim: DomainClaim.baseDomain('github.com'),
+            targetSiteId: 'work-gh',
+          ),
+        ],
+      );
+      expect((action as DispatchOpenInTab).siteId, 'work-gh');
+    });
+  });
+
+  group('LinkIntentDispatchEngine.linkTabRunsAs (LIR-034)', () {
+    final ddg = _Site(
+      siteId: 'ddg',
+      initUrl: 'https://duckduckgo.com/',
+      domainClaims: [DomainClaim.baseDomain('duckduckgo.com')],
+    );
+    final gh = _Site(
+      siteId: 'gh',
+      initUrl: 'https://github.com/',
+      domainClaims: [DomainClaim.baseDomain('github.com')],
+    );
+    final workGh = _Site(
+      siteId: 'work-gh',
+      initUrl: 'https://github.com/work',
+      domainClaims: [DomainClaim.baseDomain('github.com')],
+    );
+
+    String runsAs({
+      required bool routing,
+      required String current,
+      List<_Site>? hosts,
+      List<OutboundPreference> prefs = const [],
+      bool containers = true,
+      String home = 'https://github.com/x',
+    }) =>
+        LinkIntentDispatchEngine.linkTabRunsAs(
+          homeUrl: Uri.parse(home),
+          homeNavigationDomain: getNormalizedDomain(home),
+          routeOutboundLinks: routing,
+          containersActive: containers,
+          opener: ddg,
+          openerPrefs: prefs,
+          hosts: () => hosts ?? [ddg, gh],
+          current: current,
+        );
+
+    test('off: the opener, whatever the tab ran as before', () {
+      for (final current in ['ddg', 'gh', 'work-gh']) {
+        expect(runsAs(routing: false, current: current), 'ddg',
+            reason: current);
+      }
+    });
+
+    test('on: the site the link leads to, whatever the tab ran as before', () {
+      for (final current in ['ddg', 'gh']) {
+        expect(runsAs(routing: true, current: current), 'gh', reason: current);
+      }
+    });
+
+    test('on, with no site left that can run it: the opener', () {
+      expect(runsAs(routing: true, current: 'gh', hosts: [ddg]), 'ddg');
+    });
+
+    test('on, without containers: the opener', () {
+      expect(runsAs(routing: true, current: 'ddg', containers: false), 'ddg');
+    });
+
+    test('on, several candidates: the one the user picked is kept', () {
+      expect(
+          runsAs(routing: true, current: 'work-gh', hosts: [ddg, gh, workGh]),
+          'work-gh');
+    });
+
+    test('on, several candidates and none picked: stays with the opener', () {
+      // Putting it in one of them would be the silent pick LIR-016 forbids.
+      expect(runsAs(routing: true, current: 'ddg', hosts: [ddg, gh, workGh]),
+          'ddg');
+    });
+
+    test('on, several candidates: a preference decides', () {
+      expect(
+        runsAs(
+          routing: true,
+          current: 'ddg',
+          hosts: [ddg, gh, workGh],
+          prefs: [
+            OutboundPreference(
+              claim: DomainClaim.baseDomain('github.com'),
+              targetSiteId: 'work-gh',
+            ),
+          ],
+        ),
+        'work-gh',
+      );
+    });
+
+    test('flipping twice comes back where it started', () {
+      final on = runsAs(routing: true, current: 'ddg');
+      final off = runsAs(routing: false, current: on);
+      final again = runsAs(routing: true, current: off);
+      expect([on, off, again], ['gh', 'ddg', 'gh']);
+    });
+
+    test('agrees with routeToTab for a link opened now', () {
+      for (final routing in [true, false]) {
+        final action = LinkIntentDispatchEngine.routeToTab(
+          url: Uri.parse('https://github.com/x'),
+          urlNavigationDomain: 'github.com',
+          tabsEnabled: true,
+          routeOutboundLinks: routing,
+          containersActive: true,
+          kioskLocked: false,
+          hadGesture: true,
+          source: ddg,
+          sourcePrefs: const [],
+          hosts: () => [ddg, gh],
+        ) as DispatchOpenInTab;
+        expect(runsAs(routing: routing, current: action.siteId), action.siteId,
+            reason: 'routing $routing');
+      }
     });
   });
 }

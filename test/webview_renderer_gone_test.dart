@@ -1,9 +1,8 @@
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
-import 'package:webspace/services/webview.dart';
 import 'package:webspace/web_view_model.dart';
-
-class _StubController extends Fake implements WebViewController {}
+import 'helpers/fake_webview_controller.dart';
+import 'package:webspace/services/webview_controller.dart';
 
 void main() {
   group('WebViewModel.handleRendererGone', () {
@@ -14,7 +13,7 @@ void main() {
         stateSetterF: () => rebuilds++,
       );
       model.webview = const SizedBox.shrink();
-      model.controller = _StubController();
+      model.controller = FakeWebViewController();
 
       model.handleRendererGone(didCrash: true);
 
@@ -31,7 +30,7 @@ void main() {
     test('handles a null stateSetterF without throwing', () {
       final model = WebViewModel(initUrl: 'https://example.com');
       model.webview = const SizedBox.shrink();
-      model.controller = _StubController();
+      model.controller = FakeWebViewController();
 
       expect(() => model.handleRendererGone(didCrash: false), returnsNormally);
       expect(model.webview, isNull);
@@ -48,7 +47,7 @@ void main() {
         stateSetterF: () => rebuilds++,
       );
       model.webview = const SizedBox.shrink();
-      model.controller = _StubController();
+      model.controller = FakeWebViewController();
 
       model.handleRendererGone(didCrash: false);
 

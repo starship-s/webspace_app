@@ -69,7 +69,7 @@ NOT appear in plaintext SharedPreferences entries.
 #### Scenario: Per-site password is segregated
 
 **Given** a site has a proxy with a non-empty `password`
-**When** the site is persisted via `_saveWebViewModels`
+**When** the site is persisted via `_persistSites`
 **Then** `prefs.getStringList('webViewModels')` contains the site's blob
 **And** that blob's `proxySettings` map does NOT contain a `password` key
 **And** `flutter_secure_storage` contains an entry under the
@@ -79,7 +79,7 @@ NOT appear in plaintext SharedPreferences entries.
 
 **Given** the user updates `GlobalOutboundProxy.current` with a non-empty `password`
 **When** the in-memory cache is flushed by `GlobalOutboundProxy.update`
-**Then** `prefs.getString(kGlobalOutboundProxyKey)` decodes to a JSON
+**Then** `prefs.getString(AppPref.globalOutboundProxy.key)` decodes to a JSON
 object without a `password` key
 **And** `flutter_secure_storage` contains the password under
 [`ProxyPasswordSecureStorage.globalProxyKey`] (`__global_outbound__`)
@@ -103,7 +103,7 @@ storage at startup and after every backup import.
 #### Scenario: Per-site hydration
 
 **Given** secure storage holds a password for `siteId = "abc"`
-**When** `_loadWebViewModels` reads `webViewModels` from prefs
+**When** `SiteListStore.load` reads `webViewModels` from prefs
 **Then** the constructed `WebViewModel` for `"abc"` has its
 `proxySettings.password` populated from secure storage
 
@@ -126,7 +126,7 @@ SharedPreferences entries to secure storage, exactly once per entry.
 **Given** a `webViewModels` entry from a pre-migration build whose
 `proxySettings` contains `"password": "legacy-secret"`
 **And** secure storage has no entry for that `siteId`
-**When** `_loadWebViewModels` runs
+**When** `SiteListStore.load` runs
 **Then** secure storage is updated with `siteId -> "legacy-secret"`
 **And** the prefs entry is rewritten without the `password` key
 **And** the WebViewModel's `proxySettings.password` is `"legacy-secret"`
@@ -134,12 +134,12 @@ SharedPreferences entries to secure storage, exactly once per entry.
 #### Scenario: Per-site legacy migration is idempotent
 
 **Given** the migration ran on a previous launch
-**When** `_loadWebViewModels` runs again
+**When** `SiteListStore.load` runs again
 **Then** no further mutation of secure storage or prefs occurs
 
 #### Scenario: Global legacy migration on initialize
 
-**Given** `prefs.getString(kGlobalOutboundProxyKey)` decodes to a JSON
+**Given** `prefs.getString(AppPref.globalOutboundProxy.key)` decodes to a JSON
 object that contains `"password": "legacy-secret"`
 **When** `GlobalOutboundProxy.initialize` is called
 **Then** secure storage is updated with
@@ -201,13 +201,21 @@ is serialised via `exportToJson`
 
 **Given** `GlobalOutboundProxy.current.password = "p2"`
 **When** the export is built
-**Then** `globalPrefs[kGlobalOutboundProxyKey]` decodes to a JSON object
+**Then** `globalPrefs[AppPref.globalOutboundProxy.key]` decodes to a JSON object
 that does NOT contain a `password` key
+
+#### Scenario: Import drops an app-wide password the file carries
+
+**Given** a backup whose `globalPrefs[AppPref.globalOutboundProxy.key]` decodes to
+an object with a `password` (v0.2.2 wrote one; any file can)
+**When** `resolveExportedAppPrefs` applies it
+**Then** the stored value has no `password` key
+**And** `GlobalOutboundProxy.update` receives no password to save
 
 #### Scenario: Import does not write a password to secure storage
 
 **Given** the import path runs on a backup that has no proxy passwords
-**When** `_importSettings` finishes
+**When** `BackupController.import` finishes
 **Then** any pre-existing proxy passwords for the imported `siteId`s
 were swept by orphan cleanup (PWD-004) and no new ones are written
 
@@ -246,11 +254,45 @@ is restarted.
 
 ---
 
+### Requirement: PWD-007 - Proxy library passwords
+
+A proxy library password SHALL live in the same secure-storage entry as every
+other proxy password: saved credentials under `__saved_credentials__:<id>`, a
+saved proxy's typed password under `__saved_proxy__:<id>`. Neither SHALL be
+written to SharedPreferences or to any export (PWD-005). The library in
+SharedPreferences (`proxyLibrary`) SHALL carry names, types, addresses,
+usernames and references only. A site's typed password on a saved gateway is
+its own proxy password (PWD-001).
+
+The passwords SHALL be hydrated at startup before any site resolves a proxy.
+Deleting an entry SHALL delete its password; startup SHALL delete any library
+password whose entry no longer exists. The per-site orphan cleanup (PWD-004)
+SHALL leave library keys alone, since they belong to no site.
+
+A password SHALL NOT be read from the library, even when a backup was edited
+to carry one: it could only have been written there to point this device's
+traffic at someone else's proxy. An import SHALL therefore leave every entry
+without a password, and the post-import hint SHALL ask for passwords when the
+library names a username.
+
+#### Scenario: The export carries no library password
+
+- **GIVEN** saved credentials with username `alice` and password `s3cret`
+- **WHEN** the user exports settings
+- **THEN** the backup's `proxyLibrary` value names `alice`
+- **AND** `s3cret` appears nowhere in the file
+
+#### Scenario: A deleted entry leaves no password behind
+
+- **GIVEN** saved credentials with a password
+- **WHEN** the user deletes them
+- **THEN** secure storage holds no `__saved_credentials__:` entry for them
+
 ## Storage Flow
 
 ### Loading (App Start)
 
-1. `_loadWebViewModels` reads `webViewModels` from SharedPreferences
+1. `SiteListStore.load` reads `webViewModels` from SharedPreferences
 2. **Pre-pass:** scan each blob's `proxySettings` for a legacy plaintext
    `password`; for each one found, write to secure storage (unless an
    entry already exists for that `siteId`) and rewrite the blob without
@@ -265,8 +307,8 @@ is restarted.
 
 1. Mirror per-site `model.proxySettings.password` values into secure
    storage via `ProxyPasswordSecureStorage.saveAll`
-2. `_saveWebViewModels` calls `model.toJson()` (default — password
-   omitted) and writes to prefs
+2. `SiteListStore.save` (from `_persistSites`) calls `model.toJson()`
+   (default — password omitted) and writes to prefs
 3. `GlobalOutboundProxy.update` writes JSON-without-password to prefs and
    the password to secure storage
 
@@ -277,7 +319,7 @@ is restarted.
 | Export build  | `model.toJson()` (always password-less)      | `readExportedAppPrefs(prefs)` (already password-less since prefs are sanitised) |
 | Export to disk| Backup carries `address` / `username` only   | Backup carries `address` / `username` only                 |
 | Import parse  | `WebViewModel.fromJson` — `password` field is null | `readGlobalOutboundProxy` — `password` field is null  |
-| Import apply  | `_saveWebViewModels` writes prefs, no password to migrate | `GlobalOutboundProxy.update` with the password-less settings |
+| Import apply  | `_persistSites` writes prefs, no password to migrate | `GlobalOutboundProxy.update` with the password-less settings |
 | Post-import   | UI snackbar tells the user to re-enter passwords if a `username` was present in the backup |
 
 ---
@@ -292,11 +334,12 @@ is restarted.
 
 ### Modified
 - `lib/settings/proxy.dart` - `toJson` always omits the password
-- `lib/settings/global_outbound_proxy.dart` - migrate + hydrate on
+- `lib/services/global_outbound_proxy.dart` - migrate + hydrate on
   `initialize`; route password to secure storage on `update`
 - `lib/web_view_model.dart` - `toJson` always omits the password
-- `lib/main.dart` - `_loadWebViewModels` / `_saveWebViewModels` /
-  `_exportSettings` / `_importSettings` / orphan cleanup paths;
+- `lib/controllers/site_list_store.dart` - `SiteListStore.load` / `save`
+- `lib/main.dart` - `_persistSites` /
+  `BackupController.export` / `BackupController.import` / orphan cleanup paths;
   post-import snackbar surfaces the strip contract when a `username` was
   present in the imported backup
 - `lib/services/settings_backup.dart` - documents the strip-from-export
@@ -311,27 +354,31 @@ is restarted.
 When adding a new field that holds a credential, token, or other
 sensitive secret:
 
-1. **Decide the storage**: it does not belong in SharedPreferences. Use
-   `flutter_secure_storage` with the same options as
-   `ProxyPasswordSecureStorage` (`encryptedSharedPreferences` on Android,
-   `first_unlock` keychain accessibility on Apple).
+1. **Decide the storage**: it does not belong in SharedPreferences. Build
+   it on `SecureJsonStore` (`lib/services/keystore.dart`) over
+   `Keystores.credentials`, the options `ProxyPasswordSecureStorage` uses
+   (`encryptedSharedPreferences` on Android, `first_unlock` keychain
+   accessibility on Apple). Do not define another option set: on Apple the
+   accessibility class is part of the keychain query, so an entry written
+   under one is not found under another.
 2. **Never write it to JSON**. The `toJson` for the containing object
    simply omits the field. There is intentionally no opt-in flag —
    passwords are stripped uniformly across persistence and the backup
    format, matching the rule for `isSecure=true` cookies.
 3. **Hydrate on load** at the same point we hydrate proxy passwords —
-   `_loadWebViewModels` for per-site, `GlobalOutboundProxy.initialize`
+   `SiteListStore.load` for per-site, `GlobalOutboundProxy.initialize`
    (or its analogue) for global.
 4. **Migrate legacy plaintext** with the same idempotent pre-pass: read
    prefs, move secret to secure storage, rewrite prefs without it. Use
    `ProxyPasswordSecureStorage.migrateLegacyPassword` as the template.
-5. **Wire orphan cleanup** alongside the existing
-   `_cookieSecureStorage.removeOrphanedCookies` and
-   `_proxyPasswordStorage.removeOrphaned` calls in main.dart (three
-   sites: startup GC, post-import GC, post-delete GC).
+5. **Wire orphan cleanup** by adding the store to `OrphanStore` in
+   `lib/services/orphan_sweep_engine.dart` as `configuration` scope.
+   `PageOrphanSweep` ([page_orphan_sweep.dart](lib/controllers/page_orphan_sweep.dart)) does not compile until it sweeps
+   the store, and startup, post-import and post-delete all run the
+   engine.
 6. **Surface the strip-from-export contract in the import UI** so the
    user knows to re-enter the secret after restoring from a backup. The
-   per-site / global proxy snackbar in `_importSettings` is the model.
+   per-site / global proxy snackbar in `BackupController.import` is the model.
 7. **Add a regression test** asserting the secret never appears as a
    substring of `exportToJson(backup)` after a save. The
    "no proxy password substring in exported JSON" test in

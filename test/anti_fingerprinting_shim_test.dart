@@ -6,11 +6,6 @@ void main() {
   group('buildAntiFingerprintingShim', () {
     final js = buildAntiFingerprintingShim('alpha-fixture-seed');
 
-    test('runs as an IIFE so locals do not leak to the global scope', () {
-      expect(js.trim(), startsWith('(function() {'));
-      expect(js.trim(), endsWith('})();'));
-    });
-
     test('installs a re-entrance guard so re-runs do not double-wrap', () {
       // Android System WebView and WKWebView both re-run initialUserScripts
       // on every frame load. Without the guard, every wrapper would wrap
@@ -112,6 +107,16 @@ void main() {
       expect(js, contains("'deviceMemory'"));
       expect(js, contains("'plugins'"));
       expect(js, contains("'mimeTypes'"));
+      expect(js, contains("'maxTouchPoints'"));
+    });
+
+    test('corrects navigator.connection without extending it (ETP-026)', () {
+      expect(js, contains("'connection' in NavProto"));
+      expect(js, contains("correct('effectiveType', '4g')"));
+      expect(js, contains("correct('rtt', 50)"));
+      // The presence check is what keeps `type` / `downlinkMax` from being
+      // introduced on a build that lacks them.
+      expect(js, contains('if (!(name in connProto)) return;'));
     });
 
     test('overrides navigator.getBattery to a fixed-value Promise', () {
@@ -141,7 +146,7 @@ void main() {
     test('default (non-letterbox) pins fixed screen dimensions', () {
       // ETP-010: with letterboxing off, screen.* reports a fixed desktop
       // 1920x1080 and the window is left untouched.
-      expect(js, contains('var LETTERBOX = false'));
+      expect(js, contains('"letterbox":false'));
       expect(js, contains('1920'));
       expect(js, contains('1080'));
     });
@@ -151,7 +156,7 @@ void main() {
       // The WebView is physically letterboxed by Flutter, so window.inner* is
       // already truthful; screen.* mirrors it rather than faking 1920x1080.
       final lb = buildAntiFingerprintingShim('alpha-fixture-seed', letterbox: true);
-      expect(lb, contains('var LETTERBOX = true'));
+      expect(lb, contains('"letterbox":true'));
       // `globalThis.inner*`, not `window.inner*`: this source is also injected
       // into worker scopes, where `window` is a ReferenceError.
       expect(lb, contains('globalThis.innerWidth'));
@@ -178,7 +183,7 @@ void main() {
   });
 
   group('computeAntiFingerprintingSeed', () {
-    // Issue #327 / ETP-019: incognito sites must randomize their
+    // Issue #327 / ETP-028: incognito sites must randomize their
     // fingerprint per launch, while non-incognito sites keep the
     // ETP-004 stable-per-site posture.
 
@@ -331,7 +336,10 @@ void main() {
       );
       expect(r1, isNotNull);
       expect(r2, isNot(equals(r1)));
-      expect(r1, contains('"site-A:r1"'));
+      // The record id feeds the digest the page sees; it never appears
+      // itself (SEC-006).
+      expect(r1, contains('"${opaqueAntiFingerprintingSeed('site-A:r1')}"'));
+      expect(r1, isNot(contains('site-A')));
     });
 
     test('seed flows through buildAntiFingerprintingShim end-to-end', () {
@@ -422,7 +430,7 @@ void main() {
       expect(launch1, isNotNull);
       expect(launch2, isNot(equals(launch1)),
           reason: 'incognito + TP must reroll the fingerprint per launch '
-              '(issue #327 / ETP-019)');
+              '(issue #327 / ETP-028)');
     });
 
     test('incognito: fingerprint stable within one launch', () {
@@ -481,20 +489,8 @@ void main() {
         launchNonce: LaunchNonce.value,
         letterbox: false,
       );
-      expect(lb, contains('var LETTERBOX = true'));
-      expect(normal, contains('var LETTERBOX = false'));
-    });
-
-    test('script source carries the InAppWebView return-value sentinel', () {
-      // WebViewFactory.createWebView appends `\n;null;` to every shim
-      // source so the evaluator returns null instead of the IIFE return
-      // value (which the platform channel cannot serialize for some
-      // shapes). Keep that contract pinned in the helper.
-      LaunchNonce.overrideForTesting('pinned-nonce');
-      final src = scriptFor(
-        siteId: 'site-A', trackingProtectionEnabled: true, incognito: false,
-      );
-      expect(src, endsWith('\n;null;'));
+      expect(lb, contains('"letterbox":true'));
+      expect(normal, contains('"letterbox":false'));
     });
   });
 }

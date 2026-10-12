@@ -9,13 +9,22 @@ import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:webspace/services/cookie_isolation.dart';
+import 'package:webspace/services/domain_claim.dart';
+import 'package:webspace/services/outbound_preference.dart';
 import 'package:webspace/services/file_store_io.dart';
 import 'package:webspace/services/archive.dart';
 import 'package:webspace/services/archive_storage.dart';
 import 'package:webspace/services/webview_state_secure_storage.dart';
+import 'package:webspace/services/http_auth_engine.dart';
+import 'package:webspace/services/webspace_selection_engine.dart';
 import 'package:webspace/web_view_model.dart';
+import 'package:webspace/services/archive_membership_engine.dart';
+import 'package:webspace/services/settings_import_engine.dart';
+import 'package:webspace/services/site_tab.dart';
 import 'package:webspace/webspace_model.dart';
 
+import 'helpers/mock_cookie_manager.dart';
 import 'helpers/mock_secure_storage.dart';
 
 /// Active-state byte-identity regression tests (ARCH-001).
@@ -48,13 +57,14 @@ void main() {
 
     test('fromJson defaults isArchiveTier=false', () {
       final m = WebViewModel(initUrl: 'https://example.com');
-      final round = WebViewModel.fromJson(m.toJson(), null);
+      final round = WebViewModel.fromJson(m.toJson(), stateSetterF: null);
       expect(round.isArchiveTier, isFalse);
     });
 
     test('fromJson respects explicit isArchiveTier=true override', () {
       final m = WebViewModel(initUrl: 'https://example.com');
-      final round = WebViewModel.fromJson(m.toJson(), null, isArchiveTier: true);
+      final round = WebViewModel.fromJson(m.toJson(),
+          stateSetterF: null, isArchiveTier: true);
       expect(round.isArchiveTier, isTrue);
     });
 
@@ -62,21 +72,18 @@ void main() {
       final m = WebViewModel(
         initUrl: 'https://example.com',
         notificationsEnabled: true,
-        localCdnEnabled: true,
         incognito: false,
         isArchiveTier: true,
       );
       expect(m.effectiveNotificationsEnabled, isFalse);
-      expect(m.effectiveLocalCdnEnabled, isFalse);
       // ARCH-006: an archive-tier site is always incognito so its container
       // never writes localStorage/IDB/SW/HTTP-cache to disk in cleartext.
-      // The webview config sites (setOptions, WebViewConfig, both nested
-      // launchUrlFunc calls) all read effectiveIncognito, not the raw field.
+      // setOptions and SitePosture (every webview surface) read
+      // effectiveIncognito, not the raw field.
       expect(m.effectiveIncognito, isTrue);
       // Stored values are preserved so the user's preferences round-trip
       // through any future eject flow.
       expect(m.notificationsEnabled, isTrue);
-      expect(m.localCdnEnabled, isTrue);
       expect(m.incognito, isFalse);
     });
 
@@ -84,11 +91,9 @@ void main() {
       final m = WebViewModel(
         initUrl: 'https://example.com',
         notificationsEnabled: true,
-        localCdnEnabled: false,
         incognito: false,
       );
       expect(m.effectiveNotificationsEnabled, isTrue);
-      expect(m.effectiveLocalCdnEnabled, isFalse);
       // App-tier respects the stored incognito value both ways.
       expect(m.effectiveIncognito, isFalse);
       expect(
@@ -126,6 +131,28 @@ void main() {
     test('persistsNavState is true for a plain app-tier site', () {
       final m = WebViewModel(initUrl: 'https://a.test');
       expect(m.persistsNavState, isTrue);
+    });
+
+    // Saved sign-ins live in app-tier secure storage keyed by the cleartext
+    // siteId, so an archive-tier site must neither read nor write them.
+    test('effectiveHttpAuthMemory is off for archive-tier sites', () {
+      expect(
+        WebViewModel(initUrl: 'https://a.test', isArchiveTier: true)
+            .effectiveHttpAuthMemory,
+        HttpAuthMemory.off,
+      );
+    });
+
+    test('effectiveHttpAuthMemory is read-only for incognito sites', () {
+      expect(
+        WebViewModel(initUrl: 'https://a.test', incognito: true)
+            .effectiveHttpAuthMemory,
+        HttpAuthMemory.readOnly,
+      );
+      expect(
+        WebViewModel(initUrl: 'https://a.test').effectiveHttpAuthMemory,
+        HttpAuthMemory.readWrite,
+      );
     });
   });
 
@@ -166,20 +193,24 @@ void main() {
   // state through a docs-dir writer or a keyed secure-storage entry —
   // even AES-encrypted, even blinded — fails here.
   group('Archive persistence is confined to the slot pool', () {
-    Set<String> slotKeys() => {
+    // The pool plus the ARCH-002 salt entry: everything the feature is allowed
+    // to put in the keychain, and all of it written at pool init whether or
+    // not an archive exists.
+    Set<String> poolKeys() => {
           for (var i = 0; i < kArchiveSlotCount; i++)
             'archive_slot_${i.toString().padLeft(2, '0')}',
+          kArchiveKdfSaltKey,
         };
 
     test('a full lifecycle touches only the 16 fixed slot keys', () async {
       final mock = MockFlutterSecureStorage();
       final archive = Archive(storage: ArchiveStorage(secureStorage: mock));
       await archive.ensureInitialized();
-      expect(mock.storage.keys.toSet(), equals(slotKeys()),
+      expect(mock.storage.keys.toSet(), equals(poolKeys()),
           reason: 'only the fixed pool exists after init');
 
       final handle = await archive.createWithKey(_testKey(7));
-      handle.state.sites.add({'siteId': 'arch-site', 'initUrl': 'https://x.test'});
+      handle.state.sites.add(_tabbedSite('arch-site').toArchiveJson());
       handle.state.cookies['arch-site'] = [
         {'name': 'sid', 'value': 'super-secret-session'},
       ];
@@ -191,14 +222,65 @@ void main() {
 
       // The namespace is STILL exactly the slot pool — no per-site key
       // (cookies, webview-state, proxy password) ever appeared.
-      expect(mock.storage.keys.toSet(), equals(slotKeys()),
+      expect(mock.storage.keys.toSet(), equals(poolKeys()),
           reason: 'no per-site secure-storage key may be created');
       // And nothing leaked the archive siteId / cookie value in cleartext;
       // slot bodies are AEAD ciphertext (base64).
       for (final value in mock.storage.values) {
         expect(value.contains('arch-site'), isFalse);
         expect(value.contains('super-secret-session'), isFalse);
+        expect(value.contains('arch-site.test'), isFalse,
+            reason: 'tab addresses stay inside the ciphertext');
       }
+    });
+
+    // ARCH-001 for the salt specifically: it is the one entry the KDF fix adds,
+    // and it would break deniability if it appeared only once the user had an
+    // archive, or varied in shape with the archive count.
+    test('the keychain footprint is identical with zero and with N archives',
+        () async {
+      final withNone = MockFlutterSecureStorage();
+      await Archive(storage: ArchiveStorage(secureStorage: withNone))
+          .ensureInitialized();
+
+      final withArchives = MockFlutterSecureStorage();
+      final archive =
+          Archive(storage: ArchiveStorage(secureStorage: withArchives));
+      for (var i = 0; i < 3; i++) {
+        final handle = await archive.createWithKey(_testKey(20 + i));
+        // TAB-009: holding tabs changes nothing outside the slots either.
+        handle.state.sites.add(_tabbedSite('s$i').toArchiveJson());
+        await archive.save(handle);
+        await archive.close(handle);
+      }
+
+      expect(withArchives.storage.keys.toSet(),
+          equals(withNone.storage.keys.toSet()),
+          reason: 'the entry names must not depend on the archive count');
+      expect(withArchives.storage[kArchiveKdfSaltKey]!.length,
+          equals(withNone.storage[kArchiveKdfSaltKey]!.length));
+      for (final key in withNone.storage.keys) {
+        expect(withArchives.storage[key]!.length,
+            equals(withNone.storage[key]!.length),
+            reason: '$key must be the same size either way');
+      }
+      // Present on a device that has never held an archive, so its existence
+      // says nothing about whether one does.
+      expect(withNone.storage.containsKey(kArchiveKdfSaltKey), isTrue);
+      expect(
+        base64Url.decode(withNone.storage[kArchiveKdfSaltKey]!).length,
+        equals(kArchiveKdfSaltEntryLength),
+      );
+    });
+
+    test('the salt differs per install, so one table cannot cover two devices',
+        () async {
+      final a = ArchiveStorage(secureStorage: MockFlutterSecureStorage());
+      final b = ArchiveStorage(secureStorage: MockFlutterSecureStorage());
+      await a.ensureInitialized();
+      await b.ensureInitialized();
+      expect((await a.ensureKdfSalt()).salt,
+          isNot(equals((await b.ensureKdfSalt()).salt)));
     });
 
     test('a full lifecycle leaves the documents tree byte-identical', () async {
@@ -214,7 +296,7 @@ void main() {
           versionProvider: () => 'test-v1',
         );
         await stateStore.saveState(
-            'app-site', Uint8List.fromList([1, 2, 3, 4, 5]));
+            'app-site', state: Uint8List.fromList([1, 2, 3, 4, 5]));
         final before = await _snapshotDir(docs);
         expect(before, isNotEmpty,
             reason: 'sanity: the app-tier write produced a file to diff against');
@@ -256,7 +338,7 @@ void main() {
         isArchiveTier: true,
       );
 
-      // Mimic the production filter in `_saveWebViewModels`.
+      // Mimic the production filter in `_persistSites`.
       final all = [appA, archX, appB, archY];
       final persisted =
           all.where((m) => !m.isArchiveTier).map((m) => jsonEncode(m.toJson())).toList();
@@ -286,6 +368,152 @@ void main() {
 
       expect(withArchive, equals(withoutArchive));
     });
+
+    test('an app-tier site routes to no archive-tier site (LIR-017)', () {
+      WebViewModel ddg() => WebViewModel(
+            siteId: 'ddg',
+            initUrl: 'https://duckduckgo.com',
+            routeOutboundLinks: true,
+            outboundPreferences: [
+              OutboundPreference(
+                claim: DomainClaim.exactHost('github.com'),
+                targetSiteId: 'gh',
+              ),
+            ],
+          );
+bool prune(List<WebViewModel> sites, {required Map<String, String> archives}) =>
+    OutboundPreferenceGc.pruneAcrossBoundary<WebViewModel>(
+      sites,
+      siteIdOf: (m) => m.siteId,
+      isArchiveTier: (m) => m.isArchiveTier,
+      archiveOf: (m) => archives[m.siteId],
+      prefsOf: (m) => m.outboundPreferences,
+      setPrefs: (m, {required prefs}) => m.outboundPreferences = prefs,
+    );
+
+      // The target moved into an open archive.
+      final open = ddg();
+      expect(
+        prune([
+          open,
+          WebViewModel(
+              siteId: 'gh', initUrl: 'https://github.com', isArchiveTier: true),
+        ], archives: {'gh': 'slot'}),
+        isTrue,
+      );
+      // The same archive, closed: its sites are not in the runtime at all.
+      final closed = ddg();
+      prune([closed], archives: const {});
+      expect(jsonEncode(open.toJson()), jsonEncode(closed.toJson()));
+    });
+  });
+
+  // The legacy cookie engine (used wherever native containers are
+  // unsupported) branched on the raw `incognito` field, not
+  // `effectiveIncognito`. `_persistSites` filters archive-tier sites
+  // out of app-tier persistence, but the engine ran underneath that filter
+  // and put an archive site's non-Secure cookies into plaintext
+  // SharedPreferences (`cookies_fallback`) keyed by its cleartext siteId —
+  // an ARCH-001 byte-identity break the moment an archive is opened.
+  group('Legacy cookie engine leaves no app-tier trace for archive sites', () {
+    late MockCookieManager jar;
+    late MockCookieSecureStorage storage;
+    late CookieIsolationEngine engine;
+
+    setUp(() {
+      jar = MockCookieManager();
+      storage = MockCookieSecureStorage();
+      engine = CookieIsolationEngine(cookieManager: jar, storage: storage);
+    });
+
+    test('unloadSiteForDomainSwitch persists nothing for an archive site',
+        () async {
+      final archived = WebViewModel(
+        siteId: 'arch-1',
+        initUrl: 'https://secret.test',
+        isArchiveTier: true,
+      );
+      await jar.setCookie(
+        url: Uri.parse('https://secret.test/'),
+        name: 'sid',
+        value: 'archive-session',
+        domain: 'secret.test',
+      );
+
+      await engine.unloadSiteForDomainSwitch(
+        index: 0,
+        models: [archived],
+        loadedIndices: {0},
+      );
+
+      expect(storage.allStorage, isEmpty);
+      expect(archived.cookies, isEmpty);
+    });
+
+    test('restoreCookiesForSite skips an archive target and archive siblings',
+        () async {
+      final appSite = WebViewModel(
+        siteId: 'app-1',
+        initUrl: 'https://public.test',
+      );
+      final archived = WebViewModel(
+        siteId: 'arch-1',
+        initUrl: 'https://secret.test',
+        isArchiveTier: true,
+      );
+      await jar.setCookie(
+        url: Uri.parse('https://secret.test/'),
+        name: 'sid',
+        value: 'archive-session',
+        domain: 'secret.test',
+      );
+      await jar.setCookie(
+        url: Uri.parse('https://public.test/'),
+        name: 'sid',
+        value: 'app-session',
+        domain: 'public.test',
+      );
+
+      // Activating the app-tier site sweeps every loaded site into storage.
+      await engine.restoreCookiesForSite(
+        index: 0,
+        models: [appSite, archived],
+        loadedIndices: {0, 1},
+        versionAtEntry: 0,
+        currentVersion: () => 0,
+      );
+      expect(storage.allStorage.keys.toSet(), equals({'app-1'}));
+
+      // Activating the archive site itself must also write nothing.
+      await engine.restoreCookiesForSite(
+        index: 1,
+        models: [appSite, archived],
+        loadedIndices: {0, 1},
+        versionAtEntry: 0,
+        currentVersion: () => 0,
+      );
+      expect(storage.allStorage.containsKey('arch-1'), isFalse);
+    });
+
+    test('preDeleteCookieCleanup only erases the archive site entry',
+        () async {
+      final archived = WebViewModel(
+        siteId: 'arch-1',
+        initUrl: 'https://secret.test',
+        isArchiveTier: true,
+      );
+
+      await engine.preDeleteCookieCleanup(
+        deletedModel: archived,
+        deletedIndex: 0,
+        models: [archived],
+        loadedIndices: {0},
+      );
+
+      // `saveCookiesForSite(id, [])` removes the entry rather than writing
+      // one, so a delete stays an erase.
+      expect(storage.allStorage, isEmpty);
+    });
   });
 
   // The bugs this group catches: an earlier version of _moveSiteToArchive
@@ -299,131 +527,138 @@ void main() {
   // `_webViewModels` on archive close; re-adding at the tail on open)
   // and assert webspace persistence is unchanged across the cycle.
   group('Webspace persistence is invariant across move-to-archive cycle', () {
-    test('flipping isArchiveTier on a webspace member does not change webspace.toJson', () {
+    test('runtime membership keeps an archived site while the archive is open', () {
+      final models = [_siteWithId('a'), _siteWithId('b'), _siteWithId('c')];
+      final ws = Webspace(name: 'Work', siteIds: ['a', 'b', 'c']);
+      _resolveWebspaceIndices([ws], models: models);
+      models[1].isArchiveTier = true;
+      _resolveWebspaceIndices([ws], models: models);
+      expect(ws.siteIds, equals(['a', 'b', 'c']));
+      expect(ws.siteIndices, equals([0, 1, 2]));
+    });
+
+    test('persisted form never names an archived site (ARCH-001)', () {
       final models = [
         _siteWithId('a'),
-        _siteWithId('b'),
+        _siteWithId('b', archive: true),
         _siteWithId('c'),
       ];
       final ws = Webspace(name: 'Work', siteIds: ['a', 'b', 'c']);
-      _resolveWebspaceIndices([ws], models);
-      final beforeJson = jsonEncode(ws.toJson());
-
-      // The runtime effect of "move site b to archive": flip its flag
-      // and re-resolve. The webspace.siteIds field must stay invariant
-      // — and so must its persisted JSON.
-      models[1].isArchiveTier = true;
-      _resolveWebspaceIndices([ws], models);
-
-      expect(ws.siteIds, equals(['a', 'b', 'c']));
-      expect(jsonEncode(ws.toJson()), equals(beforeJson));
-    });
-
-    test('closing an archive (removing its sites from _webViewModels) does not change webspace.toJson', () {
-      final a = _siteWithId('a');
-      final b = _siteWithId('b', archive: true);
-      final c = _siteWithId('c');
-      final models = [a, b, c];
-      final ws = Webspace(name: 'Work', siteIds: ['a', 'b', 'c']);
-      _resolveWebspaceIndices([ws], models);
-      final beforeJson = jsonEncode(ws.toJson());
-
-      // Close archive: archive-tier models drop out of the runtime
-      // list. Webspace.siteIndices loses 'b'; siteIds keeps it.
-      models.removeWhere((m) => m.isArchiveTier);
-      _resolveWebspaceIndices([ws], models);
-
-      expect(ws.siteIndices, equals([0, 1]),
-          reason: 'siteIndices runtime view loses the archive-only site');
+      final archived = {
+        for (final m in models)
+          if (m.isArchiveTier) m.siteId,
+      };
+      final persisted =
+          ArchiveMembershipEngine.persistable([ws], archivedSiteIds: archived);
+      final neverArchived =
+          Webspace(id: ws.id, name: 'Work', siteIds: ['a', 'c']);
+      expect(
+        jsonEncode(persisted.map((w) => w.toJson()).toList()),
+        equals(jsonEncode([neverArchived.toJson()])),
+        reason: 'plaintext form must be byte-identical to a device that '
+            'never held b in this webspace',
+      );
       expect(ws.siteIds, equals(['a', 'b', 'c']),
-          reason: 'siteIds persisted membership is invariant');
-      expect(jsonEncode(ws.toJson()), equals(beforeJson),
-          reason: 'archive close must not perturb webspace persistence');
+          reason: 'runtime list is untouched');
     });
 
-    test('archive close→open round-trip restores siteIndices position membership', () {
+    test('archive-tier collections never enter the persisted form', () {
+      final app = Webspace(name: 'Work', siteIds: ['a']);
+      final arch = Webspace(name: 'Hidden', siteIds: ['b'])
+        ..isArchiveTier = true;
+      final persisted = ArchiveMembershipEngine.persistable([app, arch],
+          archivedSiteIds: {'b'});
+      expect(persisted.map((w) => w.id), equals([app.id]));
+    });
+
+    test('archive close detaches membership into archive state; reopen re-attaches', () {
       final a = _siteWithId('a');
       final b = _siteWithId('b', archive: true);
       final c = _siteWithId('c');
       final models = [a, b, c];
       final ws = Webspace(name: 'Work', siteIds: ['a', 'b', 'c']);
-      _resolveWebspaceIndices([ws], models);
-      expect(ws.siteIndices, equals([0, 1, 2]));
+      _resolveWebspaceIndices([ws], models: models);
 
-      // Close: archive sites leave _webViewModels.
+      // Close: the archived site leaves the runtime list and its
+      // membership moves into the archive's own encrypted state.
+      final membership = ArchiveMembershipEngine.detach([ws], siteIds: {'b'});
       models.removeWhere((m) => m.isArchiveTier);
-      _resolveWebspaceIndices([ws], models);
+      _resolveWebspaceIndices([ws], models: models);
+      expect(membership, equals({ws.id: ['b']}));
+      expect(ws.siteIds, equals(['a', 'c']));
       expect(ws.siteIndices, equals([0, 1]));
+      expect(
+        jsonEncode(ws.toJson()),
+        equals(jsonEncode(
+            Webspace(id: ws.id, name: 'Work', siteIds: ['a', 'c']).toJson())),
+        reason: 'post-close JSON equals a webspace that never held b',
+      );
 
-      // Open: archive sites re-append at the tail (this is what
-      // _materialiseArchive does in main.dart).
+      // Open: the archive site re-appends at the tail and its
+      // membership comes back from the archive state.
       models.add(b);
-      _resolveWebspaceIndices([ws], models);
+      ArchiveMembershipEngine.attach([ws], membership: membership);
+      _resolveWebspaceIndices([ws], models: models);
+      expect(ws.siteIds, equals(['a', 'c', 'b']));
+      expect(ws.siteIndices, equals([0, 1, 2]));
+    });
 
-      // siteIndices now [a=0, b=2 (tail), c=1] — order driven by
-      // siteIds, not _webViewModels position.
-      expect(ws.siteIndices, equals([0, 2, 1]));
+    test('attach skips ids already present and webspaces that are gone', () {
+      final ws = Webspace(id: 'w1', name: 'Work', siteIds: ['a', 'b']);
+      ArchiveMembershipEngine.attach([ws], membership: {
+        'w1': ['b', 'c'],
+        'gone': ['z'],
+      });
       expect(ws.siteIds, equals(['a', 'b', 'c']));
+    });
+
+    test('record merges into existing membership without duplicates', () {
+      final ws = Webspace(id: 'w1', name: 'Work', siteIds: ['a', 'b']);
+      final m = ArchiveMembershipEngine.record(
+        [ws],
+        siteIds: {'b'},
+        existing: {
+          'w1': ['b'],
+          'w9': ['z'],
+        },
+      );
+      expect(m, equals({'w1': ['b'], 'w9': ['z']}));
+      expect(ws.siteIds, equals(['a', 'b']), reason: 'record never mutates');
+    });
+
+    test('moving a site back out forgets it in the archive state', () {
+      final membership = {
+        'w1': ['b', 'x'],
+        'w2': ['b'],
+      };
+      ArchiveMembershipEngine.forget(membership, siteId: 'b');
+      expect(membership, equals({'w1': ['x']}));
     });
 
     test('closing an archive updates webspace.siteIndices.length (regression: stale per-webspace site counts after close)', () {
-      // A user moves a site that lives in a custom webspace into an
-      // archive. While the archive is open, the webspace shows the
-      // site at its position. After close, the site is gone from
-      // `_webViewModels` AND must be gone from the runtime
-      // `webspace.siteIndices` view that the home-screen renderer
-      // consults for its per-webspace site count. The bug this test
-      // catches: _closeArchive removed models from `_webViewModels`
-      // but did not re-resolve `siteIndices`, leaving stale positions
-      // in every webspace whose siteIds referenced the closed sites.
       final a = _siteWithId('a');
       final b = _siteWithId('b', archive: true);
       final c = _siteWithId('c');
       final models = [a, b, c];
       final work = Webspace(name: 'Work', siteIds: ['a', 'b', 'c']);
-      _resolveWebspaceIndices([work], models);
+      _resolveWebspaceIndices([work], models: models);
       expect(work.siteIndices.length, equals(3),
           reason: 'three members visible while archive is open');
 
-      // Simulate archive close: archive-tier models leave the list.
+      ArchiveMembershipEngine.detach([work], siteIds: {'b'});
       models.removeWhere((m) => m.isArchiveTier);
-      _resolveWebspaceIndices([work], models);
+      _resolveWebspaceIndices([work], models: models);
 
       expect(work.siteIndices.length, equals(2),
           reason: 'archive site must drop out of the runtime view');
-      expect(work.siteIds, equals(['a', 'b', 'c']),
-          reason: 'persisted membership still remembers b');
-    });
-
-    test('byte-equality across full add-site → move-to-archive → save → close → save cycle', () {
-      // The headline ARCH-001 contract: a user who adds a site to a
-      // named webspace and then archives it sees their webspaces.json
-      // unchanged when the archive is closed, regardless of whether
-      // the archive was ever touched.
-      final models = [_siteWithId('a'), _siteWithId('b'), _siteWithId('c')];
-      final webspaces = [
-        Webspace(name: 'Work', siteIds: ['a', 'b']),
-        Webspace(name: 'Personal', siteIds: ['c']),
-      ];
-      _resolveWebspaceIndices(webspaces, models);
-      final beforeJson =
-          jsonEncode(webspaces.map((w) => w.toJson()).toList());
-
-      // Simulate: move 'b' into an archive; close the archive.
-      models[1].isArchiveTier = true;
-      _resolveWebspaceIndices(webspaces, models);
-      models.removeWhere((m) => m.isArchiveTier); // archive close
-      _resolveWebspaceIndices(webspaces, models);
-
-      final afterJson =
-          jsonEncode(webspaces.map((w) => w.toJson()).toList());
-      expect(afterJson, equals(beforeJson));
+      expect(work.siteIds, equals(['a', 'c']),
+          reason: 'nothing app-tier remembers b once the archive is closed');
     });
   });
 
   // Legacy-data migration: webspaces persisted before the siteId
-  // refactor stored positional `siteIndices` in JSON. The migration
-  // step in main.dart resolves those indices against the loaded
+  // refactor stored positional `siteIndices` in JSON.
+  // `promoteLegacySiteIndices` resolves those indices against the loaded
   // _webViewModels to populate siteIds. These tests pin the
   // migration's behaviour so a future change to load order or
   // resolution rules can't silently drop pre-existing webspace
@@ -438,15 +673,9 @@ void main() {
       expect(ws.siteIds, isEmpty);
       expect(ws.siteIndices, equals([0, 2]));
 
-      // Mirror of _migrateLegacyWebspaceIndices in main.dart.
       final models = [_siteWithId('a'), _siteWithId('b'), _siteWithId('c')];
-      if (ws.siteIds.isEmpty && ws.siteIndices.isNotEmpty) {
-        ws.siteIds = [
-          for (final idx in ws.siteIndices)
-            if (idx >= 0 && idx < models.length) models[idx].siteId,
-        ];
-      }
-      _resolveWebspaceIndices([ws], models);
+      promoteLegacySiteIndices([ws], sites: models);
+      _resolveWebspaceIndices([ws], models: models);
 
       expect(ws.siteIds, equals(['a', 'c']));
       expect(ws.siteIndices, equals([0, 2]));
@@ -465,12 +694,7 @@ void main() {
       final beforeIds = List<String>.from(ws.siteIds);
       final models = [_siteWithId('a'), _siteWithId('b')];
       // Migration short-circuits when siteIds is already populated.
-      if (ws.siteIds.isEmpty && ws.siteIndices.isNotEmpty) {
-        ws.siteIds = [
-          for (final idx in ws.siteIndices)
-            if (idx >= 0 && idx < models.length) models[idx].siteId,
-        ];
-      }
+      promoteLegacySiteIndices([ws], sites: models);
       expect(ws.siteIds, equals(beforeIds));
     });
 
@@ -484,12 +708,7 @@ void main() {
         'siteIndices': [0, 5, 10],
       });
       final models = [_siteWithId('a'), _siteWithId('b'), _siteWithId('c')];
-      if (ws.siteIds.isEmpty && ws.siteIndices.isNotEmpty) {
-        ws.siteIds = [
-          for (final idx in ws.siteIndices)
-            if (idx >= 0 && idx < models.length) models[idx].siteId,
-        ];
-      }
+      promoteLegacySiteIndices([ws], sites: models);
       expect(ws.siteIds, equals(['a']));
     });
   });
@@ -516,26 +735,12 @@ Future<Map<String, String>> _snapshotDir(Directory dir) async {
   return out;
 }
 
-/// Mirror of `_WebSpacePageState._resolveWebspaceIndices`. The runtime
-/// `webspace.siteIndices` view is recomputed from `webspace.siteIds`
-/// against the current `_webViewModels`. Duplicated here so the
-/// neutrality tests can exercise the contract without dragging in a
-/// full widget test harness.
 void _resolveWebspaceIndices(
-  List<Webspace> webspaces,
-  List<WebViewModel> models,
-) {
-  final positionBySiteId = <String, int>{
-    for (var i = 0; i < models.length; i++) models[i].siteId: i,
-  };
-  for (final ws in webspaces) {
-    if (ws.isAll) continue;
-    ws.siteIndices = [
-      for (final sid in ws.siteIds)
-        if (positionBySiteId.containsKey(sid)) positionBySiteId[sid]!,
-    ];
-  }
-}
+  List<Webspace> webspaces, {
+  required List<WebViewModel> models,
+}) =>
+    WebspaceSelectionEngine.resolveIndices(
+        webspaces, siteIdsByPosition: [for (final m in models) m.siteId]);
 
 WebViewModel _siteWithId(String siteId, {bool archive = false}) {
   return WebViewModel(
@@ -544,3 +749,17 @@ WebViewModel _siteWithId(String siteId, {bool archive = false}) {
     isArchiveTier: archive,
   );
 }
+
+/// An archive-tier site with a tab tree, its active tab not the first.
+WebViewModel _tabbedSite(String siteId) => WebViewModel(
+      siteId: siteId,
+      initUrl: 'https://$siteId.test/',
+      isArchiveTier: true,
+      tabs: [
+        SiteTab(id: 'root', url: 'https://$siteId.test/a', title: 'A'),
+        SiteTab(
+            id: 'child', url: 'https://$siteId.test/a/1', parentId: 'root'),
+        SiteTab(id: 'other', url: 'https://$siteId.test/b'),
+      ],
+      activeTabId: 'child',
+    );

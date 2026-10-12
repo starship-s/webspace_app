@@ -11,12 +11,16 @@
 /// and a home-shortcut tap (`WebspaceSelectionEngine
 /// .indicesToResetOnShortcutLaunch`, AOH-004) — neither is a lifecycle event.
 /// A flagged site is therefore handled here exactly like any other site.
+library;
+
+import 'dart:ui' show AppLifecycleState;
+
 class LifecycleBackgroundPlan {
   /// Active site whose JS timers should pause for the background, or null when
-  /// there is no eligible active site, it is a notification site (which must
-  /// keep ticking to fire notifications), or ANY loaded site has background
-  /// audio enabled (BGAUDIO-002: the pause is process-global on Android, so a
-  /// backgrounded audio site would be starved by pausing the active one).
+  /// there is no eligible active site, or ANY loaded site has notifications
+  /// (NOTIF-011) or background audio (BGAUDIO-002) enabled: the pause is
+  /// process-global on Android, so pausing the active site would also freeze
+  /// every backgrounded site that has to keep running.
   final int? jsPauseIndex;
 
   /// Active site whose restore-state bytes should be captured, or null. Capture
@@ -47,6 +51,17 @@ class LifecycleBackgroundPlan {
 }
 
 class AppLifecycleEngine {
+  /// Whether a `didHaveMemoryPressure` callback asks the PAUSE-006 cascade to
+  /// trim. Flutter delivers two things through it: an OS memory warning, and
+  /// every exit from the screen (the iOS engine's `flutterDidEnterBackground`
+  /// calls `notifyLowMemory`; the Android embedding forwards
+  /// `TRIM_MEMORY_UI_HIDDEN` and every level above it). Only one arriving while
+  /// the app is resumed can be the OS asking. Trimming on the other disposed a
+  /// site for every two trips to the home screen, notification sites with live
+  /// connections included (PAUSE-034, BUG-024).
+  static bool memoryPressureTrims(AppLifecycleState? state) =>
+      state == AppLifecycleState.resumed;
+
   /// The active, in-bounds, loaded site index eligible for lifecycle
   /// pause/resume, or null. Mirrors the call-site guard
   /// `currentIndex != null && currentIndex < siteCount && loaded`.
@@ -99,8 +114,42 @@ class AppLifecycleEngine {
     return out;
   }
 
+  /// True when any loaded, in-bounds site has notifications enabled
+  /// (NOTIF-011). Same veto shape as [anyLoadedBackgroundAudio]: the page JS
+  /// that posts a notification is the page's own, so a notification site
+  /// sitting behind a plain active site is frozen by the process-global
+  /// Android pause exactly as an audio site's player is.
+  static bool anyLoadedNotifications({
+    required int siteCount,
+    required Set<int> loadedIndices,
+    required bool Function(int index) notificationsEnabled,
+  }) {
+    for (final i in loadedIndices) {
+      if (i < 0 || i >= siteCount) continue;
+      if (notificationsEnabled(i)) return true;
+    }
+    return false;
+  }
+
+  static bool _vetoesJsPause({
+    required int siteCount,
+    required Set<int> loadedIndices,
+    required bool Function(int index) notificationsEnabled,
+    required bool Function(int index) backgroundAudioEnabled,
+  }) =>
+      anyLoadedNotifications(
+        siteCount: siteCount,
+        loadedIndices: loadedIndices,
+        notificationsEnabled: notificationsEnabled,
+      ) ||
+      anyLoadedBackgroundAudio(
+        siteCount: siteCount,
+        loadedIndices: loadedIndices,
+        backgroundAudioEnabled: backgroundAudioEnabled,
+      );
+
   /// Plan for `AppLifecycleState.paused`. The active site's JS timers pause
-  /// only when it is loaded, NOT a notification site, and no loaded site has
+  /// only when it is loaded and no loaded site has notifications or
   /// background audio enabled; restore-state is captured for any loaded
   /// active site. Every loaded site without background audio has its media
   /// paused (BGAUDIO-009), the active one included.
@@ -137,12 +186,12 @@ class AppLifecycleEngine {
         mediaPauseIndices: mediaPause,
       );
     }
-    final skipJsPause = notificationsEnabled(active) ||
-        anyLoadedBackgroundAudio(
-          siteCount: siteCount,
-          loadedIndices: loadedIndices,
-          backgroundAudioEnabled: backgroundAudioEnabled,
-        );
+    final skipJsPause = _vetoesJsPause(
+      siteCount: siteCount,
+      loadedIndices: loadedIndices,
+      notificationsEnabled: notificationsEnabled,
+      backgroundAudioEnabled: backgroundAudioEnabled,
+    );
     return LifecycleBackgroundPlan(
       jsPauseIndex: skipJsPause ? null : active,
       captureStateIndex: active,
@@ -153,8 +202,8 @@ class AppLifecycleEngine {
 
   /// Active site whose JS timers should resume on `AppLifecycleState.resumed`:
   /// the loaded active site unless the background plan would have skipped its
-  /// pause (notification site, or a loaded background-audio site — never
-  /// paused, so nothing to resume). The renderer probe runs against
+  /// pause (a loaded notification or background-audio site: never paused, so
+  /// nothing to resume). The renderer probe runs against
   /// [activeLoadedIndex] regardless — exempted sites included.
   static int? resumeJsIndex({
     required int? currentIndex,
@@ -169,10 +218,10 @@ class AppLifecycleEngine {
       loadedIndices: loadedIndices,
     );
     if (active == null) return null;
-    if (notificationsEnabled(active)) return null;
-    if (anyLoadedBackgroundAudio(
+    if (_vetoesJsPause(
       siteCount: siteCount,
       loadedIndices: loadedIndices,
+      notificationsEnabled: notificationsEnabled,
       backgroundAudioEnabled: backgroundAudioEnabled,
     )) {
       return null;

@@ -145,6 +145,12 @@ The app SHALL allow sharing, saving, or copying the current page's HTML source v
 The app SHALL allow saving the current site's favicon as a PNG file via an
 AppBar action button, regardless of the source format the site serves.
 
+The icon saved SHALL be the one the drawer shows for the site, taken in the
+drawer's order: the user's custom icon, then the page icon the site's webview
+produced ([icon-fetching](../icon-fetching/spec.md) ICON-009/013), then the
+fetched favicon. `displayedSiteIconAsPng` is that order, shared with the home
+shortcut (HS-003).
+
 The favicon SHALL be fetched through the same proxy-aware client as all other
 favicon requests (per-site proxy, fail-closed when it cannot be honored), so
 the action never leaks the device IP.
@@ -156,11 +162,21 @@ and SVG sources are rasterized.
 #### Scenario: Save favicon to a PNG file
 
 **Given** a site is loaded with a resolvable favicon
+**And** it has no custom icon and no page icon
 **When** the user taps the image icon in the AppBar
 **Then** the favicon is resolved (preferring the `FaviconUrlCache` entry for
 the site's `initUrl`) and fetched through the site's proxy
 **And** it is normalized to PNG bytes
 **And** a file save dialog appears with filename `{domain}_icon.png`
+
+#### Scenario: The page icon on screen is the one saved
+
+**Given** Site icons only is on and the drawer shows the PNG icon a GitHub page
+declared
+**And** `FaviconUrlCache` holds the SVG the home page scrape found
+**When** the user saves the icon
+**Then** the saved PNG is the drawer's icon
+**And** the SVG is not fetched
 
 #### Scenario: SVG favicon is rasterized
 
@@ -342,6 +358,91 @@ is shared / saved / copied
 
 ---
 
+### Requirement: DEVTOOLS-010 - Developer Mode Gate
+
+The app SHALL carry an app-global **developer mode** flag, off by default, that gates affordances which exist to diagnose the app rather than to use it.
+
+Diagnostics accumulate. A blank-screen repaint action (`webview-pause-lifecycle` PAUSE-028) is the first, and each one is a control an ordinary user cannot interpret sitting in a menu they open to refresh a page. Hiding them behind a debug build is not an option either: the users who hit these bugs run release builds, and the report is worth nothing if they cannot reach the tool. So the flag is reachable on every build and reached only deliberately.
+
+- **The gesture.** App Settings SHALL show a **Version** row in the About section carrying `version+buildNumber`. Seven taps on it turn developer mode on, the Android developer-options convention, so the gesture needs no discovery mechanism of its own. The first two taps SHALL say nothing (a stray double tap is not a discovery), the third through sixth SHALL show the remaining count, and the seventh SHALL confirm. Each message SHALL replace the previous one rather than queue behind it, or the countdown lags several taps behind the finger. Tapping while already on SHALL say so and SHALL NOT count. Counting logic lives in `DeveloperUnlockEngine` (`lib/services/developer_unlock_engine.dart`), not in the widget.
+- **Turning it off.** Once on, the Developer section SHALL show a **Developer mode** switch, so the state is visible and reversible without repeating the gesture. The switch is hidden while off: a control whose only purpose is to undo a hidden gesture has nothing to say before the gesture happens.
+- **Reading it.** `DeveloperModeService.instance.enabled` (`lib/services/developer_mode_service.dart`) is the single reader. It is a service rather than a widget parameter because both webview-hosting screens consult it and it is **not** a per-site setting: routing it through the per-site `launchUrl` pipeline would misfile it as one. A `PopupMenuButton`'s `itemBuilder` runs each time the menu opens, so a flip takes effect with no rebuild and no restart.
+- **Persistence.** The flag is a user-facing global pref: it SHALL be registered in `AppPref` (`AppPref.developerMode`) so it round-trips export/import, and the service SHALL be re-read after an import, which writes the raw key through the registry behind the service's cache.
+
+#### Scenario: Unlocking developer mode
+
+**Given** developer mode is off
+**When** the user taps the Version row in App Settings seven times
+**Then** the last five taps count down and the seventh confirms developer mode is on
+**And** the Developer section grows a Developer mode switch that turns it back off
+
+#### Scenario: A stray tap says nothing
+
+**Given** developer mode is off
+**When** the user taps the Version row twice
+**Then** no message is shown, because the gesture has not been recognisably started
+
+#### Scenario: The flag survives a backup round trip
+
+**Given** developer mode is on and the user exports settings
+**When** that backup is imported
+**Then** developer mode is on and the service reflects it without a restart
+
+---
+
+### Requirement: DEVTOOLS-012 - Background Log
+
+The app SHALL keep a **background log** while developer mode (DEVTOOLS-010) is on: a record of what happened while the app was not on screen, readable on the device itself, so a user whose notifications never arrived can see where the chain stopped without logcat or Console.app.
+
+The App Logs ring (DEVTOOLS-004) cannot answer that question. It lives in memory, so the process the OS killed in the background takes its lines with it, and the steps that matter most run in native code before any Dart exists: an Android `NotificationRefreshWorker` that finds no Flutter engine, an iOS `BGAppRefreshTask` that expires. The background log is written to a file the native plugins append to themselves, and Dart appends its own background lines to the same file.
+
+- **What it records.** App lifecycle transitions (backgrounded with the notification/background-audio inputs, resumed with the time away, the process start and, on iOS, the launch state); every change of the schedule/cancel decision with the enabled and loaded notification-site counts; every OS refresh (iOS task receipt, expiration, supersession and completion; Android enqueue, cancel, worker run, engine reachability, completion or timeout, a worker stopped early with its stop reason; engine attach/detach); every wake with a per-site outcome (load settled or not, unread baseline and current count, whether the page or the wake posted, NOTIF-013/014); every notification posted, dropped for a denied permission, or failed; and every notification site unloaded, with the reason (memory pressure, proxy or Tor exit-country mismatch, the loaded-site cap, a webspace switch, a home reset, a settings import), since an unloaded site has lost its live connection and is reached only by a wake's headless check (NOTIF-016).
+- **What no lifecycle line shows.** On iOS each OS memory warning with the application state, each Low Power Mode change and the mode at launch when it is on (iOS turns off Background App Refresh while it lasts), `willTerminate`, and at launch a note when the previous process ended inside its grace period: the log's last word on that window is its start, with no expiry, resume or termination after it. On Android each trim level the system sends other than `TRIM_MEMORY_UI_HIDDEN`. These tell a real memory warning from the exit signal Flutter also reports as memory pressure (PAUSE-034), and a wake the OS withheld from one that failed.
+- **System state.** The tab SHALL show the OS gates a refresh and a notification depend on, read when it opens: on iOS the Background App Refresh status, Low Power Mode, notification authorization and alert setting, and the pending refresh requests; on Android notification enablement, the `POST_NOTIFICATIONS` grant, the channel importance, battery-optimisation exemption, power-save and idle mode, the standby bucket, background restriction, and the refresh work's state, attempts and next run time; on every platform the counts of notification sites enabled, loaded and with a live webview. Copy and Export SHALL put these rows above the entries, so a log shared from a device carries the gate that stopped its wakes; none of them names a site.
+- **Sensitive separation.** Each entry has a normal line that names sites only by position and count, and MAY have a sensitive companion carrying the site name, `siteId`, page title or notification text. The companion SHALL live only in memory, SHALL NOT reach the native file, an export, or the clipboard without the DEVTOOLS-004 confirmation, and SHALL be shown only while the tab's switch is on (reset per launch). The native side SHALL have no site data to record: its only path in from Dart is the append of normal lines.
+- **Lifetime.** Recording SHALL run only while developer mode is on, and turning developer mode off SHALL delete the log. The native file exists only while recording, so a process the OS starts for a background task records exactly when developer mode is on. The file SHALL be capped (newest 1000 lines, a few days of ordinary use) and compacted atomically.
+- **Single owner (BUG-007).** Every read, append, compaction and delete of the native file SHALL run on one serial executor (Android) or dispatch queue (iOS). Gated by `test/js/background_log_native.test.js`.
+- **Archive (ARCH-001, ARCH-006).** The log adds no SharedPreferences or secure-storage key, and archive-tier sites never have notifications on (`effectiveNotificationsEnabled`), so they are never woken, posted for, or named.
+
+#### Scenario: A wake that found no engine is on record after the process died
+
+**Given** developer mode is on and the app was backgrounded with a notification site loaded
+**And** Android later killed the process
+**When** the periodic refresh fires
+**Then** the worker's run and "no Flutter engine in this process; refresh skipped" are appended to the native file
+**And** the next time the user opens Developer Tools, the Background tab shows both lines
+
+#### Scenario: A process that ended inside its grace period is named at the next launch
+
+**Given** developer mode is on and the app left the screen, so "grace period started" is the log's last line about that window
+**When** the process ends before the grace period expires or the app resumes, without `willTerminate`, and the user opens the app later
+**Then** the native file gets "the previous process ended inside its grace period, without an expiry or a termination notice" before the new "process launched" line
+
+#### Scenario: An unloaded notification site is named as the reason nothing wakes
+
+**Given** developer mode is on and one notification site is loaded
+**When** a memory-pressure event unloads it and the app is then backgrounded
+**Then** the log shows a warning that a notification site was unloaded for memory pressure, with 0 of 1 still loaded
+**And** the schedule line shows the refresh cancelled with 1 enabled and 0 loaded
+
+#### Scenario: Site names stay behind the switch and off disk
+
+**Given** a wake posted for a site named "Mail"
+**When** the user opens the Background tab
+**Then** the wake's per-site line reads "wake site 1/1: ..." with no name
+**When** the user turns on the switch
+**Then** the companion line naming "Mail" appears beneath it, marked sensitive
+**And** the native file, an export, and a copy without confirmation carry no "Mail"
+
+#### Scenario: Turning developer mode off deletes the log
+
+**Given** the background log holds entries
+**When** the user turns developer mode off
+**Then** the native file and the in-memory entries are deleted
+**And** nothing more is recorded until developer mode is on again
+
+---
+
 ### Requirement: DEVTOOLS-007 - Console Eval
 
 The app SHALL provide a JavaScript evaluation input in the Console tab, allowing users to execute arbitrary JS in the context of the current page and see results inline, like a standard browser console.
@@ -377,6 +478,87 @@ The app SHALL provide a JavaScript evaluation input in the Console tab, allowing
 
 ---
 
+### Requirement: DEVTOOLS-011 - Experimental Features
+
+A feature that ships before it is finished SHALL be reachable only while developer mode is on (DEVTOOLS-010) **and** its own switch in the Experimental group is on. The switch only narrows developer mode: with developer mode off no experimental feature is reachable, whatever its switch reads, so "is this feature reachable" keeps one answer.
+
+- **The group.** App settings' Developer section SHALL show an **Experimental** group while developer mode is on, listing one switch per experimental feature that this platform can run. With no such feature on the platform, the group SHALL NOT be shown. Each switch carries its explanation behind a `HintButton` (HINT-001).
+- **The switches keep their positions.** Turning developer mode off SHALL leave every switch as it was, so turning developer mode back on restores the same set of features.
+- **Reading it.** `ExperimentalFeaturesService.instance.isEnabled(feature)` (`lib/services/experimental_features_service.dart`) is the single reader. The rule itself, developer mode and the switch, is the pure `experimentalFeatureEnabled`.
+- **Persistence.** Each switch is a user-facing global pref registered in `AppPref`, so it round-trips export and import, and the service SHALL be re-read after an import.
+- **Defaults.** A feature that developer mode alone opened before this group existed SHALL default its switch on, so an upgrade does not turn it off for a user who had it. A new feature SHALL default off.
+- **Leaving the group.** A feature that graduates SHALL remove its switch and stop reading this gate; one that is dropped SHALL remove its switch with its code.
+
+The features are:
+
+| Feature | Switch | Default | Gate |
+|---|---|---|---|
+| Android's per-site proxy router (`proxy` PROXY-013) | Proxy router | on | `ProxyRouterService.isSupported`, read once at launch |
+| A site's icon taken only from the site: no third-party icon service, and on Android the declared links in place of WebView's icon (`icon-fetching` ICON-014) | Site icons only | off | `publicIconServicesAllowed` in `icon_service.dart`, read on every icon fetch; `pageIconSource` in `site_icon_fetcher.dart`, read when a site's webview is created |
+| Android's texture page rendering (`webview-pause-lifecycle` PAUSE-032) | Texture page rendering | off | `WebViewFactory.hybridComposition`, read once at launch |
+| Tor sites through a tor already running on the device, on Android, Linux and macOS (`tor-proxy` TOR-025) | Tor (external) | off | `TorService.wantsExternal`, read again on every flip of the switch or of developer mode (`runtimeChoiceChanged`), so it applies without a relaunch |
+
+Outbound link routing (`link-intent-routing` LIR-013 to LIR-017) was in the group with a switch that defaulted off; it graduated with the site info sheet (`site-info-sheet`, NAV-011), which shows the site and container a routed page runs as. Page icons fetched from the links a page declares on iOS, macOS and Linux (`icon-fetching` ICON-013) were in the group with a switch that defaulted off; they graduated to the default there, and the group's Site icons only switch took the slot.
+
+The proxy library and the connection indicator (`proxy` PROXY-030, PROXY-031) were in the group with a Saved proxies switch that defaulted off; they graduated, and are offered with developer mode on or off.
+
+Tabs inside a site (`inactive-tabs` TAB-012), and web search, whose results are tabs (`link-intent-routing` LIR-029), were in the group with a Site tabs switch that defaulted off; they graduated. Tabs answer to each site's own Tabs switch (TAB-013) alone, and web search is offered with developer mode on or off.
+
+The embedded Tor client (`tor-proxy` TOR-007) was the first feature in the group, with a Built-in Tor switch that defaulted on; it graduated, and Tor is now offered wherever the platform has the runtime, with developer mode on or off.
+
+#### Scenario: A feature needs both
+
+- **GIVEN** developer mode is on and the Site icons only switch is off
+- **WHEN** a site's icon is fetched
+- **THEN** Google's and DuckDuckGo's icon services are asked
+- **AND** after turning the switch on, the next fetch asks neither, with no restart
+
+#### Scenario: Developer mode off closes every feature
+
+- **GIVEN** the Site icons only switch is on
+- **WHEN** the user turns developer mode off
+- **THEN** the next icon fetch asks Google's and DuckDuckGo's icon services again
+- **AND** turning developer mode back on stops it again, with the switch still on
+
+#### Scenario: The group appears with developer mode
+
+- **GIVEN** an iOS build with developer mode off
+- **WHEN** the user opens App settings
+- **THEN** there is no Experimental group
+- **AND** after unlocking developer mode the Developer section shows it, with Site icons only off and no Tor switch
+
+#### Scenario: Only what this platform can run
+
+- **GIVEN** an Android build whose WebView reports `MULTI_PROFILE`, with developer mode on
+- **WHEN** the user opens App settings
+- **THEN** the Experimental group lists Proxy router, on, and Texture page rendering, Site icons only and Tor (external), off
+
+#### Scenario: A platform without the router
+
+- **GIVEN** a Linux build with developer mode on
+- **WHEN** the user opens App settings
+- **THEN** the Experimental group lists only Site icons only and Tor (external), both off
+
+#### Scenario: Site icons only starts off
+
+- **GIVEN** an Android build with developer mode on and the Site icons only switch never touched
+- **WHEN** a site's icon is fetched
+- **THEN** Google's and DuckDuckGo's icon services are asked, and the site's webview reports its icon
+- **AND** after the user turns Site icons only on, neither service is asked, and a site opened afterwards gets the icon its page declares
+
+#### Scenario: The proxy router switch applies at next launch
+
+- **GIVEN** router mode is running on Android
+- **WHEN** the user turns the Proxy router switch off
+- **THEN** the relay stays bound until the app restarts
+- **AND** after the restart mismatched-proxy sites serialise under PROXY-008
+
+#### Scenario: Switches survive a backup round trip
+
+- **GIVEN** the Site icons only switch is on and the user exports settings
+- **WHEN** that backup is imported
+- **THEN** the switch is on without a restart
+
 ## Implementation Details
 
 ### Files
@@ -385,7 +567,10 @@ The app SHALL provide a JavaScript evaluation input in the Console tab, allowing
 |------|------|
 | `lib/services/log_service.dart` | LogService singleton, LogEntry, LogLevel enum |
 | `lib/screens/dev_tools.dart` | DevToolsScreen plus DevToolsHost abstraction (WebViewModelDevToolsHost, NestedDevToolsHost). Tabs/actions are gated on `host != null` (Console, Share HTML, Save Icon) and `host.blockedCookies != null` (Cookies, DNS, Scripts). |
-| `lib/services/icon_png_export.dart` | Resolves a site favicon, fetches it via the proxy-aware icon client, and normalizes any source (PNG/ICO/JPEG/SVG) to PNG bytes (`exportIconAsPng`). |
+| `lib/services/background_log.dart` | DEVTOOLS-012 `BackgroundLog`: records background lines (normal to the native file, sensitive companions in memory), merges the native file with this process, exposes the system-state rows. |
+| `lib/widgets/background_log_view.dart` | The Background tab: system state, the log, the sensitive switch, Refresh / Export / Copy / Clear. |
+| `android/.../BackgroundLogFile.kt`, `ios/Runner/BackgroundTaskPlugin.swift` (`BackgroundLogFile`) | Native background-log file, single-owner executor / queue, and the system-state query. |
+| `lib/services/icon_png_export.dart` | The icon the drawer shows, as PNG (`displayedSiteIconAsPng`); resolves a site favicon, fetches it via the proxy-aware icon client, and normalizes any source (PNG/ICO/JPEG/SVG) to PNG bytes (`exportIconAsPng`). |
 | `lib/screens/inappbrowser.dart` | InAppWebViewScreen owns a NestedDevToolsHost: forwards onConsoleMessage / onUrlChanged / onControllerCreated and exposes a "Developer Tools" entry in the popup menu. |
 
 ### Data Models
@@ -411,9 +596,10 @@ class ConsoleLogEntry {
 
 - `WebViewConfig.onConsoleMessage` callback wired in `WebViewFactory.createWebView()`
 - `WebViewModel.consoleLogs` and `NestedDevToolsHost.consoleLogs`, both ring buffers (max 500 entries)
-- All service files use `LogService.instance.log()` instead of `debugPrint()`
+- All service files log through a `LogTag` (`LogTag.x.debug(...)`, `sensitive: true` for per-site identifiers) instead of `debugPrint()`
 - Popup menu "Developer Tools" item in `main.dart` (top-level sites) and `inappbrowser.dart` (nested webviews)
 - "App Logs" tile in App Settings screen
+- `lib/services/developer_mode_service.dart` + `lib/services/developer_unlock_engine.dart` — DEVTOOLS-010 gate and its unlock gesture; `test/developer_unlock_engine_test.dart` characterizes the counting
 
 ---
 
@@ -430,3 +616,5 @@ class ConsoleLogEntry {
 8. **Filtered copy**: on each tab, enter a search query, tap Copy, and verify clipboard contains only the matching entries (not all). On the DNS tab also select the "Blocked" chip and confirm the allowed lookups stay off the clipboard
 8a. **Sensitive copy**: on the App Logs tab turn on "Show sensitive entries", tap Copy, cancel the dialog and verify the clipboard is untouched; tap Copy again, confirm, and verify the sensitive lines are in the paste. Then tap Export and verify the written file has none of them
 9. Go back, open App Settings -> App Logs: verify it works without a site loaded (share and scripts icons should not appear)
+9a. **Background log**: with developer mode on, App Settings -> Background log opens Developer Tools on the Background tab. Background the app, wait for a refresh (or use Simulate background refresh on a site's App Logs tab), reopen and verify the lines and the System state rows. Turn on the switch and verify site names appear only then; Export and verify the file has none. Turn developer mode off and on and verify the log is empty
+10. **Developer mode**: App Settings -> About -> tap Version seven times; verify the countdown starts on the third tap, each message replaces the last, and the seventh confirms. Verify a Developer mode switch appears in the Developer section, and that the page overflow menu now carries Repaint Screen on Android. Turn the switch off and verify the entry goes away

@@ -45,20 +45,22 @@ The system SHALL route every adblock decision — network blocking, cosmetic sel
 
 #### Scenario: Serialized engine cache speeds up warm starts
 
-**Given** a previous run wrote `<docs>/content_blocker_cache/.engine.bin` and `.engine.meta`
-**And** the meta's `<rulesHash>:<uboFlag>` matches the current state
+**Given** a previous run wrote `<docs>/content_blocker_cache/.engine.bin`, `.engine.prefilter` and `.engine.meta`
+**And** the meta names the same inputs as the current state: the app build (which fixes the pruning, rewrite and parser code), the platform the lists are pruned for, the uBO flag, and per enabled list in order its file stamp (size and modification time) or its inline rules' hash, and the hosts masked away from it
 **When** the next `_rebuildEngine` runs
-**Then** the engine is hydrated from the blob via `AdblockEngine.loadFromSerialized`
-**And** the multi-megabyte text parse is skipped
-**And** the load mode logs as `deserialize`
+**Then** the engine is hydrated from the blob via `AdblockEngine.loadFromSerialized` and the interceptor prefilter is read from `.engine.prefilter`
+**And** no list's text is read, pruned, rewritten or parsed
+**And** the engine is in place before `initialize` returns, as on a cold build: `main()` awaits it before `runApp`, so no page loads without it
 
-#### Scenario: Cache invalidates on rule or uBO-resources change
+#### Scenario: Cache invalidates on any input change
 
-**Given** the on-disk `.engine.meta` records hash X with uBO flag 1
-**When** either the concatenated rule text or the uBO toggle changes (`<rulesHash>:<uboFlag>` differs)
-**Then** the cache is treated as a miss
+**Given** the on-disk `.engine.meta` names inputs X
+**When** a list is downloaded again, a list is toggled, a site masks a list away, the uBO toggle flips, or the app is upgraded
+**Then** the inputs differ from X and the cache is treated as a miss
 **And** the engine re-parses from rule text
-**And** a fresh blob is written for the next warm start
+**And** a fresh blob, prefilter and meta are written for the next warm start, the meta last so a write cut short never matches
+
+Test: `test/content_blocker_engine_cache_test.dart`.
 
 #### Scenario: Cache miss falls back to parse
 
@@ -118,6 +120,8 @@ Users SHALL be able to manage multiple filter lists with download, enable/disabl
 **When** they enter a name and URL
 **Then** the custom list is added to the lists registry
 **And** it can be downloaded, enabled/disabled, and removed like default lists
+**And** a list whose rules are written in the app instead of downloaded is
+covered by CB-016
 
 #### Scenario: Remove a custom list
 
@@ -137,6 +141,13 @@ Users SHALL be able to manage multiple filter lists with download, enable/disabl
 ### Requirement: CB-003 - Network Blocking
 
 The system SHALL block navigation and resource requests matched by the engine, for both main-document navigations and sub-resource requests. The engine handles every ABP rule shape: bare-domain (`||domain^`), path-anchored (`||domain^/path*`), regex, `$domain=`, `$third-party`, resource-type modifiers (`$script`, `$image`, etc.), and exceptions (`@@||...`).
+
+The engine parses the URL itself rather than taking the caller's extracted
+host, so the `url` and `sourceUrl` handed to it SHALL carry the same host
+normalization the DNS path applies — a single trailing root dot removed (see
+[DNS-004](../dns-blocklist/spec.md)). Filter-list hostnames are written
+without it, so an un-normalized `https://tracker.example.com./x` misses every
+host-anchored and `$domain=` rule.
 
 #### Scenario: Bare-domain rule blocks main-document nav
 
@@ -174,6 +185,17 @@ The system SHALL block navigation and resource requests matched by the engine, f
 **Then** the rule fires
 **When** the same URL is checked with `requestType: 'document'`
 **Then** the rule does NOT fire
+
+#### Scenario: FQDN root dot reaches the engine normalized
+
+**Given** the engine knows `||doubleclick.net^$domain=news.com`
+**When** a sub-resource request for `https://ads.doubleclick.net./pixel.gif`
+is checked with Referer `https://news.com./article`
+**Then** both the URL and the `sourceUrl` are normalized to their dotless
+form before the engine consult
+**And** the rule fires
+**And** nothing outside the host is rewritten, so path- and query-anchored
+rules match exactly as before
 
 #### Scenario: Hook ordering in shouldOverrideUrlLoading
 
@@ -213,6 +235,10 @@ The system SHALL block navigation and resource requests matched by the engine, f
 **When** a sub-resource request is blocked
 **Then** the interceptor attributes the hit to `dns` (DNS is checked first)
 **And** the ABP block counter is not incremented for that request
+**And** every path that blocks or counts a request (navigations, popups,
+`blockCheck`, the PerformanceObserver batch, page-icon fetches) takes this
+order through `BlockDecision.decide`, which asks the engine nothing about a
+request DNS already blocked
 
 #### Scenario: Per-source counters preserved in stats
 
@@ -314,7 +340,13 @@ Generic `##.x` cosmetic rules (no domain prefix) SHALL be looked up on demand vi
 
 ### Requirement: CB-006 - Per-Site Toggle
 
-Each site SHALL have a `contentBlockEnabled` setting (default: `true`) that controls all content blocking for that site.
+Each site SHALL have a `contentBlockEnabled` setting (default: `true`) that
+controls whether ABP filtering is applied, and a `disabledFilterLists` setting
+(default: empty) that controls *which* lists apply when it is (CB-015). The
+toggle wins: with it off the site runs no filter list.
+
+Both settings SHALL ride the nested-webview config so a cross-domain link
+inherits them.
 
 #### Scenario: Disable content blocking for a site
 
@@ -326,6 +358,12 @@ Each site SHALL have a `contentBlockEnabled` setting (default: `true`) that cont
 
 **Given** a new site is created
 **Then** `contentBlockEnabled` defaults to `true`
+
+#### Scenario: Default list selection is every app-wide list
+
+**Given** a new site is created
+**Then** `disabledFilterLists` is empty
+**And** the site runs whatever App Settings has enabled
 
 #### Scenario: Setting persists
 
@@ -355,12 +393,20 @@ Each site SHALL have a `contentBlockEnabled` setting (default: `true`) that cont
 **Given** a site has content blocking enabled
 **When** a cross-domain link opens in a nested InAppBrowser
 **Then** the nested webview also has content blocking enabled
+**And** it carries the same `disabledFilterLists`
+
+#### Scenario: The list row appears only when the blocker is on
+
+**Given** a site with the content blocker on and at least one list enabled
+app-wide
+**Then** a "Filter lists" row sits under the toggle
+**And** its subtitle reports how many of those lists apply to this site
 
 ---
 
 ### Requirement: CB-007 - License Attribution
 
-The EasyList filter lists SHALL be credited under CC BY-SA 3.0, and `adblock-rust` plus its transitive dependencies SHALL be credited in the app's license page and README.
+The EasyList filter lists SHALL be credited under CC BY-SA 3.0, and `adblock-rust` plus its transitive dependencies SHALL be credited in the app's license page; the README names EasyList and `adblock-rust` in its feature list.
 
 #### Scenario: EasyList license visible
 
@@ -377,8 +423,8 @@ The EasyList filter lists SHALL be credited under CC BY-SA 3.0, and `adblock-rus
 #### Scenario: README attribution
 
 **Given** a user reads the README
-**Then** EasyList is listed in the Tech Stack section with license info
-**And** `adblock-rust` (Brave Software) is credited there too
+**Then** EasyList and `adblock-rust` are named in the Features list
+**And** the License section points at the in-app license page and the legal spec for the license details
 
 ---
 
@@ -400,10 +446,11 @@ Whenever the engine is rebuilt (download, toggle, remove, add custom list, uBO t
 
 #### Scenario: Native Android engine kept in sync
 
-**Given** the engine is rebuilt with new rules
+**Given** the engine is loaded or rebuilt
 **When** `_rebuildEngine` finishes loading the Dart-side engine
-**Then** `WebInterceptNative.sendAdblockEngineRules(rulesText, enableUboResources)` is called
-**And** the native side spins up its own engine instance from the same text
+**Then** `WebInterceptNative.sendAdblockEngine(SerializedEngine(blob), ...)` hands the native side the same engine, serialized, and `_rebuildEngine` awaits the reply
+**And** the native side hydrates it off the main thread, freeing the old engine and building the new one under the write lock, so a sub-resource checked meanwhile waits for the new engine
+**And** when the reply reports the engine inactive, the rules text is pushed instead (`EngineRulesText`) and parsed natively: without an engine the interceptor applies no ABP rule to sub-resources, so it never runs without the engine Dart runs
 **And** clears its per-host decision cache so stale `ALLOWED` verdicts don't shadow the new rules
 
 ---
@@ -463,7 +510,7 @@ The system SHALL gate `adblock-rust`'s uBO web_accessible_resources/ pool behind
 
 ### Requirement: CB-011 - Settings Backup Round-Trip
 
-The `useUboResources` preference SHALL round-trip through settings export/import via the `kExportedAppPrefs` registry. The retired `useRustAdblockEngine` toggle SHALL NOT round-trip.
+The `useUboResources` preference SHALL round-trip through settings export/import via the `AppPref` registry. The retired `useRustAdblockEngine` toggle SHALL NOT round-trip.
 
 The filter-list selection SHALL also round-trip, as user intent: each
 list's `id`, `name`, `url`, and `enabled` flag ride a dedicated
@@ -471,7 +518,7 @@ list's `id`, `name`, `url`, and `enabled` flag ride a dedicated
 skipped counts, last-updated timestamps) and the cached rule blobs SHALL
 NOT be exported — they are machine state, repopulated by re-downloading
 after import. The selection rides a dedicated field rather than the
-`kExportedAppPrefs` registry because applying it on import must run
+`AppPref` registry because applying it on import must run
 through `ContentBlockerService` (replacing `_lists` and rebuilding the
 engine), which the registry's blind pref-write path cannot do.
 
@@ -512,12 +559,70 @@ fresh device, so the user re-downloads to activate blocking)
 
 ---
 
+### Requirement: CB-013 - Imported list ids are path-safe
+
+A filter-list `id` becomes a filename by concatenation (`<id>.txt`) in the
+content-blocker cache directory, and an imported backup supplies it verbatim.
+`importListSelection` SHALL therefore drop any entry whose `id` does not match
+`^[A-Za-z0-9_-]{1,64}$` — the same shape `sanitizedSiteId` enforces for sites.
+Every id the app mints (`custom_<base36>`) and every built-in id matches, so
+a legitimate backup round-trips unchanged.
+
+The store is guarded independently: `FileStore` implementations SHALL refuse a
+name containing `/`, `\` or `..`, so a list id that reached the cache before
+this validation existed still cannot address a file outside the directory.
+
+#### Scenario: Traversal id is dropped on import
+
+**Given** a backup whose `contentBlockerLists` contains an entry with
+`id: "../../../../evil"`
+**When** the user imports that backup
+**Then** the entry does not appear in the restored list set
+**And** the remaining entries import normally
+**And** no later list update can write outside the cache directory
+
+#### Scenario: Store refuses a traversal name whatever the caller passes
+
+**Given** a `FileStore` for the content-blocker cache directory
+**When** any read, write, delete or exists call is made with a name
+containing `/`, `\` or `..`
+**Then** the call throws `ArgumentError`
+**And** nothing is created outside the store's directory
+
+---
+
+### Requirement: CB-014 - `$removeparam=` rewrites are validated and main-frame-only
+
+The `$removeparam=` rewrite in `shouldOverrideUrlLoading` cancels the
+navigation and issues `controller.loadUrl` on the **top-level** webview,
+with a URL the filter engine produced from a page-supplied one. It
+SHALL therefore run below the `isForMainFrame` gate, and its result
+SHALL be re-checked with `ExternalUrlParser.isLoadableWebUrl` before it
+is loaded. Same contract as CURL-014 / CURL-015 for ClearURLs, which the
+rewrite sits directly beneath.
+
+#### Scenario: A subframe navigation cannot drive a top-frame load
+
+**Given** a cross-origin iframe navigates to a URL a `$removeparam=` rule
+rewrites
+**When** `shouldOverrideUrlLoading` fires with `isForMainFrame == false`
+**Then** the navigation is allowed in place and no `loadUrl` is issued
+
+#### Scenario: A non-http(s) rewrite result is not loaded
+
+**Given** the engine returns a rewritten URL whose scheme is not `http`
+or `https`
+**When** the rewrite block runs on a main-frame navigation
+**Then** no `loadUrl` is issued and the original navigation proceeds
+
+---
+
 ### Requirement: CB-012 - DevTools Engine Decision Accounting
 
 Every network-block decision the engine makes SHALL be folded into the
 DevTools ABP tab's counters, regardless of which consult path produced
-it: `isBlocked` (main-doc navigations, JS-bridge `blockCheck`,
-legacy single-URL reports), `isHostBlocked` (PerformanceObserver
+it: `isBlocked` (main-doc navigations, JS-bridge `blockCheck`),
+`isHostBlocked` (PerformanceObserver
 per-host attribution), and blocks decided by the Android native JNI
 engine (drained `abp`-sourced block events). The blocked/allowed
 tallies SHALL be cumulative since timing was enabled — they MUST NOT
@@ -548,6 +653,321 @@ decay when the recent-decisions ring buffer rolls over.
 **Given** the user turns timing recording off in the ABP tab
 **Then** no decisions (Dart or native) are recorded
 **And** re-enabling resets the consulted/blocked/allowed counters to zero
+
+---
+
+### Requirement: CB-015 - Per-Site Filter-List Mask
+
+Each site SHALL have a `disabledFilterLists` setting (default: empty) naming
+filter list ids the site opts out of. It is a mask over the app-wide
+selection: a list not enabled in App Settings is not in the engine at all, so
+naming it here does nothing.
+
+The mask SHALL be carried by the rules, not by the decision path. At engine
+build time each masked list's text is rewritten with adblock-rust's own domain
+scoping by
+[`scopeRulesAwayFromHosts`](../../../lib/services/filter_list_mask.dart):
+
+- network rules gain `$domain=~<host>`, merged into an existing `domain=` or
+  `from=` option rather than appended as a second one, which would replace it;
+- cosmetic rules gain `~<host>` in their domain list.
+
+One engine therefore answers every site, and no per-request work consults the
+mask. The rewrite MUST classify rules the way adblock-rust 0.12 does — the
+LAST `$` opens the option list, options split on `,`, and
+`detect_filter_type`'s comment and cosmetic tests decide the shape — because a
+rule the rewrite mis-parses is silently dropped rather than visibly wrong.
+
+`<host>` is the site's registrable host, which is what `$domain=` matches
+against. Negated domains cover subdomains, so `example.com` covers
+`www.example.com`.
+
+The mask SHALL be persisted (`content_blocker_list_masks`) so the first engine
+build of a launch already carries it — otherwise every launch parses the whole
+rule set twice. It is derived from the sites and rewritten whenever they are
+saved, so a stale copy self-heals.
+
+Rebuilding is the cost of a mask change, so the mask SHALL be re-applied only
+when it actually differs from the one in force.
+
+**Left global by design.** Three rule shapes SHALL NOT be scoped, because
+scoping them changes what they do for every site rather than exempting one:
+
+- `$badfilter` — it cancels another rule by matching its options, so an added
+  `$domain=` breaks the cancellation everywhere;
+- cosmetic unhide (`#@#`, `#@?#`, `#@$#`, `#@%#`) — adblock-rust rejects a rule
+  that is both an unhide and domain-negated (`DoubleNegation`) and drops it;
+- generic scriptlet, procedural and action rules (`##+js(...)`,
+  `##sel:remove()`, `#?#...`) — a generic rule with only negated hostnames goes
+  on applying elsewhere *only* for plain hides (`hidden_generic_rule`); for
+  these shapes it would apply nowhere. Generic procedurals also ride the
+  synthetic-host backfill, which is queried once for every site.
+
+Archive-tier sites SHALL carry no mask (ARCH-006): the rewrite changes the
+shared engine cache blob, whose contents must not vary with whether an archive
+is open.
+
+The iOS/macOS interceptor's prefilter is derived from the same rewritten text,
+so `parseAbpNetworkPrefilter` SHALL strip a rule's options before classifying
+it. A regex rule reads as a regex only by its trailing `/`, and every masked
+rule now carries a `$domain=` after it: classified as a plain pattern, a regex
+would be tokenized on a literal it does not guarantee, and the prefilter would
+hard-allow a request the engine blocks.
+
+#### Scenario: A masked regex rule still forces a round-trip
+
+**Given** a masked list carries a regex network rule
+**When** the interceptor prefilter is rebuilt
+**Then** the rule contributes no token
+**And** the prefilter reports untokenizable rules, so a host-Bloom miss still
+round-trips to the engine
+
+#### Scenario: A site switches one list off
+
+**Given** EasyList and EasyPrivacy are enabled app-wide
+**And** a site switches EasyList off
+**When** that site's page requests a URL only an EasyList rule blocks
+**Then** the request is allowed
+**And** the same request is still blocked on every other site
+**And** EasyPrivacy still applies to the site
+
+#### Scenario: The negation reaches subdomains
+
+**Given** a site on `example.com` masks a list off
+**When** a page on `www.example.com` requests a URL that list blocks
+**Then** the request is allowed
+
+#### Scenario: An already-scoped rule keeps its scoping
+
+**Given** a masked list carries `||ads.example^$domain=news.example`
+**Then** the rule still applies on `news.example`
+**And** it applies on neither the masked site nor anywhere else it did not
+before
+
+#### Scenario: A masked generic hide stays generic
+
+**Given** a masked list carries `##.ad-banner`
+**Then** the selector is still hidden on other sites through the generic
+class/id scanner
+**And** on the masked site it comes back as an exception, so the scanner drops
+it
+
+#### Scenario: Android sub-resources carry the mask
+
+**Given** a site masks a list off
+**When** its page fetches a sub-resource on Android
+**Then** the native engine, which is fed the same rewritten rules, allows it
+
+#### Scenario: A mask that did not change costs nothing
+
+**Given** the sites are saved with no change to any site's list selection
+**Then** the engine is not rebuilt
+
+---
+
+### Requirement: CB-016 - Local Filter Lists
+
+Users SHALL be able to write a filter list in the app instead of pointing at a
+URL, for rules one site or platform needs that no published list carries. A
+local list is a `FilterList` whose `rules` field is non-null; its `url` is
+empty.
+
+- `addLocalList(name, rules)` creates it enabled and rebuilds the engine at
+  once; there is nothing to download.
+- `updateLocalList(id, name, rules)` edits it in place.
+- `downloadList` returns false for it and `downloadAllLists` skips it.
+- `_rebuildEngineInner` takes its text from `rules`, not the cache directory,
+  so it passes through the same CB-015 mask rewrite as any other list.
+- The rules persist inside the `content_blocker_lists` entry, not as a cache
+  file: they are user intent, and nothing can re-fetch them.
+
+This amends CB-011: a local list's export entry SHALL also carry `rules`, and
+`importListSelection` SHALL restore it as a local list. Download lists still
+export `{id, name, url, enabled}` only.
+
+List ids are minted from the current millisecond; minting SHALL step past an
+id already in the registry, since two lists added within one millisecond
+would otherwise share an id and one cache file.
+
+#### Scenario: Write a local list
+
+**Given** the user taps "Write Local List" and enters a name and
+`||ads.example^`
+**When** they tap Add
+**Then** the list appears enabled with its rule count
+**And** `ads.example` is blocked without any download
+
+#### Scenario: Edit a local list
+
+**Given** a local list exists
+**When** the user edits its rules and saves
+**Then** the engine is rebuilt from the new text
+**And** rules removed from the text no longer block
+
+#### Scenario: A local list survives a backup
+
+**Given** a local list and a download list
+**When** settings are exported and imported on another device
+**Then** the local list is restored with its rules and blocks immediately
+**And** the download list's entry carries no rules
+
+#### Scenario: A site masks a local list
+
+**Given** a local list is enabled
+**When** a site switches it off in its Content Blocker settings
+**Then** its rules do not apply on that site (CB-015)
+
+---
+
+### Requirement: CB-017 - uBO Pre-Parser Directives
+
+adblock-rust 0.12 reads every line starting with `!` as a comment, so it
+implements neither `!#include` nor `!#if`. uBlock Origin's own lists depend
+on both: `filters.txt` holds a quarter of its rules and pulls the rest in from
+ten sublists. The app SHALL resolve both directives before the engine sees a
+list, in [`filter_list_preparser.dart`](../../../lib/services/filter_list_preparser.dart),
+matching uBO's `utils.preparser` and `assets.fetchFilterList`:
+
+- **`!#if` / `!#else` / `!#endif`** use uBO's token table and expression
+  grammar (`!`, `&&`, `||`, one pair of parentheses). A block whose expression
+  uBO would not recognise is kept, as uBO keeps it. An unknown `cap_` token is
+  false.
+- **The environment** names the engine the rules run in: `ublock` always
+  (the engine takes uBO syntax and scriptlets), `chromium` on Android,
+  `safari` on the WebKit hosts (iOS, macOS, Linux WPE), `mobile` on Android
+  and iOS.
+- **Pruning** happens at engine build time, before the CB-015 mask rewrite, so
+  a list is stored whole and the environment is applied where it runs.
+- **`!#include`** is expanded at download time, recursively, each path
+  resolved against the directory of the list that names it. As in uBO, an
+  include inside a false `!#if` is not fetched, an absolute URL or a path
+  containing `..` is refused, and a sublist is fetched at most once. A
+  percent-encoded dot and a backslash are refused as well, since a server may
+  decode either into a climb out of the directory.
+- **A sublist that cannot be fetched fails the whole download**, as in uBO:
+  nothing is cached and the list keeps its previous state. A list may name at
+  most 64 sublists.
+
+#### Scenario: uBO's main list arrives whole
+
+**Given** the user adds `https://ublockorigin.github.io/uAssets/filters/filters.txt`
+**When** it is downloaded
+**Then** its ten `!#include` sublists are fetched from the same directory
+**And** their rules reach the engine
+
+#### Scenario: A branch for another browser is dropped
+
+**Given** a list carries `!#if env_firefox` ... `!#else` ... `!#endif`
+**When** the engine is built on Android
+**Then** the `!#else` branch is compiled and the Firefox branch is not
+
+#### Scenario: An include that leaves the directory is refused
+
+**Given** a list carries `!#include ../other.txt` or an absolute URL
+**When** it is downloaded
+**Then** the path is not fetched
+
+#### Scenario: A missing sublist fails the list
+
+**Given** a list includes a sublist that answers 404
+**When** it is downloaded
+**Then** the download reports failure and no partial list is cached
+
+---
+
+### Requirement: CB-018 - uBlock Origin Backup Import
+
+The user SHALL be able to import the backup file uBlock Origin's dashboard
+saves (`my-ublock-backup_*.txt`), from App Settings > Content Blocker. The
+file is accepted on the same test uBO's own restore applies: an object with
+`userSettings`, a trusted-site list (`whitelist` array or the older
+`netWhitelist` string) and a list selection (`selectedFilterLists` or the
+older `filterLists` map). The parser and planner are pure Dart, in
+[`ubo_backup_import.dart`](../../../lib/services/ubo_backup_import.dart).
+
+What maps:
+
+- **Filter lists.** A key the app already has as a list id (`easylist`,
+  `easyprivacy`, `fanboy-social`) enables that list rather than adding uBO's
+  mirror of it. Other keys resolve to a URL through uBO's `assets.json`,
+  fetched through the outbound proxy at import time and never committed. A
+  URL entry (a list the user imported into uBO) is added as is. A key that
+  cannot be resolved, because the registry is unreachable or uBO retired it,
+  is reported, not guessed.
+- **My filters** (`userFilters`) become one CB-016 local list, named "uBlock
+  Origin: My filters" in the UI locale, enabled when the backup selects
+  `user-filters`. A later import replaces that list's rules instead of adding
+  a second one.
+- **Trusted sites** that name a whole host (`example.com`,
+  `https://example.com/*`) switch the content blocker off on the app-tier
+  sites on that host or its subdomains, as uBO's hostname directive covers
+  subdomains. A site whose Tracking Protection holds the blocker on is left
+  alone, and so is every archive-tier site (ARCH-006). The affected
+  webviews are recreated so the change applies at once.
+
+What does not map, and is counted in the confirmation dialog: trusted-site
+directives narrower or wider than a host (a path, a regex), trusted hosts
+with no matching site here, and uBO's dynamic filtering, URL rules and
+per-site switches beyond uBO's own defaults.
+
+Nothing is applied until the user confirms a dialog that lists all of the
+above. After confirming, every list the import added or enabled that has no
+download yet is downloaded, with CB-017 applied.
+
+#### Scenario: Moving from uBO
+
+**Given** a uBO backup selecting `user-filters`, `ublock-filters`, `easylist`
+and one imported URL, with `news.example` trusted
+**When** the user imports it and confirms
+**Then** EasyList is enabled, uBlock filters and the URL are added and
+downloaded, the user's filters become an enabled local list
+**And** the content blocker is off on the News site
+
+#### Scenario: A narrower trust is reported, not widened
+
+**Given** a backup trusting `https://docs.example/private/page`
+**Then** the dialog counts it under "Not imported"
+**And** no site's content blocker changes because of it
+
+#### Scenario: Not a uBO backup
+
+**Given** the user picks a WebSpace settings backup or any other file
+**Then** a snackbar says the file is not a uBlock Origin backup
+**And** nothing changes
+
+---
+
+### Requirement: CB-019 - Early cosmetic CSS never becomes the document root
+
+The early `<style>` SHALL be inserted under the document's root element,
+never into the `Document` itself. The `onLoadStart` copy can run after a
+navigation commits and before the parser has made `<html>`, which happens
+whenever the server sends its headers before its body. On such a document
+the shim SHALL wait for the root and insert the `<style>` then, unless a
+copy is already there. A node appended to the `Document` becomes its root,
+and the parser then drops the page's `<html>` and everything under it
+([BUG-031](../../../docs/bugs/031-content-blocker-style-becomes-document-root.md)).
+
+#### Scenario: The shim lands before the parser has made <html>
+
+**Given** a page whose server sends its headers before its body
+**And** the early CSS shim runs after the navigation commits, before any of
+the body is parsed
+**When** the body arrives
+**Then** the document's root is the page's `<html>`, with its `<body>`
+**And** the shim's `<style>` is inside it
+
+#### Scenario: The document-start copy got there first
+
+**Given** the `onLoadStart` copy is waiting for the root
+**When** the root appears and the DOCUMENT_START copy inserts its `<style>`
+**Then** the waiting copy inserts nothing
+
+#### Scenario: No shim becomes the root
+
+**Given** any script in `lib/js`, run with its sample config
+**When** it runs on a document that has no root element
+**Then** the document still has no root element afterwards
 
 ---
 
@@ -594,7 +1014,7 @@ All licensed under GPL-3.0 / CC BY-SA 3.0 (dual-licensed, used under CC BY-SA 3.
 ### Storage
 
 - Filter list files: `<docs>/content_blocker_cache/<id>.txt`
-- Engine cache: `<docs>/content_blocker_cache/.engine.bin` + `.engine.meta` (sidecar `<rulesHash>:<uboFlag>`)
+- Engine cache: `<docs>/content_blocker_cache/.engine.bin` + `.engine.prefilter` (interceptor prefilter, JSON) + `.engine.meta` (hash of the build inputs, written last)
 - List metadata: SharedPreferences key `content_blocker_lists` (JSON string)
 
 ### Hook Point in WebView
@@ -615,7 +1035,7 @@ shouldOverrideUrlLoading: (controller, navigationAction) async {
 
 Two-phase injection:
 
-1. **DOCUMENT_START** (`initialUserScripts` + `onLoadStart`): `<style>` tag with engine-supplied domain-scoped selectors as `display: none !important`. Prevents flash of unstyled content.
+1. **DOCUMENT_START** (`initialUserScripts` + `onLoadStart`): `<style>` tag with engine-supplied domain-scoped selectors as `display: none !important`. Prevents flash of unstyled content. The `onLoadStart` copy can run before `<html>` exists, so the shim waits for the root (CB-019).
 2. **onLoadStop**: re-asserts the same `<style>` tag (idempotent). Selector hides are owned entirely by the CSS engine; the procedural shim runs separately for `:has-text()` / `:upward()` / `:remove()` rules emitted by the engine.
 
 Late-added or class-flipped elements hide reactively without any JS sweep.
@@ -646,7 +1066,7 @@ Late-added or class-flipped elements hide reactively without any JS sweep.
 - `lib/web_view_model.dart` — Added `contentBlockEnabled` field, serialization, pass to WebViewConfig
 - `lib/services/webview.dart` — Added `contentBlockEnabled` to WebViewConfig, domain block hook in `shouldOverrideUrlLoading`, cosmetic + procedural shim injection
 - `lib/services/dns_block_service.dart` — `BlockSource` enum, `blockedByDns` / `blockedByAbp` counters, DNS-only `getMergedBlockBloom` (ABP lives in the engine)
-- `lib/services/web_intercept_native.dart` — `sendDnsDomains`, `sendAdblockEngineRules`, `isAdblockEngineSupported`
+- `lib/services/web_intercept_native.dart` — `sendDnsDomains`, `sendAdblockEngine`, `isAdblockEngineSupported`
 - `android/app/src/main/kotlin/.../WebInterceptPlugin.kt` — DNS host-only fast path, JNI bridge to `adblock-rust` via `AdblockEngineNative`
 - `lib/widgets/stats_banner.dart` — Shows banner when either DNS or engine has rules
 - `lib/screens/settings.dart` — Per-site Content Blocker toggle
@@ -667,6 +1087,7 @@ Late-added or class-flipped elements hide reactively without any JS sweep.
 fvm flutter test test/content_blocker_service_test.dart  # service surface + singleton
 fvm flutter test test/adblock_engine_test.dart           # FFI smoke + rule parity
 npm run test:js                                          # cosmetic + procedural shim behaviour
+npm run test:browser                                     # shims in real Chromium, early CSS at document start
 ```
 
 ### Manual Testing
@@ -680,4 +1101,4 @@ npm run test:js                                          # cosmetic + procedural
 7. Open site Settings, disable Content Blocker, reload page, verify ads and promoted content reappear
 8. Add a custom filter list via "Add Custom List" dialog, verify it can be downloaded, toggled, and removed
 9. Check Licenses page shows "EasyList filter lists (filter data)" + adblock-rust transitive deps
-10. Restart app, verify the engine deserializes from the cached blob (log line `Engine active: ... (deserialize ...)`)
+10. Restart app, verify the engine loads from the cached blob (log line `Engine active: ... (cached ...)`)

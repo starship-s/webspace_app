@@ -1,7 +1,75 @@
+import 'package:flutter/services.dart';
+import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/app_lifecycle_engine.dart';
 
+class _PressureProbe with WidgetsBindingObserver {
+  final trims = <bool>[];
+
+  @override
+  void didHaveMemoryPressure() => trims.add(AppLifecycleEngine
+      .memoryPressureTrims(WidgetsBinding.instance.lifecycleState));
+}
+
 void main() {
+  group('AppLifecycleEngine.memoryPressureTrims (PAUSE-034)', () {
+    test('only a resumed app trims', () {
+      expect(AppLifecycleEngine.memoryPressureTrims(AppLifecycleState.resumed),
+          isTrue);
+      for (final state in [
+        AppLifecycleState.inactive,
+        AppLifecycleState.hidden,
+        AppLifecycleState.paused,
+        AppLifecycleState.detached,
+        null,
+      ]) {
+        expect(AppLifecycleEngine.memoryPressureTrims(state), isFalse,
+            reason: '$state');
+      }
+    });
+
+    // The platform messages Flutter sends when the app leaves the screen. The
+    // engine's `memoryPressure` rides the same notification as the lifecycle
+    // change (iOS didEnterBackground) or follows it (Android UI_HIDDEN), so
+    // both orders after `inactive` must leave the cascade alone.
+    Future<void> lifecycle(String state) => TestDefaultBinaryMessengerBinding
+        .instance.defaultBinaryMessenger
+        .handlePlatformMessage(SystemChannels.lifecycle.name,
+            const StringCodec().encodeMessage('AppLifecycleState.$state'), (_) {});
+    Future<void> memoryPressure() => TestDefaultBinaryMessengerBinding
+        .instance.defaultBinaryMessenger
+        .handlePlatformMessage(
+            SystemChannels.system.name,
+            const JSONMessageCodec()
+                .encodeMessage(<String, dynamic>{'type': 'memoryPressure'}),
+            (_) {});
+
+    for (final pressureFirst in [true, false]) {
+      testWidgets(
+          'leaving the screen does not trim '
+          '(memoryPressure ${pressureFirst ? 'before' : 'after'} paused)',
+          (tester) async {
+        final probe = _PressureProbe();
+        WidgetsBinding.instance.addObserver(probe);
+        addTearDown(() => WidgetsBinding.instance.removeObserver(probe));
+
+        await lifecycle('resumed');
+        await memoryPressure();
+        await lifecycle('inactive');
+        if (pressureFirst) await memoryPressure();
+        await lifecycle('hidden');
+        await lifecycle('paused');
+        if (!pressureFirst) await memoryPressure();
+        await lifecycle('hidden');
+        await lifecycle('inactive');
+        await lifecycle('resumed');
+
+        expect(probe.trims, [true, false],
+            reason: 'the resumed warning trims; the background one does not');
+      });
+    }
+  });
+
   group('AppLifecycleEngine.activeLoadedIndex', () {
     test('null currentIndex yields null', () {
       expect(
@@ -422,6 +490,63 @@ void main() {
           siteCount: 2,
           loadedIndices: {0, 5},
           backgroundAudioEnabled: (i) {
+            expect(i, lessThan(2));
+            return false;
+          },
+        ),
+        isFalse,
+      );
+    });
+  });
+  group('NOTIF-011 notification pause exemption', () {
+    test('LOADED notification site vetoes the pause of a plain active site',
+        () {
+      // Android's pauseTimers() is process-global: pausing the site on screen
+      // would also freeze the notification site's page JS behind it, and that
+      // JS is what posts the notification.
+      final plan = AppLifecycleEngine.backgroundPlan(
+        currentIndex: 0,
+        siteCount: 3,
+        loadedIndices: {0, 2},
+        notificationsEnabled: (i) => i == 2,
+        backgroundAudioEnabled: (_) => false,
+        cookieFlushSupported: true,
+      );
+      expect(plan.jsPauseIndex, isNull);
+      expect(plan.captureStateIndex, 0);
+    });
+
+    test('unloaded notification site does not veto the pause', () {
+      final plan = AppLifecycleEngine.backgroundPlan(
+        currentIndex: 0,
+        siteCount: 3,
+        loadedIndices: {0},
+        notificationsEnabled: (i) => i == 2,
+        backgroundAudioEnabled: (_) => false,
+        cookieFlushSupported: true,
+      );
+      expect(plan.jsPauseIndex, 0);
+    });
+
+    test('resume mirrors the skipped pause (nothing to resume)', () {
+      expect(
+        AppLifecycleEngine.resumeJsIndex(
+          currentIndex: 0,
+          siteCount: 3,
+          loadedIndices: {0, 2},
+          notificationsEnabled: (i) => i == 2,
+          backgroundAudioEnabled: (_) => false,
+        ),
+        isNull,
+      );
+    });
+
+    test('out-of-bounds loaded index never reaches the flag callback', () {
+      expect(
+        AppLifecycleEngine.anyLoadedNotifications(
+          siteCount: 2,
+          loadedIndices: {0, 5},
+          notificationsEnabled: (i) {
             expect(i, lessThan(2));
             return false;
           },

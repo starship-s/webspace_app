@@ -1,0 +1,102 @@
+// Behavioural tests for the WebGL/WebGPU kill switch
+// (lib/services/webgl_kill_switch_shim.dart), which rides the per-site
+// tracking protection toggle.
+//
+// jsdom ships none of these constructors, so every assertion here would pass
+// against an empty script if it only read the end state. Each test seeds the
+// surface it is about first, which is what lets it fail.
+
+const test = require('node:test');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const { makeDom, runInDom, pageJs } = require('./helpers/load_shim');
+
+const SHIM = pageJs('webgl_kill_switch');
+
+function seedGpuSurface(window) {
+  class WebGLRenderingContext {}
+  class WebGL2RenderingContext {}
+  class GPU { requestAdapter() { return Promise.resolve({}); } }
+  class GPUAdapter {}
+  class GPUDevice {}
+  class GPUCanvasContext {}
+  class GPUAdapterInfo {}
+  Object.assign(window, {
+    WebGLRenderingContext, WebGL2RenderingContext,
+    GPU, GPUAdapter, GPUDevice, GPUCanvasContext, GPUAdapterInfo,
+  });
+  Object.defineProperty(Object.getPrototypeOf(window.navigator), 'gpu', {
+    configurable: true, enumerable: true, get: () => new GPU(),
+  });
+  window.HTMLCanvasElement.prototype.getContext = function (type) {
+    return { __type: type };
+  };
+}
+
+function shimmed() {
+  const dom = makeDom();
+  seedGpuSurface(dom.window);
+  runInDom(dom, SHIM);
+  return dom;
+}
+
+test('every WebGL context type returns null from getContext', () => {
+  const dom = shimmed();
+  const canvas = dom.window.document.createElement('canvas');
+  for (const type of
+      ['webgl', 'webgl2', 'experimental-webgl', 'experimental-webgl2']) {
+    assert.equal(canvas.getContext(type), null, type);
+  }
+});
+
+test("getContext('webgpu') returns null too", () => {
+  // Deleting navigator.gpu alone leaves the canvas handing back a live
+  // GPUCanvasContext.
+  const dom = shimmed();
+  const canvas = dom.window.document.createElement('canvas');
+  assert.equal(canvas.getContext('webgpu'), null);
+  assert.equal(canvas.getContext('WebGPU'), null, 'type match is case-insensitive');
+});
+
+test('non-GPU context types still fall through', () => {
+  const dom = shimmed();
+  const canvas = dom.window.document.createElement('canvas');
+  assert.equal(canvas.getContext('2d').__type, '2d');
+});
+
+test('the WebGL and WebGPU constructors are gone', () => {
+  const dom = shimmed();
+  for (const name of [
+    'WebGLRenderingContext', 'WebGL2RenderingContext',
+    'GPU', 'GPUAdapter', 'GPUDevice', 'GPUCanvasContext', 'GPUAdapterInfo',
+  ]) {
+    assert.equal(dom.window.eval(`typeof ${name}`), 'undefined', name);
+  }
+});
+
+test('navigator.gpu is gone', () => {
+  const dom = shimmed();
+  assert.equal(dom.window.navigator.gpu, undefined);
+  assert.equal(dom.window.eval("'gpu' in navigator"), false);
+});
+
+test('WORK-002: the kill switch installs in a worker scope, where there is no window (SEC-018)', () => {
+  class WebGLRenderingContext {}
+  class WebGL2RenderingContext {}
+  class OffscreenCanvas { getContext(type) { return { __type: type }; } }
+  class GPU {}
+  const navProto = {};
+  Object.defineProperty(navProto, 'gpu', { configurable: true, get: () => new GPU() });
+  const ctx = vm.createContext({
+    WebGLRenderingContext, WebGL2RenderingContext, OffscreenCanvas, GPU,
+    navigator: Object.create(navProto),
+    WorkerGlobalScope: class {},
+  });
+  assert.doesNotThrow(() => vm.runInContext(SHIM, ctx));
+  assert.equal(vm.runInContext('typeof WebGLRenderingContext', ctx), 'undefined');
+  assert.equal(vm.runInContext('typeof GPU', ctx), 'undefined');
+  assert.equal(vm.runInContext("new OffscreenCanvas().getContext('webgl')", ctx), null);
+  assert.equal(vm.runInContext("new OffscreenCanvas().getContext('webgpu')", ctx), null);
+  assert.equal(vm.runInContext("new OffscreenCanvas().getContext('2d').__type", ctx), '2d');
+  assert.equal(vm.runInContext("'gpu' in navigator", ctx), false);
+});

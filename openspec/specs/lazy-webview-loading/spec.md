@@ -43,7 +43,32 @@ The system SHALL track which webview indices have been visited by the user.
 
 ### Requirement: LAZY-002 - Create Webviews On-Demand
 
-The system SHALL only create webviews for sites that the user has actually visited.
+Webviews SHALL be created only when the user visits a site, EXCEPT for sites with `notificationsEnabled == true` which SHALL be auto-loaded on app startup so their page JS can fire notifications without waiting for the user to open them. Requires container mode (`_useContainers == true`); on legacy devices the notification toggle is hidden so this modification does not apply.
+
+In container mode there are no domain-conflict restrictions (PROF-003), so all notification sites auto-load freely regardless of domain overlap.
+
+Implementation: see the auto-load loop in `StartupController.restore` ([lib/main.dart](../../../lib/main.dart)) that adds every `notificationsEnabled` site index to `_sites.loaded` after the per-site models have been hydrated.
+
+#### Scenario: App starts with multiple notification sites
+
+**Given** container mode is active
+**And** Site A (`slack.com`) has `notificationsEnabled` set to `true`
+**And** Site B (`teams.microsoft.com`) has `notificationsEnabled` set to `true`
+**And** Site C (`github.com/personal`) has `notificationsEnabled` set to `true`
+**When** the app starts
+**Then** Sites A, B, and C are all added to `_sites.loaded`
+**And** all three webviews are created with their per-site containers
+**And** all three begin executing JavaScript
+**And** sites without `notificationsEnabled` remain as placeholders until visited
+
+#### Scenario: Notification site auto-loads alongside manually visited site
+
+**Given** container mode is active
+**And** Site A (`slack.com`) has `notificationsEnabled` set to `true`
+**And** the user manually visits Site B (`github.com`)
+**When** both sites are loaded
+**Then** both coexist in `_sites.loaded` with isolated profiles
+**And** Site A continues running JavaScript in background
 
 #### Scenario: First visit to a site
 
@@ -59,8 +84,6 @@ The system SHALL only create webviews for sites that the user has actually visit
 **When** the user switches between DuckDuckGo and GitHub
 **Then** both webviews exist and preserve their state
 **And** other unvisited sites remain as placeholders
-
----
 
 ### Requirement: LAZY-003 - Placeholder Widgets
 
@@ -121,7 +144,7 @@ The system SHALL clear loaded indices when importing settings.
 ```dart
 // Track which webview indices have been loaded (for lazy loading)
 // Only webviews in this set will be created - others remain as placeholders
-final Set<int> _loadedIndices = {};
+final Set<int> _sites.loaded = {};
 ```
 
 ### Set Current Index Helper
@@ -129,10 +152,10 @@ final Set<int> _loadedIndices = {};
 ```dart
 /// Set the current index and mark it as loaded for lazy webview creation.
 /// This ensures only visited webviews are created, not all webviews at once.
-void _setCurrentIndex(int? index) {
-  _currentIndex = index;
-  if (index != null && index >= 0 && index < _webViewModels.length) {
-    _loadedIndices.add(index);
+void setCurrentIndex(int? index) {
+  _sites.current = index;
+  if (index != null && index >= 0 && index < _sites.models.length) {
+    _sites.loaded.add(index);
   }
 }
 ```
@@ -141,13 +164,13 @@ void _setCurrentIndex(int? index) {
 
 ```dart
 IndexedStack(
-  index: _currentIndex!,
-  children: _webViewModels.asMap().entries.map<Widget>((entry) {
+  index: _sites.current!,
+  children: _sites.models.asMap().entries.map<Widget>((entry) {
     final index = entry.key;
     final webViewModel = entry.value;
 
     // Only create actual webview if this index has been loaded
-    if (!_loadedIndices.contains(index)) {
+    if (!_sites.loaded.contains(index)) {
       return const SizedBox.shrink(); // Placeholder for unvisited sites
     }
 
@@ -166,14 +189,14 @@ IndexedStack(
 ### Handle Site Deletion
 
 ```dart
-// Update _loadedIndices after deletion (shift indices down)
-_loadedIndices.remove(index);
-_loadedIndices.removeWhere((i) => i >= _webViewModels.length);
-final updatedIndices = _loadedIndices
+// Update _sites.loaded after deletion (shift indices down)
+_sites.loaded.remove(index);
+_sites.loaded.removeWhere((i) => i >= _sites.models.length);
+final updatedIndices = _sites.loaded
     .map((i) => i > index ? i - 1 : i)
     .toSet();
-_loadedIndices.clear();
-_loadedIndices.addAll(updatedIndices);
+_sites.loaded.clear();
+_sites.loaded.addAll(updatedIndices);
 ```
 
 ---
@@ -206,9 +229,9 @@ _loadedIndices.addAll(updatedIndices);
 
 ### Modified
 - `lib/main.dart`
-  - Added `_loadedIndices` Set to `_WebSpacePageState`
-  - Added `_setCurrentIndex()` helper method
-  - Updated all `_currentIndex` assignments to use helper
-  - Modified `IndexedStack` to check `_loadedIndices` before creating widgets
+  - Added `_sites.loaded` Set to `_WebSpacePageState`
+  - Added `setCurrentIndex()` helper method
+  - Updated all `_sites.current` assignments to use helper
+  - Modified `IndexedStack` to check `_sites.loaded` before creating widgets
   - Added index shifting logic in site deletion handler
-  - Clear `_loadedIndices` on settings import
+  - Clear `_sites.loaded` on settings import

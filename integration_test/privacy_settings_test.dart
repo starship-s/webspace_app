@@ -32,26 +32,34 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:webspace/services/webview.dart';
+import 'package:webspace/settings/app_prefs.dart';
+import 'bare_site.dart';
+import 'fixture_server.dart';
+import 'helpers/ui.dart';
+import 'package:webspace/services/webview_config.dart';
+import 'package:webspace/services/webview_controller.dart';
+import 'package:webspace/services/page_js.dart';
 
 class _Req {
-  _Req(this.path, this.xrw);
+  _Req(this.path, {required this.xrw});
   final String path;
   final String? xrw;
 }
 
 class _Mounted {
-  _Mounted(this.request, this.controller);
+  _Mounted(this.request, {required this.controller});
   final _Req? request;
   final WebViewController? controller;
 }
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
+  setUpAll(PageJs.load);
 
   late HttpServer server;
   late int port;
   final requests = <_Req>[];
-  final bool savedBfcache = WebViewFactory.backForwardCacheEnabled;
+  final bool savedBfcache = AppPref.backForwardCacheEnabled.value;
 
   void log(String m) {
     // ignore: avoid_print
@@ -61,8 +69,9 @@ void main() {
   setUpAll(() async {
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     port = server.port;
-    server.listen((req) {
-      requests.add(_Req(req.uri.path, req.headers.value('x-requested-with')));
+    listenFixture(server, onEvent: (req) {
+      requests
+          .add(_Req(req.uri.path, xrw: req.headers.value('x-requested-with')));
       final res = req.response..headers.contentType = ContentType.html;
       res.write('<!doctype html><html><head><title>fixture</title></head>'
           '<body>fixture ${req.uri.path}</body></html>');
@@ -71,7 +80,7 @@ void main() {
   });
 
   tearDownAll(() async {
-    WebViewFactory.backForwardCacheEnabled = savedBfcache;
+    AppPref.backForwardCacheEnabled.debugValue = savedBfcache;
     await server.close(force: true);
   });
 
@@ -80,16 +89,7 @@ void main() {
   String url(String path) => 'http://127.0.0.1:$port$path';
   int countFor(String path) => requests.where((r) => r.path == path).length;
 
-  Future<void> waitReal(WidgetTester tester, bool Function() done,
-      {Duration timeout = const Duration(seconds: 30)}) async {
-    await tester.runAsync(() async {
-      final deadline = DateTime.now().add(timeout);
-      while (DateTime.now().isBefore(deadline)) {
-        await Future<void>.delayed(const Duration(milliseconds: 300));
-        if (done()) return;
-      }
-    });
-  }
+  const waitReal = RealWait(interval: Duration(milliseconds: 300));
 
   // Mount one webview through the real factory and wait (wall-clock) for its
   // initial request to reach the loopback server. Frames are pumped only to
@@ -108,8 +108,17 @@ void main() {
             height: 480,
             child: WebViewFactory.createWebView(
               config: WebViewConfig(
+                hooks: bareHooks(),
+                posture: barePosture(
+                  url(path),
+                  siteId: 'privacy-settings',
+                  adjust: (site) => site
+                    ..clearUrlEnabled = true
+                    ..dnsBlockEnabled = true
+                    ..contentBlockEnabled = true
+                    ..trackingProtectionEnabled = trackingProtection,
+                ),
                 initialUrl: url(path),
-                trackingProtectionEnabled: trackingProtection,
               ),
               onControllerCreated: (c) {
                 if (!ctrl.isCompleted) ctrl.complete(c);
@@ -122,13 +131,13 @@ void main() {
     for (var i = 0; i < 20; i++) {
       await tester.pump(const Duration(milliseconds: 100));
     }
-    await waitReal(tester, () => countFor(path) >= 1);
+    await waitReal(tester, done: () => countFor(path) >= 1);
     _Req? seen;
     for (final r in requests) {
       if (r.path == path) seen = r;
     }
     final controller = ctrl.isCompleted ? await ctrl.future : null;
-    return _Mounted(seen, controller);
+    return _Mounted(seen, controller: controller);
   }
 
   testWidgets('tracking protection suppresses the X-Requested-With header',
@@ -161,8 +170,8 @@ void main() {
     // Returns whether navigating back to A re-hits the network. With bfcache
     // the back entry is restored from cache (no new request); without it the
     // engine re-fetches A.
-    Future<bool> backRefetches(bool bfcache) async {
-      WebViewFactory.backForwardCacheEnabled = bfcache;
+    Future<bool> backRefetches({required bool bfcache}) async {
+      AppPref.backForwardCacheEnabled.debugValue = bfcache;
       final tag = bfcache ? 'on' : 'off';
       final aPath = '/bfa-$tag';
       final bPath = '/bfb-$tag';
@@ -170,15 +179,15 @@ void main() {
       final c = m.controller;
       if (c == null) return false;
       await tester.runAsync(() => c.loadUrl(url(bPath)));
-      await waitReal(tester, () => countFor(bPath) >= 1);
+      await waitReal(tester, done: () => countFor(bPath) >= 1);
       final before = countFor(aPath);
       await tester.runAsync(() => c.goBack());
-      await waitReal(tester, () => countFor(aPath) > before,
+      await waitReal(tester, done: () => countFor(aPath) > before,
           timeout: const Duration(seconds: 6));
       return countFor(aPath) > before;
     }
 
-    final offRefetch = await backRefetches(false);
+    final offRefetch = await backRefetches(bfcache: false);
     log('bfcache off -> back refetched A: $offRefetch');
     if (!offRefetch) {
       log('SKIP: back-navigation served from an always-on engine cache here, '
@@ -186,7 +195,7 @@ void main() {
           'is off by default.');
       return;
     }
-    final onRefetch = await backRefetches(true);
+    final onRefetch = await backRefetches(bfcache: true);
     log('bfcache on -> back refetched A: $onRefetch');
     expect(onRefetch, isFalse,
         reason: 'with backForwardCacheEnabled, going back must restore from '

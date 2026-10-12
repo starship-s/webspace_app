@@ -14,17 +14,24 @@ class ArchiveState {
     List<Map<String, dynamic>>? webspaces,
     List<Map<String, dynamic>>? sites,
     Map<String, List<Map<String, dynamic>>>? cookies,
+    Map<String, List<String>>? appTierMembership,
     this.selectedWebspaceId,
   })  : createdAt = createdAt ?? DateTime.now().toUtc(),
         webspaces = webspaces ?? <Map<String, dynamic>>[],
         sites = sites ?? <Map<String, dynamic>>[],
-        cookies = cookies ?? <String, List<Map<String, dynamic>>>{};
+        cookies = cookies ?? <String, List<Map<String, dynamic>>>{},
+        appTierMembership = appTierMembership ?? <String, List<String>>{};
 
   final int version;
   final DateTime createdAt;
   final List<Map<String, dynamic>> webspaces;
   final List<Map<String, dynamic>> sites;
   final Map<String, List<Map<String, dynamic>>> cookies;
+  /// Which app-tier webspaces each archived site belonged to before it was
+  /// archived (`{webspaceId: [siteId]}`). Lives here, not in the plaintext
+  /// `webspaces` pref, so a closed archive leaves no dangling ids behind
+  /// (ARCH-001); reopening re-attaches the sites to their collections.
+  final Map<String, List<String>> appTierMembership;
   String? selectedWebspaceId;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
@@ -33,9 +40,28 @@ class ArchiveState {
         'webspaces': webspaces,
         'sites': sites,
         'cookies': cookies,
+        if (appTierMembership.isNotEmpty)
+          'appTierMembership': appTierMembership,
         if (selectedWebspaceId != null)
           'selectedWebspaceId': selectedWebspaceId,
       };
+
+  /// This state with the given parts in place of its own.
+  ArchiveState copyWith({
+    List<Map<String, dynamic>>? sites,
+    Map<String, List<Map<String, dynamic>>>? cookies,
+    List<Map<String, dynamic>>? webspaces,
+    Map<String, List<String>>? appTierMembership,
+  }) =>
+      ArchiveState(
+        version: version,
+        createdAt: createdAt,
+        selectedWebspaceId: selectedWebspaceId,
+        sites: sites ?? this.sites,
+        cookies: cookies ?? this.cookies,
+        webspaces: webspaces ?? this.webspaces,
+        appTierMembership: appTierMembership ?? this.appTierMembership,
+      );
 
   factory ArchiveState.fromJson(Map<String, dynamic> json) {
     final rawCookies = json['cookies'] as Map<String, dynamic>? ??
@@ -63,6 +89,14 @@ class ArchiveState {
           .map((m) => Map<String, dynamic>.from(m))
           .toList(),
       cookies: cookies,
+      appTierMembership: {
+        for (final e
+            in (json['appTierMembership'] as Map<String, dynamic>? ??
+                    const <String, dynamic>{})
+                .entries)
+          if (e.value is List)
+            e.key: (e.value as List).whereType<String>().toList(),
+      },
       selectedWebspaceId: json['selectedWebspaceId'] as String?,
     );
   }
@@ -97,11 +131,28 @@ class ArchiveHandle {
   }
 }
 
+/// Turns a passphrase into an archive key. [salt] is the per-install salt, or
+/// null for the superseded passphrase-derived one.
+typedef ArchiveKeyDeriver = Future<Uint8List> Function(
+  String passphrase, {
+  required Uint8List? salt,
+});
+
+Future<Uint8List> _argon2Derive(String passphrase, {required Uint8List? salt}) {
+  return salt == null
+      ? ArchiveKeyDerivation.deriveLegacy(passphrase)
+      : ArchiveKeyDerivation.derive(passphrase, salt: salt);
+}
+
 class Archive {
-  Archive({ArchiveStorage? storage})
-      : _storage = storage ?? ArchiveStorage();
+  /// [deriveKey] exists so tests can exercise the passphrase paths without
+  /// paying ~1s of Argon2id per call; production always takes the default.
+  Archive({ArchiveStorage? storage, ArchiveKeyDeriver? deriveKey})
+      : _storage = storage ?? ArchiveStorage(),
+        _derive = deriveKey ?? _argon2Derive;
 
   final ArchiveStorage _storage;
+  final ArchiveKeyDeriver _derive;
   final List<ArchiveHandle> _openHandles = <ArchiveHandle>[];
 
   List<ArchiveHandle> get openArchives =>
@@ -110,8 +161,31 @@ class Archive {
   Future<void> ensureInitialized() => _storage.ensureInitialized();
 
   Future<ArchiveHandle?> tryOpen(String passphrase) async {
-    final key = await ArchiveKeyDerivation.derive(passphrase);
-    return tryOpenWithKey(key);
+    await ensureInitialized();
+    final saltEntry = await _storage.ensureKdfSalt();
+    final key = await _derive(passphrase, salt: saltEntry.salt);
+    final match = await _scanSlots(key);
+    if (match != null) {
+      return _adopt(key, match: match);
+    }
+    if (!saltEntry.legacyPossible) {
+      ArchiveCrypto.zeroize(key);
+      return null;
+    }
+    final legacyKey = await _derive(passphrase, salt: null);
+    final legacyMatch = await _scanSlots(legacyKey);
+    ArchiveCrypto.zeroize(legacyKey);
+    if (legacyMatch == null) {
+      ArchiveCrypto.zeroize(key);
+      return null;
+    }
+    final handle = _adopt(key, match: legacyMatch);
+    if (identical(handle.key, key)) {
+      // Re-seal under the per-install salt so this slot never needs the legacy
+      // derivation again.
+      await _persist(handle);
+    }
+    return handle;
   }
 
   Future<ArchiveHandle?> tryOpenWithKey(Uint8List key) async {
@@ -121,11 +195,16 @@ class Archive {
       ArchiveCrypto.zeroize(key);
       return null;
     }
+    return _adopt(key, match: match);
+  }
+
+  ArchiveHandle _adopt(Uint8List key, {required _SlotMatch match}) {
     final existing = _findOpenBySlot(match.slotIndex);
     if (existing != null) {
       ArchiveCrypto.zeroize(key);
       return existing;
     }
+    _knownOccupied.add(match.slotIndex);
     final handle = ArchiveHandle._(
       key: key,
       slotIndex: match.slotIndex,
@@ -138,13 +217,29 @@ class Archive {
   }
 
   Future<ArchiveHandle> create(String passphrase) async {
-    final key = await ArchiveKeyDerivation.derive(passphrase);
+    await ensureInitialized();
+    final saltEntry = await _storage.ensureKdfSalt();
+    if (saltEntry.legacyPossible) {
+      // A slot still sealed under the legacy key would be invisible to
+      // [createWithKey]'s scan, and claiming a second slot for the same
+      // passphrase would strand it.
+      final legacyKey = await _derive(passphrase, salt: null);
+      final legacyMatch = await _scanSlots(legacyKey);
+      ArchiveCrypto.zeroize(legacyKey);
+      if (legacyMatch != null) {
+        throw StateError(
+          'an archive already exists for this passphrase '
+          '(slot ${legacyMatch.slotIndex})',
+        );
+      }
+    }
+    final key = await _derive(passphrase, salt: saltEntry.salt);
     return createWithKey(key);
   }
 
   Future<ArchiveHandle> createWithKey(Uint8List key) async {
     await ensureInitialized();
-    final claimed = <int>{for (final h in _openHandles) h.slotIndex};
+    final claimed = _claimedSlots();
     final scan = await _scanSlots(key);
     if (scan != null) {
       ArchiveCrypto.zeroize(key);
@@ -159,9 +254,31 @@ class Archive {
       state: ArchiveState(),
     );
     await _persist(handle);
+    _knownOccupied.add(slotIndex);
     _openHandles.add(handle);
     return handle;
   }
+
+  /// Slots this process has seen hold an archive: every open handle plus
+  /// every slot that decrypted or was written since launch. A closed
+  /// archive under another passphrase is invisible to [_scanSlots], so
+  /// without this a new archive could land on it. Nothing here persists:
+  /// an on-disk occupancy marker would vary with archive count (ARCH-001).
+  final Set<int> _knownOccupied = <int>{};
+
+  Set<int> _claimedSlots() => <int>{
+        for (final h in _openHandles) h.slotIndex,
+        ..._knownOccupied,
+      };
+
+  /// Whether [state] fits one slot. Callers check before they change
+  /// anything, so a state that does not fit leaves everything as it was;
+  /// [save] refuses one that does not.
+  static bool fits(ArchiveState state) =>
+      _payload(state).length <= kArchiveSlotMaxPayload;
+
+  static Uint8List _payload(ArchiveState state) =>
+      Uint8List.fromList(utf8.encode(jsonEncode(state.toJson())));
 
   Future<void> save(ArchiveHandle handle) async {
     if (handle.isClosed) {
@@ -195,66 +312,79 @@ class Archive {
   /// but NOT opened. Returns the blobs that did not decrypt under this
   /// passphrase, so the caller can prompt again for a different one.
   Future<List<String>> importSections(
-    String passphrase,
-    List<String> base64Sections,
-  ) async {
-    final key = await ArchiveKeyDerivation.derive(passphrase);
-    try {
-      return await importSectionsWithKey(key, base64Sections);
-    } finally {
-      ArchiveCrypto.zeroize(key);
-    }
-  }
-
-  /// Key-based core of [importSections]. Does not consume or zeroize
-  /// [key] (the caller owns its lifetime). Exposed for tests so they
-  /// can exercise section round-tripping without the per-call Argon2id
-  /// cost; derivation itself is covered by the crypto tests.
-  Future<List<String>> importSectionsWithKey(
-    Uint8List key,
-    List<String> base64Sections,
-  ) async {
+    String passphrase, {
+    required List<String> base64Sections,
+  }) async {
     await ensureInitialized();
+    final localSalt = (await _storage.ensureKdfSalt()).salt;
+    final derived = <String, Uint8List>{};
+    Future<Uint8List> keyFor(Uint8List? salt) async {
+      final cacheKey = salt == null ? 'legacy' : base64.encode(salt);
+      final hit = derived[cacheKey];
+      if (hit != null) return hit;
+      final key = await _derive(passphrase, salt: salt);
+      derived[cacheKey] = key;
+      return key;
+    }
+
     final unmatched = <String>[];
-    for (final b64 in base64Sections) {
-      Uint8List wire;
-      try {
-        wire = Uint8List.fromList(base64.decode(b64));
-      } catch (_) {
-        unmatched.add(b64);
-        continue;
+    try {
+      for (final b64 in base64Sections) {
+        final section = _ArchiveSection.parse(b64);
+        if (section == null) {
+          unmatched.add(b64);
+          continue;
+        }
+        final plaintext = await ArchiveCrypto.open(await keyFor(section.salt),
+            wire: section.wire);
+        if (plaintext == null) {
+          unmatched.add(b64);
+          continue;
+        }
+        final stateJson =
+            jsonDecode(utf8.decode(plaintext)) as Map<String, dynamic>;
+        // Re-key onto this device's salt: the section was sealed under the
+        // exporting device's, which this device's open path never derives.
+        await _writeState(
+          await keyFor(localSalt),
+          state: ArchiveState.fromJson(stateJson),
+        );
       }
-      final plaintext = await ArchiveCrypto.open(key, wire);
-      if (plaintext == null) {
-        unmatched.add(b64);
-        continue;
+    } finally {
+      for (final key in derived.values) {
+        ArchiveCrypto.zeroize(key);
       }
-      final stateJson =
-          jsonDecode(utf8.decode(plaintext)) as Map<String, dynamic>;
-      await _writeState(key, ArchiveState.fromJson(stateJson));
     }
     return unmatched;
   }
 
   /// Seals an archive's state into a self-contained base64 blob (no
   /// slot AAD) that [importSections] can later restore under the same
-  /// passphrase-derived key.
+  /// passphrase.
+  ///
+  /// The blob carries this install's Argon2id salt in the clear ahead of the
+  /// ciphertext: the receiving device derives with its own salt, so without it
+  /// a backup could only ever be restored onto the device that made it
+  /// (ARCH-002, "same passphrase across devices"). The salt is public input to
+  /// a KDF, not a secret — what it costs an attacker is the ability to reuse
+  /// one precomputed table against every other install.
   Future<String> exportSection(ArchiveHandle handle) async {
+    final salt = (await _storage.ensureKdfSalt()).salt;
     final plaintext =
         Uint8List.fromList(utf8.encode(jsonEncode(handle.state.toJson())));
-    final wire = await ArchiveCrypto.seal(handle.key, plaintext);
-    return base64.encode(wire);
+    final wire = await ArchiveCrypto.seal(handle.key, plaintext: plaintext);
+    return _ArchiveSection(salt: salt, wire: wire).encode();
   }
 
-  Future<void> _writeState(Uint8List key, ArchiveState state) async {
+  Future<void> _writeState(Uint8List key, {required ArchiveState state}) async {
     final match = await _scanSlots(key);
     final int slotIndex;
     if (match != null) {
       slotIndex = match.slotIndex;
     } else {
-      final claimed = <int>{for (final h in _openHandles) h.slotIndex};
-      slotIndex = _storage.pickRandomUnclaimedSlot(claimed);
+      slotIndex = _storage.pickRandomUnclaimedSlot(_claimedSlots());
     }
+    _knownOccupied.add(slotIndex);
     // Build a transient handle over a private copy of the key just to
     // persist; never registered as open, zeroed immediately after.
     final handle = ArchiveHandle._(
@@ -271,7 +401,7 @@ class Archive {
     for (var i = 0; i < slots.length; i++) {
       final padded = await ArchiveCrypto.open(
         key,
-        slots[i],
+        wire: slots[i],
         aad: ArchiveStorage.aadForSlot(i),
       );
       if (padded == null) continue;
@@ -297,8 +427,7 @@ class Archive {
   }
 
   Future<void> _persist(ArchiveHandle handle) async {
-    final payload =
-        Uint8List.fromList(utf8.encode(jsonEncode(handle.state.toJson())));
+    final payload = _payload(handle.state);
     if (payload.length > kArchiveSlotMaxPayload) {
       throw StateError(
         'archive payload (${payload.length} B) exceeds slot capacity '
@@ -313,13 +442,13 @@ class Archive {
       kArchiveSlotPayloadHeader + payload.length,
       payload,
     );
-    fillSecureRandom(padded, kArchiveSlotPayloadHeader + payload.length);
+    fillSecureRandom(padded, from: kArchiveSlotPayloadHeader + payload.length);
     final wire = await ArchiveCrypto.seal(
       handle.key,
-      padded,
+      plaintext: padded,
       aad: ArchiveStorage.aadForSlot(handle.slotIndex),
     );
-    await _storage.writeSlot(handle.slotIndex, wire);
+    await _storage.writeSlot(handle.slotIndex, bytes: wire);
   }
 }
 
@@ -327,4 +456,52 @@ class _SlotMatch {
   _SlotMatch({required this.slotIndex, required this.plaintext});
   final int slotIndex;
   final Uint8List plaintext;
+}
+
+/// Wire framing for an exported section: `"WSA1" || salt || AEAD wire`. A blob
+/// with no magic predates the per-install salt, so its key came from the
+/// passphrase alone ([ArchiveKeyDerivation.deriveLegacy]).
+class _ArchiveSection {
+  _ArchiveSection({required this.salt, required this.wire});
+
+  static const List<int> _magic = <int>[0x57, 0x53, 0x41, 0x31];
+
+  final Uint8List? salt;
+  final Uint8List wire;
+
+  static _ArchiveSection? parse(String base64Section) {
+    Uint8List raw;
+    try {
+      raw = Uint8List.fromList(base64.decode(base64Section));
+    } on FormatException {
+      return null;
+    }
+    final headerLength = _magic.length + kArchiveSaltLength;
+    if (raw.length > headerLength && _hasMagic(raw)) {
+      return _ArchiveSection(
+        salt: Uint8List.sublistView(raw, _magic.length, headerLength),
+        wire: Uint8List.sublistView(raw, headerLength),
+      );
+    }
+    return _ArchiveSection(salt: null, wire: raw);
+  }
+
+  static bool _hasMagic(Uint8List raw) {
+    for (var i = 0; i < _magic.length; i++) {
+      if (raw[i] != _magic[i]) return false;
+    }
+    return true;
+  }
+
+  String encode() {
+    final s = salt;
+    if (s == null) {
+      return base64.encode(wire);
+    }
+    final out = Uint8List(_magic.length + s.length + wire.length);
+    out.setRange(0, _magic.length, _magic);
+    out.setRange(_magic.length, _magic.length + s.length, s);
+    out.setRange(_magic.length + s.length, out.length, wire);
+    return base64.encode(out);
+  }
 }

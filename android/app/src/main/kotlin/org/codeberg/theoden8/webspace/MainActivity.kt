@@ -1,5 +1,7 @@
 package org.codeberg.theoden8.webspace
 
+import android.content.ComponentCallbacks2
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.graphics.BitmapFactory
@@ -14,19 +16,17 @@ import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterShellArgs
 import io.flutter.plugin.common.MethodChannel
-import java.net.URL
 
 class MainActivity: FlutterActivity() {
     private val CHANNEL = "org.codeberg.theoden8.webspace/shortcuts"
     private val SHARE_CHANNEL = "org.codeberg.theoden8.webspace/share_intent"
-    private var webInterceptPlugin: WebInterceptPlugin? = null
     private var locationPlugin: LocationPlugin? = null
-    private var cameraPermissionPlugin: CameraPermissionPlugin? = null
-    private var webSpaceContainerPlugin: WebSpaceContainerPlugin? = null
+    private var cameraPermissionPlugin: CapturePermissionPlugin? = null
+    private var microphonePermissionPlugin: CapturePermissionPlugin? = null
     private var surfaceDiagPlugin: SurfaceDiagPlugin? = null
-    private var backgroundTaskPlugin: BackgroundTaskAndroidPlugin? = null
-    private var mediaSessionPlugin: MediaSessionPlugin? = null
-    private var proxyRelayPlugin: ProxyRelayPlugin? = null
+    private var enginePlugins: EnginePlugins? = null
+    private var screenCapturePlugin: ScreenCapturePlugin? = null
+    private var passkeyPlugin: PasskeyPlugin? = null
     private var pendingShareUrl: String? = null
     private var pendingShareHtml: HtmlPayload? = null
 
@@ -50,28 +50,29 @@ class MainActivity: FlutterActivity() {
         }
     }
 
-    override fun getFlutterShellArgs(): FlutterShellArgs {
-        val args = FlutterShellArgs.fromIntent(intent)
-        // Disable Impeller on x86/x86_64 (Waydroid, emulators) where Vulkan
-        // swapchain creation crashes. Falls back to Skia + OpenGL ES which
-        // is still hardware-accelerated.
-        if (Build.SUPPORTED_ABIS.any { it == "x86_64" || it == "x86" }) {
-            args.remove(FlutterShellArgs.ARG_ENABLE_IMPELLER)
-            args.add(FlutterShellArgs.ARG_DISABLE_IMPELLER)
-        }
-        return args
+    override fun getFlutterShellArgs(): FlutterShellArgs =
+        WorkerFlutterEngine.forThisDevice(FlutterShellArgs.fromIntent(intent))
+
+    /**
+     * An engine the notification worker started holds the app's Dart state
+     * too, and two of them in one process would each write the site list and
+     * drive the one proxy override. It is stopped before this activity builds
+     * its own (NOTIF-016); the wake it ran ends there.
+     */
+    override fun provideFlutterEngine(context: Context): FlutterEngine? {
+        WorkerFlutterEngine.stop(context, "the app was opened")
+        return null
     }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        webInterceptPlugin = WebInterceptPlugin(this, flutterEngine)
+        enginePlugins = EnginePlugins(this, flutterEngine, this)
         locationPlugin = LocationPlugin(this, flutterEngine)
-        cameraPermissionPlugin = CameraPermissionPlugin(this, flutterEngine)
-        webSpaceContainerPlugin = WebSpaceContainerPlugin(flutterEngine)
+        cameraPermissionPlugin = CapturePermissionPlugin.camera(this, flutterEngine)
+        microphonePermissionPlugin = CapturePermissionPlugin.microphone(this, flutterEngine)
         surfaceDiagPlugin = SurfaceDiagPlugin(this, flutterEngine)
-        backgroundTaskPlugin = BackgroundTaskAndroidPlugin(applicationContext, flutterEngine)
-        mediaSessionPlugin = MediaSessionPlugin(applicationContext, flutterEngine)
-        proxyRelayPlugin = ProxyRelayPlugin(flutterEngine)
+        screenCapturePlugin = ScreenCapturePlugin(this, flutterEngine)
+        passkeyPlugin = PasskeyPlugin(this, flutterEngine)
         captureSharePayload(intent)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, SHARE_CHANNEL).setMethodCallHandler { call, result ->
             when (call.method) {
@@ -125,6 +126,22 @@ class MainActivity: FlutterActivity() {
                     }
                     result.success(true)
                 }
+                "updateShortcuts" -> {
+                    // HS-016: a pinned tile follows the name and icon of the
+                    // site it opens. A tile sent without iconBytes keeps the
+                    // icon it has.
+                    val tiles = call.argument<List<Map<String, Any?>>>("tiles").orEmpty()
+                    val shortcuts = tiles.mapNotNull { tile ->
+                        val siteId = tile["siteId"] as? String
+                        val label = tile["label"] as? String
+                        if (siteId == null || label.isNullOrEmpty()) {
+                            null
+                        } else {
+                            siteShortcut(siteId, label, decodeIcon(tile["iconBytes"] as? ByteArray))
+                        }
+                    }
+                    result.success(updateTiles(shortcuts))
+                }
                 "disableShortcut" -> {
                     // Explicit user opt-in (HS-011): the app can't remove a
                     // pinned tile, but it can disable it — greyed out, launcher
@@ -149,6 +166,32 @@ class MainActivity: FlutterActivity() {
                         (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
                     result.success(if (debuggable) intent?.getStringExtra("ws_diag_seed") else null)
                 }
+                "getDiagRepaintSuppression" -> {
+                    // Same debuggable gate as the seed: this drops repaint
+                    // triggers, so on a release build it could only ever make
+                    // the recurring blank screen easier to hit.
+                    val debuggable =
+                        (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                    result.success(
+                        if (debuggable) {
+                            intent?.getStringExtra("ws_diag_suppress_repaint")
+                        } else {
+                            null
+                        }
+                    )
+                }
+                "getDiagReload" -> {
+                    // Adb white-screen tier (INTEG-011). The refresh funnel
+                    // is only reachable from the overflow menu, which adb
+                    // cannot drive; same debuggable gate as the seed. Drained
+                    // on read so a later resume does not reload again.
+                    val debuggable =
+                        (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE) != 0
+                    val spec =
+                        if (debuggable) intent?.getStringExtra("ws_diag_reload") else null
+                    intent?.removeExtra("ws_diag_reload")
+                    result.success(spec)
+                }
                 "getLaunchSiteId" -> {
                     val siteId = intent?.getStringExtra("siteId")
                     // Drain the extra after reading so it fires once per tap.
@@ -159,20 +202,7 @@ class MainActivity: FlutterActivity() {
                     intent?.removeExtra("siteId")
                     result.success(siteId)
                 }
-                "getPinnedSiteIds" -> {
-                    try {
-                        val pinned = ShortcutManagerCompat.getShortcuts(
-                            this,
-                            ShortcutManagerCompat.FLAG_MATCH_PINNED
-                        )
-                        val ids = pinned.mapNotNull { info ->
-                            info.id.takeIf { it.startsWith("site_") }?.removePrefix("site_")
-                        }
-                        result.success(ids)
-                    } catch (e: Exception) {
-                        result.success(emptyList<String>())
-                    }
-                }
+                "getPinnedSiteIds" -> result.success(pinnedSiteIds(this))
                 else -> result.notImplemented()
             }
         }
@@ -186,40 +216,19 @@ class MainActivity: FlutterActivity() {
 
         Thread {
             try {
-                val intent = Intent(this, MainActivity::class.java).apply {
-                    action = Intent.ACTION_VIEW
-                    putExtra("siteId", siteId)
-                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
-                }
+                // Dart rasterizes the favicon through the site's proxy; when that
+                // fails the shortcut gets the app icon (HS-003). Never fetch the
+                // page-chosen iconUrl here: this is a raw HttpURLConnection over
+                // the device IP, outside the proxy (LEAK-003).
+                val icon = decodeIcon(iconBytes)
+                    ?: IconCompat.createWithResource(this, R.mipmap.ic_launcher)
+                val shortcut = siteShortcut(siteId, label, icon)
 
-                val appIcon = IconCompat.createWithResource(this, R.mipmap.ic_launcher)
-                // Prefer Dart-rasterized PNG bytes (handles SVG/ICO favicons that
-                // BitmapFactory.decodeStream can't). Fall back to downloading the
-                // raw iconUrl, then to the app icon.
-                val icon = when {
-                    iconBytes != null -> {
-                        val bmp = BitmapFactory.decodeByteArray(iconBytes, 0, iconBytes.size)
-                        if (bmp != null) IconCompat.createWithBitmap(bmp) else appIcon
-                    }
-                    iconUrl != null -> {
-                        try {
-                            val stream = URL(iconUrl).openStream()
-                            val bitmap = BitmapFactory.decodeStream(stream)
-                            stream.close()
-                            if (bitmap != null) IconCompat.createWithBitmap(bitmap) else appIcon
-                        } catch (e: Exception) {
-                            appIcon
-                        }
-                    }
-                    else -> appIcon
+                republish(shortcut)
+                if (isPinnedAndEnabled(shortcut.id)) {
+                    runOnUiThread { result.success("alreadyPinned") }
+                    return@Thread
                 }
-
-                val shortcut = ShortcutInfoCompat.Builder(this, "site_$siteId")
-                    .setShortLabel(label)
-                    .setLongLabel(label)
-                    .setIcon(icon)
-                    .setIntent(intent)
-                    .build()
 
                 val success = ShortcutManagerCompat.requestPinShortcut(this, shortcut, null)
                 runOnUiThread {
@@ -236,6 +245,57 @@ class MainActivity: FlutterActivity() {
             }
         }.start()
     }
+
+    // A null icon leaves it unset, which an update reads as "keep the tile's
+    // icon": ShortcutInfo.copyNonNullFieldsFrom only replaces non-null fields.
+    private fun siteShortcut(siteId: String, label: String, icon: IconCompat?): ShortcutInfoCompat {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            putExtra("siteId", siteId)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP)
+        }
+        val builder = ShortcutInfoCompat.Builder(this, "site_$siteId")
+            .setShortLabel(label)
+            .setLongLabel(label)
+            .setIntent(intent)
+        if (icon != null) builder.setIcon(icon)
+        return builder.build()
+    }
+
+    private fun decodeIcon(bytes: ByteArray?): IconCompat? {
+        if (bytes == null) return null
+        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return null
+        return IconCompat.createWithBitmap(bmp)
+    }
+
+    // updateShortcuts is the documented way to change a pinned shortcut. It
+    // returns false when rate-limited (an app in the background) and throws
+    // for an immutable id; either way Dart keeps the tile stale and retries
+    // on its next sync.
+    private fun updateTiles(shortcuts: List<ShortcutInfoCompat>): Boolean {
+        if (shortcuts.isEmpty()) return true
+        return try {
+            ShortcutManagerCompat.updateShortcuts(this, shortcuts)
+        } catch (e: IllegalArgumentException) {
+            false
+        }
+    }
+
+    // requestPinShortcut throws when the id already exists disabled. A device
+    // restore leaves exactly that behind: the old pinned tile comes back
+    // disabled when Android can't vouch for this install (signature, version),
+    // invisible to getShortcuts, and an imported backup brings the same siteId
+    // back. Publishing the id replaces that copy with an enabled one and keeps
+    // its pin (HS-015); dropping the dynamic flag right after keeps the site
+    // out of the launcher's long-press menu.
+    private fun republish(shortcut: ShortcutInfoCompat) {
+        ShortcutManagerCompat.pushDynamicShortcut(this, shortcut)
+        ShortcutManagerCompat.removeDynamicShortcuts(this, listOf(shortcut.id))
+    }
+
+    private fun isPinnedAndEnabled(id: String): Boolean =
+        ShortcutManagerCompat.getShortcuts(this, ShortcutManagerCompat.FLAG_MATCH_PINNED)
+            .any { it.id == id && it.isEnabled }
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
@@ -362,13 +422,34 @@ class MainActivity: FlutterActivity() {
         }
     }
 
+    /**
+     * DEVTOOLS-012: the system asking for memory, or saying it may reclaim
+     * the process. Flutter forwards every level from RUNNING_LOW up as memory
+     * pressure, UI_HIDDEN included, which arrives on every exit from the
+     * screen and is not pressure at all (PAUSE-034), so that one is left out.
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level == ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) return
+        BackgroundLogFile.record(this, "system trim memory: ${trimLevelName(level)}", "warning")
+    }
+
+    // Since API 34 apps are sent only UI_HIDDEN and BACKGROUND; the other
+    // levels are deprecated there and still arrive on older releases.
+    @Suppress("DEPRECATION")
+    private fun trimLevelName(level: Int): String = when (level) {
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE -> "running moderate"
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW -> "running low"
+        ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL -> "running critical"
+        ComponentCallbacks2.TRIM_MEMORY_BACKGROUND -> "background"
+        ComponentCallbacks2.TRIM_MEMORY_MODERATE -> "moderate"
+        ComponentCallbacks2.TRIM_MEMORY_COMPLETE -> "complete"
+        else -> "level $level"
+    }
+
     override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
-        backgroundTaskPlugin?.dispose()
-        backgroundTaskPlugin = null
-        mediaSessionPlugin?.dispose()
-        mediaSessionPlugin = null
-        proxyRelayPlugin?.dispose()
-        proxyRelayPlugin = null
+        enginePlugins?.dispose()
+        enginePlugins = null
         super.cleanUpFlutterEngine(flutterEngine)
     }
 
@@ -383,6 +464,25 @@ class MainActivity: FlutterActivity() {
         if (cameraPermissionPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults) == true) {
             return
         }
+        if (microphonePermissionPlugin?.onRequestPermissionsResult(requestCode, permissions, grantResults) == true) {
+            return
+        }
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
     }
+}
+
+/** Site ids of the enabled pinned shortcuts. Needs no activity, so the
+ * worker's engine answers it too (NOTIF-016). */
+internal fun pinnedSiteIds(context: Context): List<String> = try {
+    val pinned = ShortcutManagerCompat.getShortcuts(
+        context,
+        ShortcutManagerCompat.FLAG_MATCH_PINNED
+    )
+    // A disabled tile opens nothing, so it must not hide
+    // the menu item that would bring it back (HS-015).
+    pinned.filter { it.isEnabled }.mapNotNull { info ->
+        info.id.takeIf { it.startsWith("site_") }?.removePrefix("site_")
+    }
+} catch (e: Exception) {
+    emptyList()
 }

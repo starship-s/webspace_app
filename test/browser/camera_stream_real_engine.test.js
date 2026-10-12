@@ -1,10 +1,9 @@
 // Real-Chromium proof for the virtual camera shim
-// (lib/services/camera_stream_shim.dart, dumped to
-// test/js_fixtures/camera_stream/shim.js).
+// (lib/js/camera_stream.js).
 //
 // The jsdom tier (test/js/camera_stream_shim.test.js) stubs canvas /
 // captureStream, so it proves the decision funnel but not that the synthetic
-// stream actually carries the picked image. This test runs the exact dumped
+// stream actually carries the picked image. This test runs the exact
 // shim in real headless Chromium and asserts a scanner can DECODE A QR CODE
 // off the getUserMedia stream — the end-to-end claim the feature makes.
 //
@@ -13,12 +12,13 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const CAPTURE = require('../js/helpers/capture_shims');
 const fs = require('node:fs');
 const path = require('node:path');
-const http = require('node:http');
-const { setupBrowser, requireBrowser, readFixture } = require('./helpers/launch');
+const { setupBrowser, requireBrowser } = require('./helpers/launch');
+const { startBlankServer } = require('./helpers/blank_server');
 
-const SHIM = readFixture('camera_stream/shim.js');
+const SHIM = CAPTURE.CAMERA;
 const JSQR = fs.readFileSync(
   path.resolve(__dirname, '..', '..', 'node_modules', 'jsqr', 'dist', 'jsQR.js'),
   'utf8',
@@ -27,16 +27,6 @@ const QR_PAYLOAD = 'WEBSPACE-CAM-OK-42';
 
 const browser = setupBrowser();
 
-function startServer() {
-  return new Promise((resolve) => {
-    const server = http.createServer((_req, res) => {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<!doctype html><html><head></head><body></body></html>');
-    });
-    server.listen(0, '127.0.0.1', () => resolve(server));
-  });
-}
-
 test('virtual camera stream carries a decodable QR under real Chromium', async (t) => {
   if (!requireBrowser(browser, t)) return;
 
@@ -44,13 +34,13 @@ test('virtual camera stream carries a decodable QR under real Chromium', async (
     margin: 2,
     width: 400,
   });
-  const server = await startServer();
+  const server = await startBlankServer();
   const { port } = server.address();
   const page = await browser.browser.newPage();
 
   try {
     // Bridge stub returns whatever source the page stashes (built from the
-    // QR below); the dumped shim and jsQR are injected before any page load.
+    // QR below); the shim and jsQR are injected before any page load.
     await page.evaluateOnNewDocument(() => {
       window.__wsCamSource = null;
       window.flutter_inappwebview = {
@@ -136,20 +126,88 @@ test('virtual camera stream carries a decodable QR under real Chromium', async (
   }
 });
 
+// Single source of truth: the same committed clip the emulator tier feeds the
+// device (integration_test/fixtures/virtual_camera_video.dart).
+function readClipFixture() {
+  const src = fs.readFileSync(
+    path.resolve(__dirname, '..', '..', 'integration_test', 'fixtures',
+      'virtual_camera_video.dart'), 'utf8');
+  const b64 = /'data:video\/webm;base64,'\s*'([^']+)'/.exec(src)[1];
+  const colours = [...src.matchAll(/kVirtualCameraVideoColor[AB] = \[([^\]]+)\]/g)]
+    .map((m) => m[1].split(',').map((n) => parseInt(n.trim(), 10)));
+  assert.equal(colours.length, 2, 'fixture should declare both colours');
+  return { b64, colours };
+}
+
+// BUG-010: the emulator tier proves "playing, not frozen" by watching the clip
+// change colour, so the assertion is only as good as the share of playback
+// time the second colour holds. The clip this replaced carried that colour on
+// one frame at the very end, leaving the probe to race the loop wrap for it —
+// a race it lost across ~300 samples in 30s. tool/generate_camera_video_fixture.js
+// enforces per-frame alternation where the clip is generated; this re-derives
+// it from the committed bytes, so a hand-edited fixture fails here rather than
+// on an emulator three tiers away.
+test('the committed clip alternates colour on every frame', async (t) => {
+  if (!requireBrowser(browser, t)) return;
+
+  const { b64 } = readClipFixture();
+  const page = await browser.browser.newPage();
+  try {
+    const r = await page.evaluate(async (dataUrl) => {
+      const video = document.createElement('video');
+      video.muted = true;
+      video.playsInline = true;
+      video.src = dataUrl;
+      await new Promise((res, rej) => {
+        video.oncanplay = res;
+        video.onerror = () => rej(new Error('committed clip does not decode'));
+      });
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      const ctx = canvas.getContext('2d');
+      const frames = [];
+      const ended = new Promise((res) => { video.onended = res; });
+      const onFrame = () => {
+        ctx.drawImage(video, 0, 0);
+        const d = ctx.getImageData(
+          Math.floor(canvas.width / 2), Math.floor(canvas.height / 2), 1, 1).data;
+        frames.push([d[0], d[1], d[2]]);
+        video.requestVideoFrameCallback(onFrame);
+      };
+      video.requestVideoFrameCallback(onFrame);
+      await video.play();
+      await Promise.race([ended, new Promise((res) => setTimeout(res, 10000))]);
+      return frames;
+    }, `data:video/webm;base64,${b64}`);
+
+    const flipped = (p, q) => Math.abs(p[0] - q[0]) + Math.abs(p[1] - q[1]) +
+      Math.abs(p[2] - q[2]) > 40;
+    assert.ok(r.length >= 8, `clip presented only ${r.length} frames`);
+    // Not `flipped(r[0], r[1])`: presentation can repeat a frame under a
+    // software decoder running slower than real time, which the transitions
+    // budget below already allows for. Demanding the flip at a fixed index
+    // contradicted that tolerance and failed a clip that was playing fine.
+    const firstFlip = r.findIndex((_, i) => i > 0 && flipped(r[i - 1], r[i]));
+    assert.ok(firstFlip > 0 && firstFlip <= 3,
+      `the clip must start alternating within its first frames, got ${
+        JSON.stringify(r.slice(0, 4))}`);
+    let transitions = 0;
+    for (let i = 1; i < r.length; i++) if (flipped(r[i - 1], r[i])) transitions++;
+    // Presentation can duplicate a frame under load; half the boundaries is
+    // still far from the one-flip-per-clip the old fixture offered.
+    assert.ok(transitions >= (r.length - 1) / 2,
+      `only ${transitions} flips across ${r.length} presented frames`);
+  } finally {
+    await page.close();
+  }
+});
+
 test('a video virtual source plays and loops under real Chromium', async (t) => {
   if (!requireBrowser(browser, t)) return;
 
-  // Single source of truth: the same committed clip the emulator tier feeds
-  // the device (integration_test/fixtures/virtual_camera_video.dart).
-  const fixtureSrc = fs.readFileSync(
-    path.resolve(__dirname, '..', '..', 'integration_test', 'fixtures',
-      'virtual_camera_video.dart'), 'utf8');
-  const b64 = /'data:video\/webm;base64,'\s*'([^']+)'/.exec(fixtureSrc)[1];
-  const colours = [...fixtureSrc.matchAll(/kVirtualCameraVideoColor[AB] = \[([^\]]+)\]/g)]
-    .map((m) => m[1].split(',').map((n) => parseInt(n.trim(), 10)));
-  assert.equal(colours.length, 2, 'fixture should declare both colours');
-
-  const server = await startServer();
+  const { b64, colours } = readClipFixture();
+  const server = await startBlankServer();
   const { port } = server.address();
   const page = await browser.browser.newPage();
   try {
@@ -199,7 +257,8 @@ test('a video virtual source plays and loops under real Chromium', async (t) => 
       (p) => near(p[0], want[0]) && near(p[1], want[1]) && near(p[2], want[2]));
     assert.ok(saw(colours[0]), `clip's first colour never appeared: ${JSON.stringify(r.samples.slice(0, 6))}`);
     assert.ok(saw(colours[1]), `clip's second colour never appeared: ${JSON.stringify(r.samples.slice(0, 6))}`);
-    // ~0.5s clip watched for 4s: a frozen first frame yields 0 transitions.
+    // ~1s clip alternating colour every frame, sampled 10x/s for 4s: a
+    // frozen first frame yields 0 transitions.
     assert.ok(r.changes >= 2,
       `the clip must keep looping, got ${r.changes} transitions over ${r.samples.length} samples`);
   } finally {

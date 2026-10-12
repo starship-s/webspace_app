@@ -1,17 +1,19 @@
 // Behavioural tests for the Android document-start viewport contract
-// (lib/services/webview.dart#buildAndroidPageZoomScript).
+// (lib/js/page_zoom_viewport.js). The legacy Android-only fixture was moved
+// into the shared PageJs source during the upstream service split.
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeDom, readFixture, runInDom } = require('./helpers/load_shim');
+const { makeDom, runInDom, pageJs } = require('./helpers/load_shim');
 
-function boot(fixture, html) {
+function boot(scale, html) {
   const dom = makeDom({ html });
-  Object.defineProperty(dom.window.screen, 'width', {
-    configurable: true,
-    value: 360,
-  });
-  runInDom(dom, readFixture(`android_page_zoom/${fixture}.js`));
+  runInDom(dom, pageJs('page_zoom_viewport', {
+    scale,
+    pinLayoutWidth: true,
+    portraitWidth: 360,
+    landscapeWidth: 360,
+  }));
   return dom;
 }
 
@@ -20,14 +22,14 @@ function settle() {
 }
 
 test('80% uses the CSS screen-width formula', () => {
-  const dom = boot('80', '<!doctype html><html><head></head><body></body></html>');
+  const dom = boot(0.8, '<!doctype html><html><head></head><body></body></html>');
   const meta = dom.window.document.querySelector('meta[name="viewport"]');
   assert.ok(meta);
   assert.equal(meta.getAttribute('content'), 'width=450, initial-scale=0.8');
 });
 
 test('125% uses the CSS screen-width formula', () => {
-  const dom = boot('125', '<!doctype html><html><head></head><body></body></html>');
+  const dom = boot(1.25, '<!doctype html><html><head></head><body></body></html>');
   const meta = dom.window.document.querySelector('meta[name="viewport"]');
   assert.ok(meta);
   assert.equal(meta.getAttribute('content'), 'width=288, initial-scale=1.25');
@@ -35,7 +37,7 @@ test('125% uses the CSS screen-width formula', () => {
 
 test('rewrites only zoom directives and preserves accessibility/site directives', () => {
   const dom = boot(
-    '80',
+    0.8,
     '<!doctype html><html><head><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content, user-scalable=no, minimum-scale=0.5, maximum-scale=2"></head><body></body></html>',
   );
   const metas = dom.window.document.querySelectorAll('meta[name="viewport"]');
@@ -50,7 +52,7 @@ test('rewrites only zoom directives and preserves accessibility/site directives'
 });
 
 test('late viewport metadata is adopted without duplicate tags or observer recursion', async () => {
-  const dom = boot('80', '<!doctype html><html><head></head><body></body></html>');
+  const dom = boot(0.8, '<!doctype html><html><head></head><body></body></html>');
   const late = dom.window.document.createElement('meta');
   late.name = 'viewport';
   late.content = 'width=device-width, initial-scale=1, viewport-fit=cover';

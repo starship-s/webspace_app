@@ -9,17 +9,26 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart' show ConsoleMess
 import 'package:share_plus/share_plus.dart';
 
 import 'package:webspace/l10n/gen/app_localizations.dart';
+import 'package:webspace/services/reentry_guard.dart';
 import 'package:webspace/web_view_model.dart';
 import 'package:webspace/screens/add_site.dart' show FaviconUrlCache;
 import 'package:webspace/services/container_cookie_manager.dart';
-import 'package:webspace/services/webview.dart';
 import 'package:webspace/services/icon_png_export.dart';
 import 'package:webspace/services/log_service.dart';
 import 'package:webspace/services/notification_service.dart';
 import 'package:webspace/services/content_blocker_service.dart';
+import 'package:webspace/services/developer_mode_service.dart';
 import 'package:webspace/services/dns_block_service.dart';
 import 'package:webspace/settings/proxy.dart';
 import 'package:webspace/settings/user_script.dart';
+import 'package:webspace/widgets/background_log_view.dart';
+import 'package:webspace/widgets/dev_tools_parts.dart';
+import 'package:webspace/widgets/log_entry_line.dart';
+import 'package:webspace/widgets/stat_chip.dart';
+import 'package:webspace/widgets/toast.dart';
+import 'package:webspace/services/cookie_manager.dart';
+import 'package:webspace/services/webview_controller.dart';
+import 'package:webspace/services/webview_config.dart';
 
 typedef VoidAsyncCallback = Future<void> Function();
 
@@ -40,6 +49,8 @@ abstract class DevToolsHost {
   /// URL used as the favicon cache key for this host (the site's stable
   /// `initUrl` for top-level sites; the current URL for nested webviews).
   String get iconUrl;
+  /// The user-chosen icon, which the drawer shows over any other.
+  Uint8List? get customIcon;
   /// Per-site proxy the favicon must be fetched through, or null for global.
   UserProxySettings? get proxy;
   WebViewController? get controller;
@@ -66,7 +77,9 @@ class WebViewModelDevToolsHost implements DevToolsHost {
   @override
   String get iconUrl => model.initUrl;
   @override
-  UserProxySettings? get proxy => model.proxySettings;
+  Uint8List? get customIcon => model.customIconPng;
+  @override
+  UserProxySettings? get proxy => model.outboundProxySettings;
   @override
   WebViewController? get controller => model.controller;
   @override
@@ -96,40 +109,33 @@ class NestedDevToolsHost implements DevToolsHost {
   final String name;
   @override
   final String? siteId;
-  String _currentUrl;
-  WebViewController? _controller;
+  @override
+  String currentUrl;
+  @override
+  WebViewController? controller;
   @override
   final List<ConsoleLogEntry> consoleLogs = [];
-  VoidCallback? _onConsoleLogChanged;
+  @override
+  VoidCallback? onConsoleLogChanged;
   @override
   List<Cookie> cookies = const [];
 
   NestedDevToolsHost({
     required this.name,
     required this.siteId,
-    required String currentUrl,
-  }) : _currentUrl = currentUrl;
+    required this.currentUrl,
+  });
 
   @override
-  String get currentUrl => _currentUrl;
-  set currentUrl(String value) => _currentUrl = value;
-
+  String get iconUrl => currentUrl;
   @override
-  String get iconUrl => _currentUrl;
+  Uint8List? get customIcon => null;
   @override
   UserProxySettings? get proxy => null;
 
-  @override
-  WebViewController? get controller => _controller;
-  set controller(WebViewController? value) => _controller = value;
-
-  @override
-  set onConsoleLogChanged(VoidCallback? cb) => _onConsoleLogChanged = cb;
-  VoidCallback? get onConsoleLogChanged => _onConsoleLogChanged;
-
   static const _maxConsoleLogs = 500;
 
-  void appendConsole(String message, ConsoleMessageLevel level) {
+  void appendConsole(String message, {required ConsoleMessageLevel level}) {
     consoleLogs.add(ConsoleLogEntry(
       timestamp: DateTime.now(),
       message: message,
@@ -138,7 +144,7 @@ class NestedDevToolsHost implements DevToolsHost {
     if (consoleLogs.length > _maxConsoleLogs) {
       consoleLogs.removeAt(0);
     }
-    _onConsoleLogChanged?.call();
+    onConsoleLogChanged?.call();
   }
 
   @override
@@ -148,7 +154,7 @@ class NestedDevToolsHost implements DevToolsHost {
   @override
   Set<String> get enabledGlobalScriptIds => const {};
   @override
-  void reload() => _controller?.reload();
+  void reload() => controller?.reload();
 }
 
 class DevToolsScreen extends StatefulWidget {
@@ -164,13 +170,17 @@ class DevToolsScreen extends StatefulWidget {
   final VoidAsyncCallback? onSave;
   final List<UserScriptConfig> globalUserScripts;
 
-  /// When non-null, the App Logs tab shows a diagnostics row that triggers
-  /// the same notification-site reload the OS background task would run.
+  /// When non-null and developer mode is on, the App Logs tab shows a
+  /// diagnostics row that triggers the same wake the OS background task
+  /// would run, plus a test notification for the host's site.
   /// Lets the wake-up chain (reload -> page JS -> webNotification handler ->
   /// NotificationService.show) be exercised in the foreground without
   /// waiting on iOS BGAppRefreshTask / Android WorkManager. Wired only from
   /// the top-level (per-site) launch; null for nested webviews.
   final VoidAsyncCallback? onSimulateBackgroundRefresh;
+
+  /// Open on the Background tab (DEVTOOLS-012) when developer mode shows it.
+  final bool startOnBackground;
 
   const DevToolsScreen({
     super.key,
@@ -180,6 +190,7 @@ class DevToolsScreen extends StatefulWidget {
     this.onSave,
     this.globalUserScripts = const [],
     this.onSimulateBackgroundRefresh,
+    this.startOnBackground = false,
   });
 
   @override
@@ -205,7 +216,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
 
   /// Guards `_copyLogs` against re-entry: a second tap while its confirmation
   /// dialog is up would stack a second dialog (or pop the first).
-  bool _isCopyingLogs = false;
+  final _copyLogsGuard = ReentryGuard();
 
   bool _isSearchVisible = false;
   String _searchQuery = '';
@@ -224,17 +235,10 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
   bool get _hasHost => widget.host != null;
   bool get _hasSiteState => widget.host?.blockedCookies != null;
 
-  bool get _hasDnsBlocklist => DnsBlockService.instance.hasBlocklist;
-  int get _tabCount {
-    var n = 1; // App Logs is always present.
-    if (_hasHost) n += 1; // Console
-    if (_hasSiteState) {
-      n += 1; // Cookies
-      if (_hasDnsBlocklist) n += 1; // DNS
-    }
-    if (ContentBlockerService.instance.usingRustEngine) n += 1; // ABP
-    return n;
-  }
+  /// Gates the Background tab and the notification diagnostics row. Read
+  /// once: a tab that appears or vanishes under an open TabController would
+  /// leave its length wrong.
+  final bool _developerMode = DeveloperModeService.instance.enabled;
 
   /// Filter for DNS log: null = all, true = blocked only, false = allowed only.
   bool? _dnsFilter;
@@ -243,30 +247,22 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
   @override
   void initState() {
     super.initState();
-    _initialBlockedCookies = _hasSiteState
-        ? Set<BlockedCookie>.of(widget.host!.blockedCookies!)
-        : <BlockedCookie>{};
-    LogService.instance.addListener(_onLogUpdate);
-    DnsBlockService.instance.addDnsLogListener(_onDnsLogUpdate);
-    if (_hasHost) {
-      widget.host!.onConsoleLogChanged = _onConsoleUpdate;
-    }
+    _initialBlockedCookies = {...?widget.host?.blockedCookies};
+    LogService.instance.addListener(_rebuild);
+    DnsBlockService.instance.addDnsLogListener(_rebuild);
+    widget.host?.onConsoleLogChanged = _rebuild;
   }
 
   @override
   void dispose() {
-    LogService.instance.removeListener(_onLogUpdate);
-    DnsBlockService.instance.removeDnsLogListener(_onDnsLogUpdate);
-    if (_hasHost) {
-      widget.host!.onConsoleLogChanged = null;
-    }
-    if (_hasSiteState) {
-      // If blocked cookies changed while DevTools was open, reload the page
-      // so the webview re-fetches cookies with the new rules applied.
-      final current = widget.host!.blockedCookies!;
-      if (!_setEquals(current, _initialBlockedCookies)) {
-        widget.host!.reload();
-      }
+    LogService.instance.removeListener(_rebuild);
+    DnsBlockService.instance.removeDnsLogListener(_rebuild);
+    widget.host?.onConsoleLogChanged = null;
+    // If blocked cookies changed while DevTools was open, reload the page
+    // so the webview re-fetches cookies with the new rules applied.
+    if (_hasSiteState &&
+        !setEquals(widget.host!.blockedCookies, _initialBlockedCookies)) {
+      widget.host!.reload();
     }
     _consoleScrollController.dispose();
     _logScrollController.dispose();
@@ -278,37 +274,15 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     super.dispose();
   }
 
-  /// Value-equality check for two sets (avoid importing collection).
-  static bool _setEquals<T>(Set<T> a, Set<T> b) {
-    if (a.length != b.length) return false;
-    return a.every(b.contains);
-  }
-
-  void _onConsoleUpdate() {
+  void _rebuild() {
     if (mounted) setState(() {});
   }
 
-  void _onLogUpdate() {
-    if (mounted) setState(() {});
-  }
-
-  void _onDnsLogUpdate() {
-    if (mounted) setState(() {});
-  }
-
-  List<Tab> get _tabs {
-    final loc = AppLocalizations.of(context);
-    return [
-      if (_hasHost)
-        Tab(icon: const Icon(Icons.terminal, size: 18), text: loc.devToolsTabConsole),
-      if (_hasSiteState)
-        Tab(icon: const Icon(Icons.cookie_outlined, size: 18), text: loc.devToolsTabCookies),
-      if (_hasSiteState && _hasDnsBlocklist)
-        Tab(icon: const Icon(Icons.shield_outlined, size: 18), text: loc.devToolsTabDns),
-      if (ContentBlockerService.instance.usingRustEngine)
-        Tab(icon: const Icon(Icons.speed, size: 18), text: loc.devToolsTabAbp),
-      Tab(icon: const Icon(Icons.list_alt, size: 18), text: loc.devToolsTabLogs),
-    ];
+  /// A toast from a handler that may outlive the screen.
+  void _toast(String Function(AppLocalizations loc) message) {
+    if (mounted) {
+      ScaffoldMessenger.of(context).toast(message(AppLocalizations.of(context)));
+    }
   }
 
   void _toggleSearch() {
@@ -323,16 +297,32 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     });
   }
 
-  bool _matchesSearch(String text) {
-    if (_searchQuery.isEmpty) return true;
-    return text.toLowerCase().contains(_searchQuery.toLowerCase());
-  }
+  bool _matchesSearch(String text) =>
+      text.toLowerCase().contains(_searchQuery.toLowerCase());
 
   @override
   Widget build(BuildContext context) {
     final loc = AppLocalizations.of(context);
+    final tabs = <(IconData, String, Widget)>[
+      if (_hasHost) (Icons.terminal, loc.devToolsTabConsole, _buildConsoleTab()),
+      if (_hasSiteState)
+        (Icons.cookie_outlined, loc.devToolsTabCookies, _buildCookiesTab()),
+      if (_hasSiteState && DnsBlockService.instance.hasBlocklist)
+        (Icons.shield_outlined, loc.devToolsTabDns, _buildDnsTab()),
+      if (ContentBlockerService.instance.usingRustEngine)
+        (Icons.speed, loc.devToolsTabAbp, _buildAbpTab()),
+      (Icons.list_alt, loc.devToolsTabLogs, _buildAppLogsTab()),
+      if (_developerMode)
+        (
+          Icons.bedtime_outlined,
+          loc.devToolsTabBackground,
+          BackgroundLogView(searchQuery: _searchQuery),
+        ),
+    ];
     return DefaultTabController(
-      length: _tabCount,
+      length: tabs.length,
+      initialIndex:
+          widget.startOnBackground && _developerMode ? tabs.length - 1 : 0,
       child: Scaffold(
         appBar: AppBar(
           title: Text(loc.devToolsTitle),
@@ -356,7 +346,10 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
             ),
           ],
           bottom: TabBar(
-            tabs: _tabs,
+            tabs: [
+              for (final (icon, label, _) in tabs)
+                Tab(icon: Icon(icon, size: 18), text: label),
+            ],
             isScrollable: true,
             tabAlignment: TabAlignment.start,
             labelPadding:
@@ -388,21 +381,12 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
                     isDense: true,
                     contentPadding: const EdgeInsets.symmetric(vertical: 8.0),
                   ),
-                  onChanged: (value) {
-                    setState(() => _searchQuery = value);
-                  },
+                  onChanged: (value) => setState(() => _searchQuery = value),
                 ),
               ),
             Expanded(
               child: TabBarView(
-                children: [
-                  if (_hasHost) _buildConsoleTab(),
-                  if (_hasSiteState) _buildCookiesTab(),
-                  if (_hasSiteState && _hasDnsBlocklist) _buildDnsTab(),
-                  if (ContentBlockerService.instance.usingRustEngine)
-                    _buildAbpTab(),
-                  _buildAppLogsTab(),
-                ],
+                children: [for (final (_, _, body) in tabs) body],
               ),
             ),
           ],
@@ -411,85 +395,49 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
-  // ── Console Tab ──
-
   Widget _buildConsoleTab() {
     final loc = AppLocalizations.of(context);
-    final allLogs = widget.host!.consoleLogs;
-    final logs = _searchQuery.isEmpty
-        ? allLogs
-        : allLogs.where((e) => _matchesSearch(e.message)).toList();
+    final logs = widget.host!.consoleLogs
+        .where((e) => _matchesSearch(e.message))
+        .toList();
     return Column(
       children: [
-        _buildConsoleActions(logs),
+        ToolActions([
+          toolButton(Icons.delete_outline, label: loc.devToolsClear,
+              onPressed: () => setState(widget.host!.consoleLogs.clear)),
+          toolButton(Icons.copy, label: loc.devToolsCopy, onPressed: logs.isEmpty ? null : () {
+            final text = logs
+                .map((e) => '[${_formatTime(e.timestamp)}] [${_consoleLevelName(e.level)}] ${e.message}')
+                .join('\n');
+            Clipboard.setData(ClipboardData(text: text));
+            ScaffoldMessenger.of(context).toast(
+              loc.devToolsConsoleCopied(logs.length),
+            );
+          }),
+        ]),
         Expanded(
-          child: logs.isEmpty
-              ? Center(child: Text(_searchQuery.isEmpty ? loc.devToolsConsoleEmpty : loc.devToolsNoMatches))
-              : ListView.builder(
-                  controller: _consoleScrollController,
-                  reverse: _searchQuery.isEmpty,
-                  itemCount: logs.length,
-                  itemBuilder: (context, index) {
-                    return _buildConsoleEntry(logs[logs.length - 1 - index]);
-                  },
-                ),
+          child: LogLines(
+            lines: logs,
+            searching: _searchQuery.isNotEmpty,
+            empty: loc.devToolsConsoleEmpty,
+            line: _buildConsoleEntry,
+            controller: _consoleScrollController,
+          ),
         ),
         _buildEvalInput(),
       ],
     );
   }
 
-  Widget _buildConsoleActions(List<ConsoleLogEntry> logs) {
-    final loc = AppLocalizations.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
-      child: Row(
-        children: [
-          TextButton.icon(
-            onPressed: () {
-              setState(() {
-                widget.host!.consoleLogs.clear();
-              });
-            },
-            icon: const Icon(Icons.delete_outline, size: 18),
-            label: Text(loc.devToolsClear),
-          ),
-          TextButton.icon(
-            onPressed: logs.isEmpty
-                ? null
-                : () {
-                    final text = logs
-                        .map((e) => '[${_formatTime(e.timestamp)}] [${_consoleLevelName(e.level)}] ${e.message}')
-                        .join('\n');
-                    Clipboard.setData(ClipboardData(text: text));
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(loc.devToolsConsoleCopied(logs.length))),
-                    );
-                  },
-            icon: const Icon(Icons.copy, size: 18),
-            label: Text(loc.devToolsCopy),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildConsoleEntry(ConsoleLogEntry entry) {
-    Color color;
-    if (entry.isEvalInput) {
-      color = Theme.of(context).colorScheme.primary;
-    } else {
-      switch (entry.level) {
-        case ConsoleMessageLevel.WARNING:
-          color = Colors.amber;
-          break;
-        case ConsoleMessageLevel.ERROR:
-          color = Colors.red;
-          break;
-        default:
-          color = Theme.of(context).textTheme.bodyMedium?.color ?? Colors.white;
-      }
-    }
+    // ConsoleMessageLevel is a class of constants, not an enum.
+    final color = entry.isEvalInput
+        ? Theme.of(context).colorScheme.primary
+        : switch (entry.level) {
+            ConsoleMessageLevel.WARNING => Colors.amber,
+            ConsoleMessageLevel.ERROR => Colors.red,
+            _ => Theme.of(context).textTheme.bodyMedium?.color ?? Colors.white,
+          };
     final text = entry.isEvalInput
         ? '> ${entry.message}'
         : '[${_formatTimeMs(entry.timestamp)}] ${entry.message}';
@@ -506,8 +454,6 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
       ),
     );
   }
-
-  // ── Console Eval ──
 
   static const _kEvalPromptGlyph = '>';
 
@@ -550,28 +496,21 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
                 textInputAction: TextInputAction.send,
               ),
             ),
-            if (_evalHistory.isNotEmpty) ...[
-              SizedBox(
-                width: 28,
-                height: 28,
-                child: IconButton(
-                  icon: const Icon(Icons.keyboard_arrow_up, size: 18),
-                  padding: EdgeInsets.zero,
-                  tooltip: loc.devToolsEvalPrevCommand,
-                  onPressed: hasController ? _historyUp : null,
+            if (_evalHistory.isNotEmpty)
+              for (final (icon, tooltip, step) in [
+                (Icons.keyboard_arrow_up, loc.devToolsEvalPrevCommand, _historyUp),
+                (Icons.keyboard_arrow_down, loc.devToolsEvalNextCommand, _historyDown),
+              ])
+                SizedBox(
+                  width: 28,
+                  height: 28,
+                  child: IconButton(
+                    icon: Icon(icon, size: 18),
+                    padding: EdgeInsets.zero,
+                    tooltip: tooltip,
+                    onPressed: hasController ? step : null,
+                  ),
                 ),
-              ),
-              SizedBox(
-                width: 28,
-                height: 28,
-                child: IconButton(
-                  icon: const Icon(Icons.keyboard_arrow_down, size: 18),
-                  padding: EdgeInsets.zero,
-                  tooltip: loc.devToolsEvalNextCommand,
-                  onPressed: hasController ? _historyDown : null,
-                ),
-              ),
-            ],
             SizedBox(
               width: 36,
               height: 36,
@@ -615,7 +554,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
         level: ConsoleMessageLevel.LOG,
         isEvalInput: true,
       ));
-      _onConsoleUpdate();
+      _rebuild();
 
       // Directly embed code (no eval/Function) to respect CSP.
       // Phase 1: set sentinel. Phase 2: try as expression.
@@ -626,67 +565,59 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
 
       _evalController.clear();
     } finally {
-      if (mounted) {
-        setState(() => _isEvaluating = false);
-      }
+      if (mounted) setState(() => _isEvaluating = false);
     }
   }
 
-  String _buildExprJs(String source) {
-    return '(function(){try{var __r=(\n$source\n);if(__r!==undefined){if(typeof __r==="object"&&__r!==null){try{console.log(JSON.stringify(__r,null,2))}catch(e){console.log(String(__r))}}else{console.log(String(__r))}}window.__wsEvalOk=true}catch(__e){console.error((__e&&__e.message)?__e.message:String(__e));window.__wsEvalOk=true}})()';
-  }
+  String _buildExprJs(String source) =>
+      '(function(){try{var __r=(\n$source\n);if(__r!==undefined){if(typeof __r==="object"&&__r!==null){try{console.log(JSON.stringify(__r,null,2))}catch(e){console.log(String(__r))}}else{console.log(String(__r))}}window.__wsEvalOk=true}catch(__e){console.error((__e&&__e.message)?__e.message:String(__e));window.__wsEvalOk=true}})()';
 
-  String _buildStmtJs(String source) {
-    return 'if(!window.__wsEvalOk){try{\n$source\n}catch(__e){console.error((__e&&__e.message)?__e.message:String(__e))}delete window.__wsEvalOk}else{delete window.__wsEvalOk}';
-  }
+  String _buildStmtJs(String source) =>
+      'if(!window.__wsEvalOk){try{\n$source\n}catch(__e){console.error((__e&&__e.message)?__e.message:String(__e))}delete window.__wsEvalOk}else{delete window.__wsEvalOk}';
 
   void _historyUp() {
     if (_evalHistory.isEmpty) return;
-    if (_evalHistoryIndex == -1) {
-      _evalHistoryIndex = _evalHistory.length - 1;
-    } else if (_evalHistoryIndex > 0) {
-      _evalHistoryIndex--;
-    }
-    _evalController.text = _evalHistory[_evalHistoryIndex];
-    _evalController.selection = TextSelection.fromPosition(
-      TextPosition(offset: _evalController.text.length),
-    );
+    _evalHistoryIndex = _evalHistoryIndex == -1
+        ? _evalHistory.length - 1
+        : _evalHistoryIndex > 0 ? _evalHistoryIndex - 1 : 0;
+    _showEval(_evalHistory[_evalHistoryIndex]);
   }
 
+  /// Past the newest command the input is empty again.
   void _historyDown() {
-    if (_evalHistory.isEmpty || _evalHistoryIndex == -1) return;
-    if (_evalHistoryIndex < _evalHistory.length - 1) {
-      _evalHistoryIndex++;
-      _evalController.text = _evalHistory[_evalHistoryIndex];
-    } else {
-      _evalHistoryIndex = -1;
-      _evalController.clear();
-    }
-    _evalController.selection = TextSelection.fromPosition(
-      TextPosition(offset: _evalController.text.length),
-    );
+    if (_evalHistoryIndex == -1) return;
+    _evalHistoryIndex =
+        _evalHistoryIndex < _evalHistory.length - 1 ? _evalHistoryIndex + 1 : -1;
+    _showEval(_evalHistoryIndex == -1 ? '' : _evalHistory[_evalHistoryIndex]);
   }
 
-  // ── Cookies Tab ──
+  void _showEval(String source) => _evalController.value = TextEditingValue(
+        text: source,
+        selection: TextSelection.collapsed(offset: source.length),
+      );
 
   Widget _buildCookiesTab() {
     final loc = AppLocalizations.of(context);
-    final allCookies = widget.host!.cookies;
-    final blocked = widget.host!.blockedCookies!;
-    final cookies = _searchQuery.isEmpty
-        ? allCookies
-        : allCookies
-            .where((c) =>
-                _matchesSearch(c.name) ||
-                _matchesSearch(c.value) ||
-                _matchesSearch(c.domain ?? ''))
-            .toList();
-    final filteredBlocked = _searchQuery.isEmpty
-        ? blocked.toList()
-        : blocked.where((b) => _matchesSearch(b.name) || _matchesSearch(b.domain)).toList();
+    final cookies = widget.host!.cookies
+        .where((c) => <String>[c.name, c.value, c.domain ?? ''].any(_matchesSearch))
+        .toList();
+    final filteredBlocked = widget.host!.blockedCookies!
+        .where((b) => _matchesSearch(b.name) || _matchesSearch(b.domain))
+        .toList();
     return Column(
       children: [
-        _buildCookieActions(cookies),
+        ToolActions([
+          toolButton(Icons.refresh, label: loc.devToolsRefresh, onPressed: _refreshCookies),
+          if (cookies.isNotEmpty)
+            toolButton(Icons.copy, label: loc.devToolsCopyAsJson, onPressed: () {
+              final json = cookies.map((c) => c.toJson()).toList();
+              Clipboard.setData(
+                  ClipboardData(text: const JsonEncoder.withIndent('  ').convert(json)));
+              ScaffoldMessenger.of(context).toast(
+                loc.devToolsCookiesCopiedJson(cookies.length),
+              );
+            }),
+        ]),
         Expanded(
           child: _loadingCookies
               ? const Center(child: CircularProgressIndicator())
@@ -717,35 +648,6 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
-  Widget _buildCookieActions(List<Cookie> cookies) {
-    final loc = AppLocalizations.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
-      child: Row(
-        children: [
-          TextButton.icon(
-            onPressed: _refreshCookies,
-            icon: const Icon(Icons.refresh, size: 18),
-            label: Text(loc.devToolsRefresh),
-          ),
-          if (cookies.isNotEmpty)
-            TextButton.icon(
-              onPressed: () {
-                final json = cookies.map((c) => c.toJson()).toList();
-                Clipboard.setData(
-                    ClipboardData(text: const JsonEncoder.withIndent('  ').convert(json)));
-                ScaffoldMessenger.of(context).showSnackBar(
-                  SnackBar(content: Text(loc.devToolsCookiesCopiedJson(cookies.length))),
-                );
-              },
-              icon: const Icon(Icons.copy, size: 18),
-              label: Text(loc.devToolsCopyAsJson),
-            ),
-        ],
-      ),
-    );
-  }
-
   Future<void> _refreshCookies() async {
     final url = widget.host!.currentUrl;
     if (url.isEmpty) return;
@@ -760,27 +662,21 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
           siteId: widget.host!.siteId!,
           url: Uri.parse(url),
         );
-        LogService.instance.log(
-          'DevTools',
-          'Cookie inspector via ContainerCookieManager: '
-              'siteId=${widget.host!.siteId} url=$url '
-              'count=${cookies.length}',
-          sensitivity: LogSensitivity.sensitive,
-        );
+        LogTag.devTools.debug('Cookie inspector via ContainerCookieManager: '
+            'siteId=${widget.host!.siteId} url=$url '
+            'count=${cookies.length}', sensitive: true);
       } else {
         cookies = await widget.cookieManager.getCookies(url: Uri.parse(url));
-        LogService.instance.log(
-          'DevTools',
-          'Cookie inspector via legacy CookieManager: '
-              'siteId=${widget.host!.siteId} url=$url '
-              'count=${cookies.length} '
-              '(container=${container != null} ctrl=${controller != null})',
-          sensitivity: LogSensitivity.sensitive,
-        );
+        LogTag.devTools.debug('Cookie inspector via legacy CookieManager: '
+            'siteId=${widget.host!.siteId} url=$url '
+            'count=${cookies.length} '
+            '(container=${container != null} ctrl=${controller != null})',
+            sensitive: true);
       }
       if (mounted) {
         widget.host!.cookies = cookies;
         setState(() => _loadingCookies = false);
+        await widget.onSave?.call();
       }
     } catch (e) {
       if (mounted) {
@@ -810,12 +706,9 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
         path: cookie.path ?? '/',
       );
     }
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(AppLocalizations.of(context).devToolsCookieDeleted(cookie.name))),
-      );
-      _refreshCookies();
-    }
+    if (!mounted) return;
+    _toast((loc) => loc.devToolsCookieDeleted(cookie.name));
+    await _refreshCookies();
   }
 
   Future<void> _blockCookie(Cookie cookie) async {
@@ -824,7 +717,6 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     setState(() {
       widget.host!.blockedCookies!.add(rule);
     });
-    // Delete the cookie immediately from the webview
     await _deleteCookie(cookie);
     await widget.onSave?.call();
   }
@@ -834,11 +726,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
       widget.host!.blockedCookies!.remove(rule);
     });
     await widget.onSave?.call();
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(AppLocalizations.of(context).devToolsCookieUnblocked(rule.name))),
-      );
-    }
+    _toast((loc) => loc.devToolsCookieUnblocked(rule.name));
   }
 
   Widget _buildCookieTile(Cookie cookie) {
@@ -877,10 +765,10 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
                 children: [
                   _buildSecurityChip(
                     cookie.isSecure == true ? loc.devToolsCookieSecure : loc.devToolsCookieNotSecure,
-                    cookie.isSecure == true ? Colors.green : Colors.red,
+                    color: cookie.isSecure == true ? Colors.green : Colors.red,
                   ),
                   if (cookie.isHttpOnly == true)
-                    _buildSecurityChip('HttpOnly', Colors.green),
+                    _buildSecurityChip('HttpOnly', color: Colors.green),
                   if (cookie.sameSite != null)
                     _buildSameSiteChip(cookie.sameSite.toString()),
                 ],
@@ -922,7 +810,7 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
-  Widget _buildSecurityChip(String label, Color color) {
+  Widget _buildSecurityChip(String label, {required Color color}) {
     return Chip(
       label: Text(label, style: TextStyle(fontSize: 11, color: color)),
       backgroundColor: color.withAlpha(25),
@@ -933,22 +821,13 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
   }
 
   Widget _buildSameSiteChip(String value) {
-    Color color;
-    String label;
-    if (value.contains('STRICT')) {
-      color = Colors.green;
-      label = 'SameSite=Strict';
-    } else if (value.contains('LAX')) {
-      color = Colors.blue;
-      label = 'SameSite=Lax';
-    } else {
-      color = Colors.amber;
-      label = 'SameSite=None';
-    }
-    return _buildSecurityChip(label, color);
+    final (label, color) = value.contains('STRICT')
+        ? ('SameSite=Strict', Colors.green)
+        : value.contains('LAX')
+            ? ('SameSite=Lax', Colors.blue)
+            : ('SameSite=None', Colors.amber);
+    return _buildSecurityChip(label, color: color);
   }
-
-  // ── Scripts Bottom Sheet ──
 
   void _showScriptsSheet() {
     final loc = AppLocalizations.of(context);
@@ -1065,8 +944,8 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
                                     tooltip: loc.devToolsScriptCopySource,
                                     onPressed: () {
                                       Clipboard.setData(ClipboardData(text: script.source));
-                                      ScaffoldMessenger.of(context).showSnackBar(
-                                        SnackBar(content: Text(loc.devToolsScriptCopied(script.name))),
+                                      ScaffoldMessenger.of(context).toast(
+                                        loc.devToolsScriptCopied(script.name),
                                       );
                                     },
                                     visualDensity: VisualDensity.compact,
@@ -1089,8 +968,6 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
-  // ── Share HTML Bottom Sheet ──
-
   void _showShareSheet() {
     final loc = AppLocalizations.of(context);
     showModalBottomSheet(
@@ -1101,39 +978,22 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
             mainAxisSize: MainAxisSize.min,
             children: [
               _buildSheetHandle(),
-              ListTile(
-                leading: const Icon(Icons.share),
-                title: Text(loc.devToolsShareHtml),
-                onTap: () {
-                  Navigator.pop(sheetContext);
-                  _shareHtml();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.save),
-                title: Text(loc.devToolsSaveToFile),
-                onTap: () {
-                  Navigator.pop(sheetContext);
-                  _saveHtmlToFile();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.copy),
-                title: Text(loc.devToolsCopyToClipboard),
-                onTap: () {
-                  Navigator.pop(sheetContext);
-                  _copyHtml();
-                },
-              ),
-              ListTile(
-                leading: const Icon(Icons.image_outlined),
-                title: Text(loc.devToolsSaveIcon),
-                enabled: !_isSavingIcon,
-                onTap: () {
-                  Navigator.pop(sheetContext);
-                  _saveIconAsPng();
-                },
-              ),
+              for (final (icon, label, export, enabled) in [
+                (Icons.share, loc.devToolsShareHtml, _shareHtml, true),
+                (Icons.save, loc.devToolsSaveToFile, _saveHtmlToFile, true),
+                (Icons.copy, loc.devToolsCopyToClipboard, _copyHtml, true),
+                (Icons.image_outlined, loc.devToolsSaveIcon, _saveIconAsPng,
+                    !_isSavingIcon),
+              ])
+                ListTile(
+                  leading: Icon(icon),
+                  title: Text(label),
+                  enabled: enabled,
+                  onTap: () {
+                    Navigator.pop(sheetContext);
+                    export();
+                  },
+                ),
             ],
           ),
         );
@@ -1164,72 +1024,62 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     try {
       final html = await controller.getHtml();
       if (html == null || html.isEmpty) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(AppLocalizations.of(context).devToolsNoHtmlContent)),
-          );
-        }
+        _toast((loc) => loc.devToolsNoHtmlContent);
         return null;
       }
-      _exportedHtml = html;
-      return html;
+      return _exportedHtml = html;
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(AppLocalizations.of(context).devToolsHtmlFetchFailed(e.toString()))),
-        );
-      }
+      _toast((loc) => loc.devToolsHtmlFetchFailed(e.toString()));
       return null;
     } finally {
       _isFetchingHtml = false;
     }
   }
 
+  String get _htmlFileName {
+    final domain = extractDomain(widget.host!.currentUrl);
+    final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
+    return '${domain}_$timestamp.html';
+  }
+
+  /// Saves [bytes] as [fileName] through the platform dialog: on mobile the
+  /// picker takes the bytes, on desktop they go to the path it returns. False
+  /// when the user picked no place.
+  Future<bool> _saveAs(String fileName,
+      {required String dialogTitle, required Uint8List bytes}) async {
+    final isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
+    final outputPath = await FilePicker.saveFile(
+      dialogTitle: dialogTitle,
+      fileName: fileName,
+      bytes: isMobile ? bytes : null,
+    );
+    if (outputPath == null) return false;
+    if (!isMobile) {
+      final ext = fileName.substring(fileName.lastIndexOf('.'));
+      await hostWriteFileBytes(
+          outputPath.endsWith(ext) ? outputPath : '$outputPath$ext',
+          bytes: bytes);
+    }
+    return true;
+  }
+
   Future<void> _shareHtml() async {
     final html = _exportedHtml ?? await _fetchHtml();
     if (html == null || !mounted) return;
-
-    final domain = extractDomain(widget.host!.currentUrl);
-    final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
-    SharePlus.instance.share(ShareParams(
-      text: html,
-      title: '${domain}_$timestamp.html',
-    ));
+    SharePlus.instance.share(ShareParams(text: html, title: _htmlFileName));
   }
 
   Future<void> _saveHtmlToFile() async {
     final html = _exportedHtml ?? await _fetchHtml();
     if (html == null || !mounted) return;
-
+    final title = AppLocalizations.of(context).devToolsSaveHtmlDialogTitle;
     try {
-      final domain = extractDomain(widget.host!.currentUrl);
-      final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
-      final fileName = '${domain}_$timestamp.html';
-      final bytes = utf8.encode(html);
-
-      final bool isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
-      final outputPath = await FilePicker.saveFile(
-        dialogTitle: AppLocalizations.of(context).devToolsSaveHtmlDialogTitle,
-        fileName: fileName,
-        bytes: isMobile ? bytes : null,
-      );
-
-      if (outputPath != null && !isMobile) {
-        final filePath = outputPath.endsWith('.html') ? outputPath : '$outputPath.html';
-        await hostWriteFileText(filePath, html);
-      }
-
-      if (mounted && outputPath != null) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(AppLocalizations.of(context).devToolsHtmlSaved)),
-        );
+      if (await _saveAs(_htmlFileName,
+          dialogTitle: title, bytes: utf8.encode(html))) {
+        _toast((loc) => loc.devToolsHtmlSaved);
       }
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(AppLocalizations.of(context).devToolsSaveFailed(e.toString()))),
-        );
-      }
+      _toast((loc) => loc.devToolsSaveFailed(e.toString()));
     }
   }
 
@@ -1237,14 +1087,8 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     final html = _exportedHtml ?? await _fetchHtml();
     if (html == null || !mounted) return;
     Clipboard.setData(ClipboardData(text: html));
-    if (mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(AppLocalizations.of(context).devToolsHtmlCopied)),
-      );
-    }
+    _toast((loc) => loc.devToolsHtmlCopied);
   }
-
-  // ── Save Icon as PNG ──
 
   Future<void> _saveIconAsPng() async {
     if (_isSavingIcon) return;
@@ -1252,128 +1096,72 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     final host = widget.host!;
     final loc = AppLocalizations.of(context);
     final messenger = ScaffoldMessenger.of(context);
-    messenger.showSnackBar(
-      SnackBar(content: Text(loc.devToolsPreparingIcon)),
-    );
+    messenger.toast(loc.devToolsPreparingIcon);
     try {
-      final png = await exportIconAsPng(
+      final png = await displayedSiteIconAsPng(
         host.iconUrl,
+        customIcon: host.customIcon,
         resolvedIconUrl: FaviconUrlCache.get(host.iconUrl),
         proxy: host.proxy,
       );
       if (!mounted) return;
       if (png == null) {
-        messenger.showSnackBar(
-          SnackBar(content: Text(loc.devToolsNoIconToSave)),
-        );
+        messenger.toast(loc.devToolsNoIconToSave);
         return;
       }
-
-      final domain = extractDomain(host.currentUrl);
-      final fileName = '${domain}_icon.png';
-      final bool isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
-      final outputPath = await FilePicker.saveFile(
-        dialogTitle: loc.devToolsSaveIconDialogTitle,
-        fileName: fileName,
-        bytes: isMobile ? png : null,
-      );
-
-      if (outputPath != null && !isMobile) {
-        final filePath = outputPath.endsWith('.png') ? outputPath : '$outputPath.png';
-        await hostWriteFileBytes(filePath, png);
-      }
-
-      if (mounted && outputPath != null) {
-        messenger.showSnackBar(
-          SnackBar(content: Text(loc.devToolsIconSaved)),
-        );
+      final fileName = '${extractDomain(host.currentUrl)}_icon.png';
+      if (await _saveAs(fileName,
+              dialogTitle: loc.devToolsSaveIconDialogTitle, bytes: png) &&
+          mounted) {
+        messenger.toast(loc.devToolsIconSaved);
       }
     } catch (e) {
-      if (mounted) {
-        messenger.showSnackBar(
-          SnackBar(content: Text(loc.devToolsSaveFailed(e.toString()))),
-        );
-      }
+      if (mounted) messenger.toast(loc.devToolsSaveFailed(e.toString()));
     } finally {
       if (mounted) setState(() => _isSavingIcon = false);
     }
   }
 
-  // ── DNS Tab ──
-
   Widget _buildDnsTab() {
     final loc = AppLocalizations.of(context);
     final stats = DnsBlockService.instance.statsForSite(widget.host!.siteId!);
-    final allEntries = stats.log;
-    List<DnsLogEntry> entries = _dnsFilter == null
-        ? allEntries
-        : allEntries.where((e) => e.blocked == _dnsFilter).toList();
-    if (_searchQuery.isNotEmpty) {
-      entries = entries.where((e) => _matchesSearch(e.domain)).toList();
-    }
+    final entries = stats.log
+        .where((e) =>
+            (_dnsFilter == null || e.blocked == _dnsFilter) &&
+            _matchesSearch(e.domain))
+        .toList();
 
     return Column(
       children: [
-        _buildDnsStats(stats),
+        DnsStatChips(stats, padding: const EdgeInsets.fromLTRB(12, 8, 12, 4)),
         _buildDnsFilters(stats),
-        _buildDnsActions(entries),
+        ToolActions([
+          toolButton(Icons.delete_outline, label: loc.devToolsClear,
+              onPressed: () => DnsBlockService.instance.clearStatsForSite(widget.host!.siteId!)),
+          toolButton(
+            Icons.copy,
+            label: loc.devToolsCopy,
+            onPressed: entries.isEmpty ? null : () {
+              final text = entries
+                  .map((e) =>
+                      '[${_formatTimeMs(e.timestamp)}] ${e.blocked ? 'BLOCKED' : 'ALLOWED'} ${e.domain}')
+                  .join('\n');
+              Clipboard.setData(ClipboardData(text: text));
+              ScaffoldMessenger.of(context).toast(loc.devToolsDnsLogCopied);
+            },
+            key: const Key('devtools-dns-copy'),
+          ),
+        ]),
         Expanded(
-          child: entries.isEmpty
-              ? Center(child: Text(_searchQuery.isEmpty ? loc.devToolsDnsEmpty : loc.devToolsNoMatches))
-              : ListView.builder(
-                  controller: _dnsScrollController,
-                  reverse: _searchQuery.isEmpty,
-                  itemCount: entries.length,
-                  itemBuilder: (context, index) {
-                    final entry = entries[entries.length - 1 - index];
-                    return _buildDnsEntry(entry);
-                  },
-                ),
+          child: LogLines(
+            lines: entries,
+            searching: _searchQuery.isNotEmpty,
+            empty: loc.devToolsDnsEmpty,
+            line: _buildDnsEntry,
+            controller: _dnsScrollController,
+          ),
         ),
       ],
-    );
-  }
-
-  Widget _buildDnsStats(DnsStats stats) {
-    final loc = AppLocalizations.of(context);
-    final blockRate = '${stats.blockRate.toStringAsFixed(1)}%';
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-      child: Row(
-        children: [
-          _buildDnsStatCard(loc.devToolsDnsTotal, stats.total.toString(), Colors.blue),
-          const SizedBox(width: 8),
-          _buildDnsStatCard(loc.devToolsDnsAllowed, stats.allowed.toString(), Colors.green),
-          const SizedBox(width: 8),
-          _buildDnsStatCard(loc.devToolsDnsBlocked, stats.blocked.toString(), Colors.red),
-          const SizedBox(width: 8),
-          _buildDnsStatCard(loc.devToolsDnsBlockRate, blockRate,
-              stats.blockRate > 0 ? Colors.orange : Colors.grey),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDnsStatCard(String label, String value, Color color) {
-    return Expanded(
-      child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 4),
-        decoration: BoxDecoration(
-          color: color.withAlpha(20),
-          borderRadius: BorderRadius.circular(8),
-          border: Border.all(color: color.withAlpha(60)),
-        ),
-        child: Column(
-          children: [
-            Text(value,
-                style: TextStyle(
-                    fontSize: 16, fontWeight: FontWeight.bold, color: color)),
-            const SizedBox(height: 2),
-            Text(label,
-                style: TextStyle(fontSize: 10, color: color.withAlpha(180))),
-          ],
-        ),
-      ),
     );
   }
 
@@ -1382,66 +1170,20 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 12),
       child: Row(
+        spacing: 6,
         children: [
-          FilterChip(
-            label: Text(loc.devToolsDnsFilterAll, style: const TextStyle(fontSize: 12)),
-            selected: _dnsFilter == null,
-            onSelected: (_) => setState(() => _dnsFilter = null),
-            visualDensity: VisualDensity.compact,
-          ),
-          const SizedBox(width: 6),
-          FilterChip(
-            label: Text(loc.devToolsDnsFilterAllowed(stats.allowed),
-                style: const TextStyle(fontSize: 12)),
-            selected: _dnsFilter == false,
-            onSelected: (_) =>
-                setState(() => _dnsFilter = _dnsFilter == false ? null : false),
-            visualDensity: VisualDensity.compact,
-          ),
-          const SizedBox(width: 6),
-          FilterChip(
-            label: Text(loc.devToolsDnsFilterBlocked(stats.blocked),
-                style: const TextStyle(fontSize: 12)),
-            selected: _dnsFilter == true,
-            onSelected: (_) =>
-                setState(() => _dnsFilter = _dnsFilter == true ? null : true),
-            visualDensity: VisualDensity.compact,
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildDnsActions(List<DnsLogEntry> entries) {
-    final loc = AppLocalizations.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      child: Row(
-        children: [
-          TextButton.icon(
-            onPressed: () {
-              DnsBlockService.instance.clearStatsForSite(widget.host!.siteId!);
-            },
-            icon: const Icon(Icons.delete_outline, size: 18),
-            label: Text(loc.devToolsClear),
-          ),
-          TextButton.icon(
-            key: const Key('devtools-dns-copy'),
-            onPressed: entries.isEmpty
-                ? null
-                : () {
-                    final text = entries
-                        .map((e) =>
-                            '[${_formatTimeMs(e.timestamp)}] ${e.blocked ? 'BLOCKED' : 'ALLOWED'} ${e.domain}')
-                        .join('\n');
-                    Clipboard.setData(ClipboardData(text: text));
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text(loc.devToolsDnsLogCopied)),
-                    );
-                  },
-            icon: const Icon(Icons.copy, size: 18),
-            label: Text(loc.devToolsCopy),
-          ),
+          for (final (filter, label) in [
+            (null, loc.devToolsDnsFilterAll),
+            (false, loc.devToolsDnsFilterAllowed(stats.allowed)),
+            (true, loc.devToolsDnsFilterBlocked(stats.blocked)),
+          ])
+            FilterChip(
+              label: Text(label, style: const TextStyle(fontSize: 12)),
+              selected: _dnsFilter == filter,
+              onSelected: (_) =>
+                  setState(() => _dnsFilter = _dnsFilter == filter ? null : filter),
+              visualDensity: VisualDensity.compact,
+            ),
         ],
       ),
     );
@@ -1475,8 +1217,6 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
       ),
     );
   }
-
-  // ── ABP (Rust engine) Tab ──
 
   Widget _buildAbpTab() {
     final svc = ContentBlockerService.instance;
@@ -1513,20 +1253,26 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
             spacing: 8,
             runSpacing: 4,
             children: [
-              _abpStatChip(loc.devToolsAbpEngine, svc.usingRustEngine ? loc.devToolsAbpActive : loc.devToolsAbpOff,
-                  svc.usingRustEngine ? Colors.green : Colors.grey),
-              _abpStatChip(loc.devToolsAbpRecording,
-                  timingOn ? loc.devToolsAbpOn : loc.devToolsAbpOff,
-                  timingOn ? Colors.green : Colors.orange),
-              _abpStatChip(loc.devToolsAbpConsulted, consulted.toString(), Colors.blueGrey),
-              _abpStatChip(
-                  loc.devToolsAbpAvg, avgValue, Colors.blueGrey),
-              _abpStatChip(loc.devToolsAbpMax, maxValue,
-                  maxMicros > 1000 ? Colors.orange : Colors.blueGrey),
-              _abpStatChip(loc.devToolsAbpBlocked, blockedCount.toString(), Colors.red),
-              _abpStatChip(loc.devToolsAbpAllowed, allowedCount.toString(), Colors.green),
-              _abpStatChip('uBO', svc.useUboResources ? loc.devToolsAbpOn : loc.devToolsAbpOff,
-                  svc.useUboResources ? Colors.green : Colors.grey),
+              StatChip(
+                  svc.usingRustEngine
+                      ? loc.devToolsAbpActive
+                      : loc.devToolsAbpOff,
+                  label: loc.devToolsAbpEngine,
+                  color: svc.usingRustEngine ? Colors.green : Colors.grey),
+              StatChip(timingOn ? loc.devToolsAbpOn : loc.devToolsAbpOff,
+                  label: loc.devToolsAbpRecording,
+                  color: timingOn ? Colors.green : Colors.orange),
+              StatChip('$consulted', label: loc.devToolsAbpConsulted,
+                  color: Colors.blueGrey),
+              StatChip(avgValue, label: loc.devToolsAbpAvg, color: Colors.blueGrey),
+              StatChip(maxValue, label: loc.devToolsAbpMax,
+                  color: maxMicros > 1000 ? Colors.orange : Colors.blueGrey),
+              StatChip('$blockedCount', label: loc.devToolsAbpBlocked, color: Colors.red),
+              StatChip('$allowedCount', label: loc.devToolsAbpAllowed, color: Colors.green),
+              StatChip(
+                  svc.useUboResources ? loc.devToolsAbpOn : loc.devToolsAbpOff,
+                  label: 'uBO',
+                  color: svc.useUboResources ? Colors.green : Colors.grey),
             ],
           ),
         ),
@@ -1576,31 +1322,6 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
-  Widget _abpStatChip(String label, String value, Color color) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-      decoration: BoxDecoration(
-        color: color.withAlpha(36),
-        borderRadius: BorderRadius.circular(6),
-      ),
-      child: RichText(
-        text: TextSpan(
-          style: Theme.of(context).textTheme.bodySmall,
-          children: [
-            TextSpan(
-              text: '$label ',
-              style: TextStyle(color: color),
-            ),
-            TextSpan(
-              text: value,
-              style: const TextStyle(fontWeight: FontWeight.bold),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
   Widget _buildAbpRow(EngineDecisionSample s) {
     final color = s.blocked ? Colors.red.shade400 : Colors.green.shade600;
     final micros = s.micros;
@@ -1626,55 +1347,71 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
     );
   }
 
-  // ── App Logs Tab ──
-
   Widget _buildAppLogsTab() {
     final loc = AppLocalizations.of(context);
     final allEntries = _showSensitive
         ? LogService.instance.allEntriesMerged
         : LogService.instance.entries;
-    var filtered = _activeFilters.length == LogLevel.values.length
-        ? allEntries
-        : allEntries.where((e) => _activeFilters.contains(e.level)).toList();
-    if (_searchQuery.isNotEmpty) {
-      filtered = filtered
-          .where((e) => _matchesSearch(e.message) || _matchesSearch(e.tag))
-          .toList();
-    }
+    final filtered = allEntries
+        .where((e) =>
+            _activeFilters.contains(e.level) &&
+            (_matchesSearch(e.message) || _matchesSearch(e.tag)))
+        .toList();
 
     return Column(
       children: [
-        _buildLogActions(filtered),
+        ToolActions([
+          toolButton(
+            Icons.save,
+            label: loc.devToolsExport,
+            onPressed: () => saveLogText(context, text: LogService.instance.export(),
+                fileNamePrefix: 'webspace_logs'),
+          ),
+          toolButton(Icons.copy, label: loc.devToolsCopy,
+              onPressed: filtered.isEmpty ? null : () => _copyLogs(filtered),
+              key: const Key('devtools-logs-copy')),
+          toolButton(Icons.delete_outline, label: loc.devToolsClear,
+              onPressed: () => setState(LogService.instance.clear)),
+        ]),
         _buildLogFilters(),
-        _buildSensitiveToggle(),
-        if (widget.onSimulateBackgroundRefresh != null)
-          _buildNotificationDiagnostics(),
+        SensitiveSwitch(
+          value: _showSensitive,
+          onChanged: (v) => setState(() => _showSensitive = v),
+          label: _showSensitive
+              ? loc.devToolsSensitiveShowing
+              : loc.devToolsSensitiveShow,
+        ),
+        if (_developerMode && widget.onSimulateBackgroundRefresh != null)
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 8.0),
+            child: Wrap(
+              spacing: 4,
+              children: [
+                toolButton(Icons.refresh, label: loc.devToolsSimulateRefresh,
+                    onPressed: _simulateBackgroundRefresh),
+                toolButton(Icons.notifications_active, label: loc.devToolsTestNotification,
+                    onPressed: widget.host?.siteId != null ? _sendTestNotification : null),
+              ],
+            ),
+          ),
         Expanded(
-          child: filtered.isEmpty
-              ? Center(child: Text(_searchQuery.isEmpty ? loc.devToolsLogsEmpty : loc.devToolsNoMatches))
-              : ListView.builder(
-                  controller: _logScrollController,
-                  reverse: _searchQuery.isEmpty,
-                  itemCount: filtered.length,
-                  itemBuilder: (context, index) {
-                    return _buildLogEntry(filtered[filtered.length - 1 - index]);
-                  },
-                ),
+          child: LogLines(
+            lines: filtered,
+            searching: _searchQuery.isNotEmpty,
+            empty: loc.devToolsLogsEmpty,
+            line: (entry) =>
+                LogEntryLine(entry: entry, time: _formatTime(entry.timestamp)),
+            controller: _logScrollController,
+          ),
         ),
       ],
     );
   }
 
   Future<void> _simulateBackgroundRefresh() async {
-    final loc = AppLocalizations.of(context);
-    final cb = widget.onSimulateBackgroundRefresh;
-    if (cb == null) return;
-    await cb();
-    if (!mounted) return;
-    setState(() {});
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(loc.devToolsSimulateRefreshDone)),
-    );
+    await widget.onSimulateBackgroundRefresh!();
+    _rebuild();
+    _toast((loc) => loc.devToolsSimulateRefreshDone);
   }
 
   Future<void> _sendTestNotification() async {
@@ -1685,138 +1422,23 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
       siteId: siteId,
       title: loc.devToolsTestNotificationTitle,
       body: loc.devToolsTestNotificationBody,
+      origin: NotificationOrigin.test,
     );
-    if (!mounted) return;
-    setState(() {});
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(loc.devToolsTestNotificationSent)),
-    );
+    _rebuild();
+    _toast((loc) => loc.devToolsTestNotificationSent);
   }
 
-  Widget _buildNotificationDiagnostics() {
-    final loc = AppLocalizations.of(context);
-    final hasSite = widget.host?.siteId != null;
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8.0),
-      child: Wrap(
-        spacing: 4,
-        children: [
-          TextButton.icon(
-            onPressed: _simulateBackgroundRefresh,
-            icon: const Icon(Icons.refresh, size: 18),
-            label: Text(loc.devToolsSimulateRefresh),
-          ),
-          TextButton.icon(
-            onPressed: hasSite ? _sendTestNotification : null,
-            icon: const Icon(Icons.notifications_active, size: 18),
-            label: Text(loc.devToolsTestNotification),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Widget _buildSensitiveToggle() {
-    final loc = AppLocalizations.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 12.0),
-      child: Row(
-        children: [
-          Switch(
-            value: _showSensitive,
-            onChanged: (v) => setState(() => _showSensitive = v),
-          ),
-          const SizedBox(width: 4),
-          Expanded(
-            child: Text(
-              _showSensitive
-                  ? loc.devToolsSensitiveShowing
-                  : loc.devToolsSensitiveShow,
-              style: Theme.of(context).textTheme.bodySmall,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  /// Copies exactly what the Logs tab shows. Sensitive entries reach the
-  /// clipboard only through the confirmation below: the show-sensitive toggle
-  /// is consent to display them, not to hand them to clipboard history, a
-  /// cloud clipboard or a third-party keyboard. Files written by Export never
-  /// carry them at all.
-  Future<void> _copyLogs(List<LogEntry> filtered) async {
-    if (_isCopyingLogs) return;
-    final loc = AppLocalizations.of(context);
-    final messenger = ScaffoldMessenger.of(context);
-    final sensitive =
-        filtered.where((e) => e.sensitivity == LogSensitivity.sensitive).length;
-    var includeSensitive = false;
-    _isCopyingLogs = true;
-    try {
-      if (sensitive > 0) {
-        final confirmed = await showDialog<bool>(
-          context: context,
-          builder: (dialogContext) => AlertDialog(
-            title: Text(loc.devToolsLogsCopySensitiveTitle),
-            content: Text(loc.devToolsLogsCopySensitiveBody(sensitive)),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(false),
-                child: Text(loc.commonCancel),
-              ),
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(true),
-                child: Text(loc.devToolsCopy),
-              ),
-            ],
-          ),
-        );
-        if (confirmed != true || !mounted) return;
-        includeSensitive = true;
-      }
-      await Clipboard.setData(ClipboardData(
-        text: LogService.formatForClipboard(filtered,
-            includeSensitive: includeSensitive),
-      ));
-      if (!mounted) return;
-      messenger.showSnackBar(
-        SnackBar(content: Text(loc.devToolsLogsCopied(filtered.length))),
+  /// Copies exactly what the Logs tab shows.
+  Future<void> _copyLogs(List<LogEntry> filtered) => _copyLogsGuard.run(
+        () => copyLogs(
+          context,
+          entries: filtered,
+          consent: AppLocalizations.of(context).devToolsLogsCopySensitiveBody,
+          format: ({required includeSensitive}) =>
+              LogService.formatForClipboard(filtered,
+                  includeSensitive: includeSensitive),
+        ),
       );
-    } finally {
-      _isCopyingLogs = false;
-    }
-  }
-
-  Widget _buildLogActions(List<LogEntry> filtered) {
-    final loc = AppLocalizations.of(context);
-    return Padding(
-      padding: const EdgeInsets.symmetric(horizontal: 8.0, vertical: 4.0),
-      child: Row(
-        children: [
-          TextButton.icon(
-            onPressed: _exportLogs,
-            icon: const Icon(Icons.save, size: 18),
-            label: Text(loc.devToolsExport),
-          ),
-          TextButton.icon(
-            key: const Key('devtools-logs-copy'),
-            onPressed: filtered.isEmpty ? null : () => _copyLogs(filtered),
-            icon: const Icon(Icons.copy, size: 18),
-            label: Text(loc.devToolsCopy),
-          ),
-          TextButton.icon(
-            onPressed: () {
-              LogService.instance.clear();
-              setState(() {});
-            },
-            icon: const Icon(Icons.delete_outline, size: 18),
-            label: Text(loc.devToolsClear),
-          ),
-        ],
-      ),
-    );
-  }
 
   Widget _buildLogFilters() {
     return Padding(
@@ -1843,71 +1465,6 @@ class _DevToolsScreenState extends State<DevToolsScreen> {
       ),
     );
   }
-
-  Widget _buildLogEntry(LogEntry entry) {
-    Color color;
-    switch (entry.level) {
-      case LogLevel.warning:
-        color = Colors.amber;
-        break;
-      case LogLevel.error:
-        color = Colors.red;
-        break;
-      case LogLevel.info:
-        color = Colors.blue;
-        break;
-      default:
-        color = Theme.of(context).textTheme.bodyMedium?.color ?? Colors.white;
-    }
-    final isSensitive = entry.sensitivity == LogSensitivity.sensitive;
-    final prefix = isSensitive ? '[SENSITIVE] ' : '';
-    final line =
-        '[${_formatTime(entry.timestamp)}] $prefix[${entry.tag}] ${entry.message}';
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 1.0),
-      decoration: isSensitive
-          ? BoxDecoration(
-              border: Border(
-                left: BorderSide(color: Colors.deepOrange.shade400, width: 3),
-              ),
-            )
-          : null,
-      child: SelectableText(
-        line,
-        style: TextStyle(fontFamily: 'monospace', fontSize: 11, color: color),
-      ),
-    );
-  }
-
-  Future<void> _exportLogs() async {
-    final text = LogService.instance.export();
-    if (text.isEmpty) return;
-
-    final bytes = utf8.encode(text);
-    final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
-    final fileName = 'webspace_logs_$timestamp.txt';
-
-    final bool isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
-    if (!mounted) return;
-    final outputPath = await FilePicker.saveFile(
-      dialogTitle: AppLocalizations.of(context).devToolsExportLogsDialogTitle,
-      fileName: fileName,
-      bytes: isMobile ? bytes : null,
-    );
-
-    if (outputPath != null && !isMobile) {
-      final filePath = outputPath.endsWith('.txt') ? outputPath : '$outputPath.txt';
-      await hostWriteFileText(filePath, text);
-    }
-
-    if (mounted && outputPath != null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(AppLocalizations.of(context).devToolsLogsExported)),
-      );
-    }
-  }
-
-  // ── Helpers ──
 
   String _consoleLevelName(ConsoleMessageLevel level) {
     if (level == ConsoleMessageLevel.WARNING) return 'WARN';

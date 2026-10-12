@@ -42,8 +42,13 @@ abstract final class Chrome {
   static const Color hairlineDark = Color(0xFF3E3E3E);
   static const double hairlineWidth = 0.5;
 
-  static Color bar(bool isDark) => isDark ? barDark : barLight;
-  static Color hairline(bool isDark) => isDark ? hairlineDark : hairlineLight;
+  /// A chip that is not selected, on the dark bar; white on the light one.
+  static const Color chipDark = Color(0xFF2A2A2A);
+
+  static Color bar({required bool isDark}) => isDark ? barDark : barLight;
+  static Color chip({required bool isDark}) => isDark ? chipDark : Colors.white;
+  static Color hairline({required bool isDark}) =>
+      isDark ? hairlineDark : hairlineLight;
 }
 
 /// The padlock in the URL bar. Green only for https; anything else reads as
@@ -77,6 +82,13 @@ abstract final class TapTargets {
 abstract final class Motion {
   /// Press / release feedback. Short enough to feel attached to the finger.
   static const Duration press = Duration(milliseconds: 100);
+
+  /// One step of a list scrolling itself while something is dragged at its
+  /// edge.
+  static const Duration autoScrollTick = Duration(milliseconds: 16);
+
+  /// A released control gliding to where it rests.
+  static const Duration settle = Duration(milliseconds: 250);
 }
 
 abstract final class Elevations {
@@ -90,6 +102,61 @@ abstract final class FloatingButton {
   static const double surfaceOpacity = 0.85;
   static const double padding = 10;
   static const double dragScale = 1.2;
+}
+
+/// Rows of the tab list (TAB-011).
+abstract final class TabRows {
+  /// A tab that holds no webview is drawn at this strength, as a browser
+  /// fades an unloaded tab.
+  static const double unloadedOpacity = 0.5;
+
+  /// The row being dragged, left in place (TAB-015).
+  static const double draggingOpacity = 0.3;
+
+  /// The line that shows where a dragged tab will land.
+  static const double dropLineWidth = 2;
+
+  /// How close to the list's top or bottom a drag starts scrolling it, and
+  /// how far one step scrolls.
+  static const double autoScrollEdge = 48;
+  static const double autoScrollStep = 8;
+}
+
+/// One colour per container (TAB-018): a tab row is marked with the colour of
+/// the container it runs in, so which container a tab uses is never a guess.
+/// Two sets, the same hues in order, each holding 3:1 against the surfaces of
+/// its brightness so the mark reads as a graphic.
+abstract final class ContainerColors {
+  /// Blue, turquoise, green, yellow, orange, red, pink, purple.
+  static const List<Color> light = [
+    Color(0xFF1565C0),
+    Color(0xFF00838F),
+    Color(0xFF2E7D32),
+    Color(0xFF8D6E00),
+    Color(0xFFE65100),
+    Color(0xFFC62828),
+    Color(0xFFAD1457),
+    Color(0xFF6A1B9A),
+  ];
+
+  static const List<Color> dark = [
+    Color(0xFF64B5F6),
+    Color(0xFF4DD0E1),
+    Color(0xFF81C784),
+    Color(0xFFFFD54F),
+    Color(0xFFFFB74D),
+    Color(0xFFE57373),
+    Color(0xFFF06292),
+    Color(0xFFBA68C8),
+  ];
+
+  /// The bar at the start of a tab row.
+  static const double markWidth = 3;
+
+  static Color of(int index, {required Brightness brightness}) {
+    final set = brightness == Brightness.dark ? dark : light;
+    return set[index % set.length];
+  }
 }
 
 abstract final class TextSizes {

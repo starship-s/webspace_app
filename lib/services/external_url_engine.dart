@@ -67,7 +67,7 @@ class ExternalUrlParser {
     if (scheme.isEmpty || _internalSchemes.contains(scheme)) return null;
 
     if (scheme == 'intent') {
-      return _parseIntent(url, uri);
+      return _parseIntent(url, uri: uri);
     }
     return ExternalUrlInfo(
       url: url,
@@ -80,7 +80,7 @@ class ExternalUrlParser {
   ///   intent://HOST/PATH?QUERY#Intent;scheme=...;package=...;S.browser_fallback_url=...;end
   /// Extras live in the fragment, `;`-separated, with `S.` prefixing
   /// string extras per the Chrome intent scheme spec.
-  static ExternalUrlInfo _parseIntent(String url, Uri uri) {
+  static ExternalUrlInfo _parseIntent(String url, {required Uri uri}) {
     String? package;
     String? fallbackUrl;
     String? targetScheme;
@@ -104,7 +104,8 @@ class ExternalUrlParser {
           case 'S.browser_fallback_url':
             try {
               fallbackUrl = Uri.decodeComponent(value);
-            } catch (_) {
+            } on ArgumentError {
+              // How the SDK reports a malformed %-escape.
               fallbackUrl = value;
             }
             break;
@@ -212,13 +213,6 @@ class ExternalUrlSuppressor {
   /// expired.
   static bool isSuppressedInfo(ExternalUrlInfo info) =>
       _checkExpiry(_keyForInfo(info));
-
-  /// URL-keyed variant — convenience for callers that only have the raw
-  /// URL string (e.g. `onReceivedError` in webview.dart).
-  static bool isSuppressedUrl(String url) {
-    final info = ExternalUrlParser.parse(url);
-    return info == null ? false : isSuppressedInfo(info);
-  }
 
   static void mark(
     ExternalUrlInfo info, {

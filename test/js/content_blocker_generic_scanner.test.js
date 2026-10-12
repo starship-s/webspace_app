@@ -1,5 +1,5 @@
 // Phase 5 — jsdom assertions for the generic-cosmetic scanner shim
-// (test/js_fixtures/content_blocker/generic_scanner.js).
+// (lib/js/generic_cosmetic.js).
 //
 // The shim is the page-side half of the Rust engine's
 // `hidden_class_id_selectors` lookup: it scans the loaded DOM for
@@ -14,9 +14,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeDom, runInDom, readFixture } = require('./helpers/load_shim');
+const { makeDom, runInDom, pageJs } = require('./helpers/load_shim');
 
-const SCANNER = readFixture('content_blocker/generic_scanner.js');
+const SCANNER = pageJs('generic_cosmetic');
 
 function setupBridge(dom, returnSelectors) {
   const calls = [];
@@ -222,4 +222,60 @@ test('generic scanner: scanner reports only new tokens (delta scanning)',
       'delta scan must NOT include already-seen `a` and `b`; '
         + 'got: ' + JSON.stringify(latePayload.classes));
     assert.equal(latePayload.classes[0], 'c');
+  });
+
+test('generic scanner: a rescan walks what changed, not the page', async () => {
+  // A page that re-renders a few nodes per keystroke over thousands of
+  // static ones paid a walk of every element per keystroke.
+  const rows = Array.from({ length: 200 }, (_, i) => `<div class="row-${i}"></div>`);
+  const dom = makeDom({ html: `<!doctype html><html><body>${rows.join('')}` +
+    '<ul id="results"></ul></body></html>' });
+  const payloads = [];
+  dom.window.flutter_inappwebview = {
+    callHandler: function(name, payload) {
+      payloads.push(payload);
+      return Promise.resolve([]);
+    },
+  };
+  runInDom(dom, SCANNER);
+  await new Promise((r) => setTimeout(r, 30));
+  let visited = 0;
+  const protos = [dom.window.Element.prototype, dom.window.Document.prototype];
+  const originals = protos.map((proto) => proto.querySelectorAll);
+  protos.forEach((proto, i) => {
+    proto.querySelectorAll = function(sel) {
+      const found = originals[i].call(this, sel);
+      visited += found.length;
+      return found;
+    };
+  });
+  const doc = dom.window.document;
+  const li = doc.createElement('li');
+  li.innerHTML = '<span class="nested-ad"></span>';
+  doc.getElementById('results').appendChild(li);
+  await new Promise((r) => setTimeout(r, 200));
+  protos.forEach((proto, i) => { proto.querySelectorAll = originals[i]; });
+  assert.ok(visited < 10, `rescan visited ${visited} elements`);
+  assert.deepEqual([...payloads.at(-1).classes], ['nested-ad'],
+    'a class inside an inserted subtree is reported');
+});
+
+test('generic scanner: an element appended to <html> beside <body> is scanned',
+  async () => {
+    const dom = makeDom({ html: '<!doctype html><html><body></body></html>' });
+    const payloads = [];
+    dom.window.flutter_inappwebview = {
+      callHandler: function(name, payload) {
+        payloads.push(payload);
+        return Promise.resolve([]);
+      },
+    };
+    runInDom(dom, SCANNER);
+    await new Promise((r) => setTimeout(r, 30));
+    const doc = dom.window.document;
+    const ad = doc.createElement('div');
+    ad.className = 'outside-body';
+    doc.documentElement.appendChild(ad);
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(payloads.some((p) => p.classes.includes('outside-body')));
   });

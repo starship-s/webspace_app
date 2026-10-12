@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import 'package:webspace/web_view_model.dart';
 
 /// Outcome of resolving a tapped home shortcut against the current site list.
@@ -55,32 +57,11 @@ class LaunchOfferReroute extends LaunchResolution {
   const LaunchOfferReroute({required this.shortcutSiteId});
 }
 
-/// Pure helpers for `_WebSpacePageState._restoreAppState`. Only the
+/// Pure helpers for `StartupController.restore`. Only the
 /// straight-line decisions live here; SharedPreferences I/O, native
-/// cookie-jar nuking, and `_setCurrentIndex` chaining stay at the
+/// cookie-jar nuking, and `setCurrentIndex` chaining stay at the
 /// caller because they cross rendering/persistence boundaries.
 class StartupRestoreEngine {
-  /// Resolves a launch-shortcut intent to a site index, or `null` if no
-  /// shortcut intent was passed (or the intent's siteId no longer maps to
-  /// a known site — e.g. the user deleted the site after pinning the
-  /// shortcut). Returning `null` causes the app to launch on the home
-  /// screen without activating any site.
-  ///
-  /// Matches by `WebViewModel.siteId`; the first hit wins (siteIds are
-  /// generated to be unique, so collisions only occur if a backup was
-  /// hand-edited).
-  ///
-  /// Kept as the siteId-only view used where the richer [resolveLaunch]
-  /// outcome (domain fallback, offer-to-create) isn't needed.
-  static int? resolveLaunchTarget({
-    required String? shortcutSiteId,
-    required List<WebViewModel> models,
-  }) {
-    if (shortcutSiteId == null) return null;
-    final i = models.indexWhere((m) => m.siteId == shortcutSiteId);
-    return i >= 0 ? i : null;
-  }
-
   /// Full shortcut resolution (HS-011). Tries, in order:
   ///
   /// 1. direct `siteId` match — [LaunchOpenSite];
@@ -146,6 +127,21 @@ class StartupRestoreEngine {
     required bool perSiteFullscreenMode,
   }) {
     return perSiteFullscreenMode || (directEntry && fullscreenOnShortcut);
+  }
+
+  /// Whether the restore's closing `setCurrentIndex(indexToRestore)` should
+  /// still run (NAV-012).
+  ///
+  /// The home grid takes taps while the restore is still awaiting startup work
+  /// (the proxy router's attribution pass alone can take seconds), so a site
+  /// the user opened in that window would otherwise be closed again by a
+  /// plain launch's `null` target. A shortcut target still applies: it is the
+  /// site the app was launched to open.
+  static bool shouldActivateAfterRestore({
+    required int? indexToRestore,
+    required bool activatedDuringRestore,
+  }) {
+    return indexToRestore != null || !activatedDuringRestore;
   }
 }
 
@@ -216,7 +212,67 @@ class ShortcutPinState {
         if (tile == siteId || rememberedRemap[tile] == siteId) tile,
     };
   }
+
+  /// Each pinned tile and the site a tap on it opens, by the rule
+  /// [StartupRestoreEngine.resolveLaunch] applies. A tile that opens no site
+  /// is left out, as is one opening an archive-tier site, whose name and
+  /// icon never reach an OS surface (ARCH-006).
+  static Map<String, WebViewModel> sitesOfTiles({
+    required Set<String> pinnedSiteIds,
+    required Map<String, String> rememberedRemap,
+    required List<WebViewModel> models,
+  }) {
+    final result = <String, WebViewModel>{};
+    for (final tile in pinnedSiteIds) {
+      final opens = StartupRestoreEngine.resolveLaunch(
+        shortcutSiteId: tile,
+        shortcutUrl: null,
+        models: models,
+        rememberedRemap: rememberedRemap,
+      );
+      if (opens is! LaunchOpenSite) continue;
+      final site = models[opens.index];
+      if (!site.isArchiveTier) result[tile] = site;
+    }
+    return result;
+  }
+
+  /// HS-016: the tiles in [want] whose face differs from what [shown] says
+  /// they were last given, and what every tile shows once those are
+  /// rewritten. A wanted face with no icon leaves the tile's icon as it is,
+  /// so an icon not known yet never replaces the one a tile has.
+  static ({List<TileUpdate> updates, Map<String, TileFace> shown}) staleTiles({
+    required Map<String, TileFace> want,
+    required Map<String, TileFace> shown,
+  }) {
+    final updates = <TileUpdate>[];
+    final next = Map<String, TileFace>.of(shown);
+    for (final MapEntry(key: tile, value: face) in want.entries) {
+      final last = shown[tile];
+      final icon = face.icon;
+      final newIcon =
+          icon != null && !_sameBytes(icon, other: last?.icon) ? icon : null;
+      if (newIcon == null && face.label == last?.label) continue;
+      updates.add((tile: tile, label: face.label, icon: newIcon));
+      next[tile] = (label: face.label, icon: icon ?? last?.icon);
+    }
+    return (updates: updates, shown: next);
+  }
+
+  static bool _sameBytes(Uint8List a, {required Uint8List? other}) {
+    if (other == null || a.length != other.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] != other[i]) return false;
+    }
+    return true;
+  }
 }
+
+/// What a pinned tile shows: its label and, once known, its icon as PNG.
+typedef TileFace = ({String label, Uint8List? icon});
+
+/// A pinned tile to rewrite; a null [icon] leaves the tile's icon as it is.
+typedef TileUpdate = ({String tile, String label, Uint8List? icon});
 
 /// iOS-only tombstone list backing HS-011 parity. iOS can't enumerate
 /// home-screen Shortcut tiles, so when a site is deleted we keep a small
@@ -249,9 +305,9 @@ class ShortcutTombstones {
   /// Drop tombstones whose siteId is now a live site (defensive: ids are
   /// unique per create, so this only fires if a backup reintroduces one).
   static List<Map<String, String>> pruneLive(
-    List<Map<String, String>> tombstones,
-    Set<String> liveSiteIds,
-  ) {
+    List<Map<String, String>> tombstones, {
+    required Set<String> liveSiteIds,
+  }) {
     return [
       for (final t in tombstones)
         if (!liveSiteIds.contains(t['siteId'])) t,

@@ -14,7 +14,7 @@
 //   2. Detector sensitivity control: a genuinely white page must classify
 //      as uniformBlank, proving the sampler reads webview pixels and the
 //      assertions in the other scenarios are not vacuously green.
-//   3. Loaded-site switch (_setCurrentIndex reuse path, Attempt 3).
+//   3. Loaded-site switch (setCurrentIndex reuse path, Attempt 3).
 //   4. Reload funnel (reloadAndRepaint + load-settled re-nudge, Attempt 9).
 //   5. OS memory pressure against the visible site (Attempt 7).
 //   6. Fresh activation with other sites live (controller-attach nudge,
@@ -54,14 +54,20 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:webspace/widgets/site_menu.dart';
 import 'package:webspace/main.dart' as app;
-import 'package:webspace/demo_data.dart';
+import 'package:webspace/settings/demo_mode.dart';
 import 'package:webspace/screens/inappbrowser.dart';
 import 'package:webspace/screens/settings.dart';
+import 'package:webspace/services/developer_mode_service.dart';
+import 'package:webspace/settings/app_prefs.dart';
 import 'package:webspace/services/log_service.dart';
 import 'package:webspace/services/surface_diag_native.dart';
 import 'package:webspace/web_view_model.dart';
 import 'package:webspace/webspace_model.dart';
+import 'package:webspace/widgets/url_bar.dart';
+import 'fixture_server.dart';
+import 'helpers/ui.dart';
 
 const int _kDarkColor = 0xFF123524;
 const int _kMagentaColor = 0xFF8C1D5A;
@@ -83,9 +89,11 @@ void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
 
   HttpServer? server;
+  late String altBase;
 
   setUpAll(() async {
     isDemoMode = true;
+    DeveloperModeService.instance.debugSet(on: true);
 
     // anyIPv4, not loopbackIPv4: the nested-screen scenario needs a second
     // host name for the same pages (127.0.0.2), because the nested screen
@@ -93,21 +101,16 @@ void main() {
     // literally. Both addresses are loopback, so nothing leaves the device.
     server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
     final port = server!.port;
-    final altBase = 'http://127.0.0.2:$port';
-    server!.listen((request) async {
+    altBase = 'http://127.0.0.2:$port';
+    listenFixture(server!, onEvent: (request) async {
       final page = switch (request.uri.path) {
         '/dark.html' => _solidPage('#123524'),
         '/white.html' => _solidPage('#ffffff'),
         '/magenta.html' => _solidPage('#8c1d5a'),
         '/slow-blue.html' => _solidPage('#1d3f8c'),
-        // Cross-domain hop into the nested screen, script-initiated so the
-        // test never depends on a synthetic touch reaching the platform view.
-        // The site that serves it has blockAutoRedirects off, so the
-        // navigation decision engine resolves it to blockOpenNested.
-        '/opener.html' => _solidPage('#123524',
-            body: '<script>setTimeout(function(){'
-                "location.href='$altBase/slow-blue.html';"
-                '},500);</script>'),
+        // The site scenario 9 opens its nested screen from, by submitting
+        // the 127.0.0.2 address in its URL bar.
+        '/opener.html' => _solidPage('#123524'),
         _ => '<!doctype html><html><body>404</body></html>',
       };
       // Withhold the first byte so the document commits well after every
@@ -146,12 +149,13 @@ void main() {
       siteId: 'ws-opener',
       initUrl: '$base/opener.html',
       name: 'Opener',
-      // The hop to 127.0.0.2 is script-initiated and therefore gestureless;
-      // the default (block) would classify it blockSilent and never open the
-      // nested screen.
-      blockAutoRedirects: false,
     );
+    // The repaint trace is gated on developer mode so an ordinary session does
+    // not spend its log ring on it. Turn it on for the suite: a pixel verdict
+    // says the surface is painted, and only the trace says which repaint path
+    // painted it — which is what a silently-dropped funnel would change.
     SharedPreferences.setMockInitialValues({
+      AppPref.developerMode.key: true,
       'webViewModels': [
         jsonEncode(dark.toJson()),
         jsonEncode(white.toJson()),
@@ -166,7 +170,7 @@ void main() {
     await server?.close(force: true);
   });
 
-  bool colorNear(int? actual, int expected, {int tolerance = 28}) {
+  bool colorNear(int? actual, {required int expected,int tolerance = 28}) {
     if (actual == null) return false;
     for (final shift in const [16, 8, 0]) {
       final a = (actual >> shift) & 0xFF;
@@ -179,7 +183,7 @@ void main() {
   // The test data is synthetic (loopback URLs, seeded names), so dumping the
   // sensitive log ring into the CI log leaks nothing; it is the only way to
   // read onLoadStop/onReceivedError from a remote failure (INTEG-006).
-  void dumpDiagnostics(WidgetTester tester, String context) {
+  void dumpDiagnostics(WidgetTester tester, {required String context}) {
     print('=== white_screen_test failure: $context');
     print('Texts: ${find.byType(Text).evaluate().map((e) {
       final w = e.widget;
@@ -191,14 +195,47 @@ void main() {
     }
   }
 
-  Future<WindowRegionSample> sampleSlot(WidgetTester tester, Finder slot) {
-    final logical = tester.getRect(slot.first);
-    return SurfaceDiagNative.sampleWindowRegion(SurfaceDiagNative.physicalRect(
-      logicalRect: logical,
-      devicePixelRatio: tester.view.devicePixelRatio,
-      insetLogical: 12,
-    ));
+  /// Assert the repaint trace names the funnel that ran since [since].
+  ///
+  /// A pixel verdict says the surface ended up painted; on a page that commits
+  /// in a millisecond it says that whether or not the repaint funnel ran at
+  /// all. The trace is the half that can tell those apart, so a refactor that
+  /// silently drops a funnel fails here even when the pixels stay green. The
+  /// trace is gated on developer mode, which `setUpAll` turns on.
+  /// Polled, not asserted once: the pixel wait above returns as soon as the
+  /// surface shows the right colour, and the settle-side repaint fires later,
+  /// at `onLoadStop`. Asserting immediately raced it and failed with only the
+  /// issue-time trigger in the trace. A folded burst also matches, because the
+  /// throttle's summary keeps the `trigger=... ->` prefix.
+  Future<void> expectRepaintTrigger(
+    WidgetTester tester, {
+    required DateTime since,
+    required String trigger,
+    required String context,
+    Duration timeout = const Duration(seconds: 20),
+  }) async {
+    List<String> trace() => LogService.instance.allEntriesMerged
+        .where((e) => e.tag == 'SurfaceDiag' && !e.timestamp.isBefore(since))
+        .map((e) => e.message)
+        .toList();
+    final deadline = DateTime.now().add(timeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (trace().any((m) => m.startsWith('trigger=$trigger ->'))) return;
+      await tester.pump(const Duration(milliseconds: 200));
+    }
+    fail('$context: expected a "$trigger" repaint in the SurfaceDiag trace '
+        'within ${timeout.inSeconds}s, got ${trace()}');
   }
+
+Future<WindowRegionSample> sampleSlot(WidgetTester tester,
+    {required Finder slot}) {
+  final logical = tester.getRect(slot.first);
+  return SurfaceDiagNative.sampleWindowRegion(SurfaceDiagNative.physicalRect(
+    logicalRect: logical,
+    devicePixelRatio: tester.view.devicePixelRatio,
+    insetLogical: 12,
+  ));
+}
 
   // pumpAndSettle deadlocks on a live webview (see lazy_webview_loading_test),
   // so poll in fixed slices, re-sampling the composited window each pass
@@ -206,10 +243,10 @@ void main() {
   // sample is the diagnostic: uniform white with an ok status IS a white
   // screen.
   Future<WindowRegionSample> pollSlot(
-    WidgetTester tester,
-    Finder slot,
-    String description,
-    bool Function(WindowRegionSample) accept, {
+    WidgetTester tester, {
+    required Finder slot,
+    required String description,
+    required bool Function(WindowRegionSample) accept,
     Duration timeout = const Duration(seconds: 90),
   }) async {
     final deadline = DateTime.now().add(timeout);
@@ -217,67 +254,29 @@ void main() {
     while (DateTime.now().isBefore(deadline)) {
       await tester.pump(const Duration(milliseconds: 250));
       if (slot.evaluate().isEmpty) continue;
-      last = await sampleSlot(tester, slot);
+      last = await sampleSlot(tester, slot: slot);
       if (accept(last)) {
         print('white_screen_test: $description -> $last');
         return last;
       }
     }
-    dumpDiagnostics(tester, '$description; last sample: $last');
+    dumpDiagnostics(tester, context: '$description; last sample: $last');
     fail('Timed out after ${timeout.inSeconds}s waiting for: $description '
         '(last sample: $last)');
   }
 
-  Future<WindowRegionSample> pollSite(
-    WidgetTester tester,
-    String siteId,
-    String description,
-    bool Function(WindowRegionSample) accept, {
-    Duration timeout = const Duration(seconds: 90),
-  }) =>
-      pollSlot(tester, find.byKey(ValueKey(siteId)), description, accept,
-          timeout: timeout);
-
-  Future<void> openSiteDrawer(WidgetTester tester) async {
-    for (var attempt = 0; attempt < 3; attempt++) {
-      if (find.byType(Drawer).evaluate().isNotEmpty) return;
-      final menuIcon = find.byIcon(Icons.menu);
-      if (menuIcon.evaluate().isNotEmpty) {
-        await tester.tap(menuIcon.first);
-      } else {
-        final scaffolds = find.byType(Scaffold).evaluate();
-        for (final element in scaffolds) {
-          final state = tester.state<ScaffoldState>(
-              find.byWidget(element.widget as Scaffold));
-          if (state.hasDrawer) {
-            state.openDrawer();
-            break;
-          }
-        }
-      }
-      await tester.pump();
-      await tester.pump(const Duration(milliseconds: 400));
-    }
-    expect(find.byType(Drawer), findsOneWidget,
-        reason: 'site drawer should open for switching sites');
-  }
-
-  // The active site's name can also appear in the AppBar title, so scope to
-  // the open drawer when there is one; the drawer tile is the switch target.
-  Future<void> tapSite(WidgetTester tester, String siteName) async {
-    final drawer = find.byType(Drawer);
-    final tile = drawer.evaluate().isNotEmpty
-        ? find.descendant(of: drawer, matching: find.text(siteName))
-        : find.text(siteName);
-    if (tile.evaluate().isEmpty) {
-      dumpDiagnostics(tester, 'site tile "$siteName" not found');
-    }
-    expect(tile, findsWidgets,
-        reason: '$siteName should be visible in the site list');
-    await tester.tap(tile.first);
-    await tester.pump();
-    await tester.pump(const Duration(milliseconds: 400));
-  }
+Future<WindowRegionSample> pollSite(
+  WidgetTester tester, {
+  required String siteId,
+  required String description,
+  required bool Function(WindowRegionSample) accept,
+  Duration timeout = const Duration(seconds: 90),
+}) =>
+    pollSlot(tester,
+        slot: find.byKey(ValueKey(siteId)),
+        description: description,
+        accept: accept,
+        timeout: timeout);
 
   // Tap an action in the AppBar's overflow popup menu. Menu contents are
   // built at open time and some entries are conditional (Refresh swaps to
@@ -286,15 +285,16 @@ void main() {
   // the AppBar renders its own gear only on the webspaces list, where no
   // site is active.
   Future<void> openOverflowMenuAction(
-    WidgetTester tester,
-    IconData action,
-    String label, {
+    WidgetTester tester, {
+    required IconData action,
+    required String label,
     Duration timeout = const Duration(seconds: 45),
   }) async {
     final deadline = DateTime.now().add(timeout);
     while (true) {
       if (DateTime.now().isAfter(deadline)) {
-        dumpDiagnostics(tester, '$label: overflow menu action not reachable');
+        dumpDiagnostics(tester,
+            context: '$label: overflow menu action not reachable');
         fail('$label: timed out opening the overflow menu / finding the action');
       }
       final item = find.byIcon(action);
@@ -303,13 +303,13 @@ void main() {
         await tester.pump();
         return;
       }
-      if (find.byType(PopupMenuItem<String>).evaluate().isNotEmpty) {
+      if (find.byType(PopupMenuItem<SiteMenuAction>).evaluate().isNotEmpty) {
         // Menu is open without the action: dismiss and reopen next pass.
         await tester.tapAt(const Offset(5, 5));
       } else {
         final menuButton = find.descendant(
             of: find.byType(AppBar),
-            matching: find.byType(PopupMenuButton<String>));
+            matching: find.byType(PopupMenuButton<SiteMenuAction>));
         if (menuButton.evaluate().isNotEmpty) {
           await tester.tap(menuButton.first);
         }
@@ -327,7 +327,7 @@ void main() {
 
       bool darkVisible(WindowRegionSample s) =>
           s.ok &&
-          colorNear(s.dominantColor, _kDarkColor) &&
+          colorNear(s.dominantColor, expected: _kDarkColor) &&
           (s.uniformFraction ?? 0) > 0.5;
 
       // Scenario 1: fresh first activation. This is the reported path: the
@@ -337,9 +337,12 @@ void main() {
       // still end up showing the page.
       await tester.tap(find.byKey(const ValueKey(kAllWebspaceId)));
       await tester.pumpAndSettle(const Duration(seconds: 5));
-      await tapSite(tester, 'Dark');
-      await pollSite(tester, 'ws-dark',
-          'scenario 1: fresh activation paints dark content', darkVisible);
+      await tapSite(tester, siteName: 'Dark',
+          diagnose: (c) => dumpDiagnostics(tester, context: c));
+      await pollSite(tester,
+          siteId: 'ws-dark',
+          description: 'scenario 1: fresh activation paints dark content',
+          accept: darkVisible);
 
       // Scenario 2: detector sensitivity control. A genuinely white page is
       // pixel-identical to the BUG-001 blank, so the sampler MUST classify it
@@ -349,22 +352,27 @@ void main() {
       // samples as uniform 0x00000000 (alpha 0), which also classifies
       // blank; waiting for white proves the white *content* composited.
       await openSiteDrawer(tester);
-      await tapSite(tester, 'White');
-      await pollSite(
-          tester,
-          'ws-white',
-          'scenario 2: white control page classifies as uniformBlank',
-          (s) =>
+      await tapSite(tester, siteName: 'White',
+          diagnose: (c) => dumpDiagnostics(tester, context: c));
+      await pollSite(tester,
+          siteId: 'ws-white',
+          description:
+              'scenario 2: white control page classifies as uniformBlank',
+          accept: (s) =>
               s.ok &&
-              colorNear(s.dominantColor, 0xFFFFFFFF) &&
-              SurfaceDiagNative.classify(s) == WindowSampleVerdict.uniformBlank);
+              colorNear(s.dominantColor, expected: 0xFFFFFFFF) &&
+              SurfaceDiagNative.classify(s) ==
+                  WindowSampleVerdict.uniformBlank);
 
-      // Scenario 3: switch back to an already-loaded site (_setCurrentIndex
+      // Scenario 3: switch back to an already-loaded site (setCurrentIndex
       // reuse path, Attempt 3's chokepoint).
       await openSiteDrawer(tester);
-      await tapSite(tester, 'Dark');
-      await pollSite(tester, 'ws-dark',
-          'scenario 3: loaded-site switch repaints dark content', darkVisible);
+      await tapSite(tester, siteName: 'Dark',
+          diagnose: (c) => dumpDiagnostics(tester, context: c));
+      await pollSite(tester,
+          siteId: 'ws-dark',
+          description: 'scenario 3: loaded-site switch repaints dark content',
+          accept: darkVisible);
 
       // Scenario 4: reload funnel (Attempt 9). The Refresh action lives
       // inside the AppBar's overflow popup menu (it swaps to Stop while
@@ -372,9 +380,20 @@ void main() {
       // open: open the menu, tap Refresh, then require the recommitted
       // document on the window. Menu contents are built at open time, so a
       // menu showing Stop is dismissed and reopened until the load settles.
-      await openOverflowMenuAction(tester, Icons.refresh, 'scenario 4');
-      await pollSite(tester, 'ws-dark',
-          'scenario 4: reload recommits dark content', darkVisible);
+      final reloadMark = DateTime.now();
+      await openOverflowMenuAction(tester,
+          action: Icons.refresh, label: 'scenario 4');
+      await pollSite(tester,
+          siteId: 'ws-dark',
+          description: 'scenario 4: reload recommits dark content',
+          accept: darkVisible);
+      // Both halves of PAUSE-021: the issue-time nudge and the settle-side
+      // one. A reload that painted only because the page was fast would show
+      // the first and not the second.
+      await expectRepaintTrigger(tester,
+          since: reloadMark, trigger: 'reload', context: 'scenario 4');
+      await expectRepaintTrigger(tester,
+          since: reloadMark, trigger: 'commit-settled', context: 'scenario 4');
 
       // Scenario 5: OS memory pressure with the site visible (Attempt 7).
       // Delivered as the real platform message so it flows through
@@ -388,25 +407,28 @@ void main() {
         (_) {},
       );
       await tester.pump();
-      await pollSite(tester, 'ws-dark',
-          'scenario 5: memory pressure keeps dark content', darkVisible);
+      await pollSite(tester,
+          siteId: 'ws-dark',
+          description: 'scenario 5: memory pressure keeps dark content',
+          accept: darkVisible);
 
       // Scenario 6: fresh activation while other webviews are live
       // (controller-attach nudge, Attempt 4's chokepoint).
       await openSiteDrawer(tester);
-      await tapSite(tester, 'Magenta');
-      await pollSite(
-          tester,
-          'ws-magenta',
-          'scenario 6: fresh activation among live sites paints magenta',
-          (s) =>
+      await tapSite(tester, siteName: 'Magenta',
+          diagnose: (c) => dumpDiagnostics(tester, context: c));
+      await pollSite(tester,
+          siteId: 'ws-magenta',
+          description:
+              'scenario 6: fresh activation among live sites paints magenta',
+          accept: (s) =>
               s.ok &&
-              colorNear(s.dominantColor, _kMagentaColor) &&
+              colorNear(s.dominantColor, expected: _kMagentaColor) &&
               (s.uniformFraction ?? 0) > 0.5);
 
       bool blueVisible(WindowRegionSample s) =>
           s.ok &&
-          colorNear(s.dominantColor, _kBlueColor) &&
+          colorNear(s.dominantColor, expected: _kBlueColor) &&
           (s.uniformFraction ?? 0) > 0.5;
 
       // Scenario 7: fresh activation of a site whose document commits LATE
@@ -418,12 +440,13 @@ void main() {
       // that can paint it. The deadline is deliberately tight: a blank that
       // clears minutes later, on some unrelated relayout, is still the bug.
       await openSiteDrawer(tester);
-      await tapSite(tester, 'Slow');
+      await tapSite(tester, siteName: 'Slow',
+          diagnose: (c) => dumpDiagnostics(tester, context: c));
       await pollSlot(
           tester,
-          find.byKey(const ValueKey('ws-slow')),
-          'scenario 7: late-committing first document paints blue',
-          blueVisible,
+          slot: find.byKey(const ValueKey('ws-slow')),
+          description: 'scenario 7: late-committing first document paints blue',
+          accept: blueVisible,
           timeout: const Duration(seconds: 45));
 
       // Scenario 8: return from a pushed opaque route (PAUSE-024). While the
@@ -431,7 +454,8 @@ void main() {
       // so Android detaches the SurfaceView and re-attaches it on the pop —
       // through no other chokepoint: same site, same controller, no
       // navigation, no lifecycle event.
-      await openOverflowMenuAction(tester, Icons.settings, 'scenario 8');
+      await openOverflowMenuAction(tester,
+          action: Icons.settings, label: 'scenario 8');
       final settlesSettings = DateTime.now().add(const Duration(seconds: 20));
       while (find.byType(SettingsScreen).evaluate().isEmpty &&
           DateTime.now().isBefore(settlesSettings)) {
@@ -446,11 +470,11 @@ void main() {
           .first);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
-      await pollSlot(
-          tester,
-          find.byKey(const ValueKey('ws-slow')),
-          'scenario 8: returning from a pushed route repaints the surface',
-          blueVisible,
+      await pollSlot(tester,
+          slot: find.byKey(const ValueKey('ws-slow')),
+          description:
+              'scenario 8: returning from a pushed route repaints the surface',
+          accept: blueVisible,
           timeout: const Duration(seconds: 45));
 
       // Scenario 9: the nested InAppWebViewScreen. Its cross-domain entry
@@ -458,23 +482,51 @@ void main() {
       // PAUSE-017 + PAUSE-025 pair, neither of which the nested screen had
       // before, and which the main page's nudge cannot reach (that one
       // toggles an inset around an IndexedStack sitting under this route).
+      // A page cannot open it by script: a gesture-less cross-domain hop is
+      // blocked on every site (NESTED-004). A cross-domain address submitted
+      // in the URL bar opens it instead, and that is text input, so no
+      // synthetic touch has to reach the platform view.
       await openSiteDrawer(tester);
-      await tapSite(tester, 'Opener');
+      await tapSite(tester, siteName: 'Opener',
+          diagnose: (c) => dumpDiagnostics(tester, context: c));
+      await pollSlot(
+          tester,
+          slot: find.byKey(const ValueKey('ws-opener')),
+          description: 'scenario 9: the opener paints before the hop',
+          accept: darkVisible,
+          timeout: const Duration(seconds: 45));
+      await openOverflowMenuAction(tester,
+          action: Icons.visibility, label: 'scenario 9');
+      final urlField = find.descendant(
+          of: find.byType(UrlBar), matching: find.byType(TextField));
+      final barDeadline = DateTime.now().add(const Duration(seconds: 20));
+      while (urlField.evaluate().isEmpty &&
+          DateTime.now().isBefore(barDeadline)) {
+        await tester.pump(const Duration(milliseconds: 200));
+      }
+      expect(urlField, findsOneWidget,
+          reason: 'the URL bar should show after the menu toggle');
+      await tester.tap(urlField);
+      await tester.pump();
+      await tester.enterText(urlField, '$altBase/slow-blue.html');
+      await tester.testTextInput.receiveAction(TextInputAction.go);
+      await tester.pump();
       final nestedDeadline = DateTime.now().add(const Duration(seconds: 60));
       while (find.byType(InAppWebViewScreen).evaluate().isEmpty &&
           DateTime.now().isBefore(nestedDeadline)) {
         await tester.pump(const Duration(milliseconds: 250));
       }
       if (find.byType(InAppWebViewScreen).evaluate().isEmpty) {
-        dumpDiagnostics(tester, 'scenario 9: nested screen never opened');
+        dumpDiagnostics(tester,
+            context: 'scenario 9: nested screen never opened');
       }
       expect(find.byType(InAppWebViewScreen), findsOneWidget,
-          reason: 'the cross-domain hop should open the nested webview screen');
-      await pollSlot(
-          tester,
-          find.byKey(const ValueKey(kNestedWebViewSlotKey)),
-          'scenario 9: nested fresh surface paints its late document',
-          blueVisible,
+          reason: 'the cross-domain address should open the nested webview screen');
+      await pollSlot(tester,
+          slot: find.byKey(const ValueKey(kNestedWebViewSlotKey)),
+          description:
+              'scenario 9: nested fresh surface paints its late document',
+          accept: blueVisible,
           timeout: const Duration(seconds: 45));
 
       // ...and popping back to the main page re-attaches the opener's
@@ -488,11 +540,11 @@ void main() {
           .first);
       await tester.pump();
       await tester.pump(const Duration(milliseconds: 400));
-      await pollSlot(
-          tester,
-          find.byKey(const ValueKey('ws-opener')),
-          'scenario 9: returning from the nested screen repaints the site',
-          darkVisible,
+      await pollSlot(tester,
+          slot: find.byKey(const ValueKey('ws-opener')),
+          description:
+              'scenario 9: returning from the nested screen repaints the site',
+          accept: darkVisible,
           timeout: const Duration(seconds: 45));
     },
     skip: !Platform.isAndroid,

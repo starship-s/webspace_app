@@ -1,11 +1,10 @@
 // Real-Chromium proof for the virtual microphone shim
-// (lib/services/microphone_stream_shim.dart, dumped to
-// test/js_fixtures/microphone_stream/shim.js).
+// (lib/js/microphone_stream.js).
 //
 // The jsdom tier (test/js/microphone_stream_shim.test.js) stubs WebAudio, so
 // it proves the decision funnel but not that the synthetic track actually
 // carries the picked clip, nor that the clip REPEATS — the headline claim of
-// the feature. This test runs the exact dumped shim in real headless Chromium
+// the feature. This test runs the exact shim in real headless Chromium
 // and samples the served track back through an AnalyserNode.
 //
 // getUserMedia needs a secure context, so the page is served from 127.0.0.1
@@ -13,10 +12,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const http = require('node:http');
-const { setupBrowser, requireBrowser, readFixture } = require('./helpers/launch');
+const CAPTURE = require('../js/helpers/capture_shims');
+const { setupBrowser, requireBrowser } = require('./helpers/launch');
+const { startBlankServer } = require('./helpers/blank_server');
 
-const SHIM = readFixture('microphone_stream/shim.js');
+const SHIM = CAPTURE.MICROPHONE;
 
 const browser = setupBrowser();
 
@@ -47,19 +47,9 @@ function makeWavDataUrl({ seconds = 0.25, freq = 440, rate = 44100 } = {}) {
   return 'data:audio/wav;base64,' + buf.toString('base64');
 }
 
-function startServer() {
-  return new Promise((resolve) => {
-    const server = http.createServer((_req, res) => {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<!doctype html><html><head></head><body></body></html>');
-    });
-    server.listen(0, '127.0.0.1', () => resolve(server));
-  });
-}
-
 // Boots a page with the shim installed and the bridge answering `decision`.
 async function openPage(decision) {
-  const server = await startServer();
+  const server = await startBlankServer();
   const { port } = server.address();
   const page = await browser.browser.newPage();
   await page.evaluateOnNewDocument((d) => {
@@ -155,7 +145,7 @@ test('virtual microphone plays the picked clip and keeps looping', async (t) => 
   }
 });
 
-test('no OS capture is involved: the page never holds a microphone permission',
+test('virtual mode involves no OS capture: the permission state never moves',
   async (t) => {
     if (!requireBrowser(browser, t)) return;
     const { page, server } = await openPage({

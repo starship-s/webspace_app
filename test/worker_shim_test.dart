@@ -9,6 +9,7 @@ import 'package:webspace/services/user_agent_classifier.dart';
 import 'package:webspace/services/user_agent_identity_shim.dart';
 import 'package:webspace/services/worker_shim.dart';
 import 'package:webspace/settings/location.dart';
+import 'package:webspace/services/page_js.dart';
 
 /// Strip JS comments so a structural check inspects code, not prose (the shim
 /// sources legitimately discuss `window.inner*` in comments).
@@ -28,14 +29,16 @@ void main() {
       'ua_identity':
           buildUserAgentIdentityShim(buildFirefoxAndroidUserAgent('152.0'))!,
       'anti_fingerprinting': buildAntiFingerprintingShim('seed'),
-      'location_timezone': LocationSpoofService.buildScript(
-        locationMode: LocationMode.off,
-        spoofLatitude: null,
-        spoofLongitude: null,
-        spoofAccuracy: 50.0,
-        spoofTimezone: 'UTC',
-        webRtcPolicy: WebRtcPolicy.disabled,
-      ),
+      'webgl_kill_switch': PageJs.webGlKillSwitch.script,
+      'location_timezone': LocationSpoofService.buildScript((
+        mode: LocationMode.off,
+        latitude: null,
+        longitude: null,
+        accuracy: 50.0,
+        timezone: 'UTC',
+        granularity: LocationGranularity.gps,
+        webRtc: WebRtcPolicy.disabled,
+      )),
     };
 
     for (final entry in workerScopeShims.entries) {
@@ -57,6 +60,21 @@ void main() {
         }
       });
     }
+  });
+
+  // Every Intl constructor the language shim wraps takes the native
+  // prototype, so each needs its `constructor` re-pointed or
+  // `Intl.NumberFormat.prototype.constructor` formats in the OS locale.
+  group('language shim wrapper prototypes (BUG-009)', () {
+    test('re-points the wrapped constructor', () {
+      final shim = buildLanguageShim('fr-FR');
+      expect(shim, contains('Wrapped.prototype = Native.prototype'));
+      expect(
+        shim,
+        contains("Object.defineProperty(Wrapped.prototype, 'constructor'"),
+      );
+      expect(shim, contains('value: Wrapped'));
+    });
   });
 
   group('buildWorkerShimScript', () {
@@ -104,9 +122,118 @@ void main() {
       expect(script, contains('_wrapped.get(key)'));
     });
 
+    // BUG-009 / WORK-007: taking `Real.prototype` also inherits its own
+    // `constructor`, so without the re-point
+    // `new (Worker.prototype.constructor)('probe.js')` reaches the real
+    // constructor and produces a worker the payload never loaded into.
+    test('the Worker patch re-points prototype.constructor', () {
+      final script = buildWorkerShimScript([buildLanguageShim('en')])!;
+      expect(script, contains('Patched.prototype = Real.prototype'));
+      expect(
+        script,
+        contains("Object.defineProperty(Patched.prototype, 'constructor'"),
+      );
+      expect(script, contains('value: Patched'));
+    });
+
+    test('the nested-worker payload carries the same re-point', () {
+      final script = buildWorkerShimScript([buildLanguageShim('en')])!;
+      // The installer definition appears twice: once verbatim for the page,
+      // once JSON-encoded inside PAYLOAD for the worker that re-installs it.
+      // A fix applied only to the page half would show up once.
+      final occurrences = RegExp(
+        r"Object\.defineProperty\(Patched\.prototype, 'constructor'",
+      ).allMatches(script).length;
+      expect(occurrences, equals(2),
+          reason: 'the re-point must live in _installerDefinition so a '
+              'worker-spawned worker inherits it');
+    });
+
+    // WORK-006: nothing is asked of the CSP up front. A document that never
+    // builds a worker never breaks the policy, which is the only way a page
+    // can learn what it says.
+    test('installs no worker of its own', () {
+      final script = buildWorkerShimScript([buildLanguageShim('en')])!;
+      expect(script, isNot(contains('postMessage(1);close();')),
+          reason: 'a throwaway probe worker announces the app to every site '
+              'on every load, whether or not the page wanted a worker');
+    });
+
+    // A wrapper handed out before the answer is known is refused with nothing
+    // left to fall open on, so both kinds carry a rescue until blob: workers
+    // are known to run here. A worker running the payload is itself that
+    // proof, which is why the nested install starts answered and arms nothing.
+    test('both worker kinds are armed until the answer is known', () {
+      final script = buildWorkerShimScript([buildLanguageShim('en')])!;
+      expect(script, contains('var _blobProven = !watchCsp;'));
+      expect(script, contains("if (name === 'Worker') armRescue(Real, w, script, options);"));
+      expect(script, contains('else armSharedRescue(Real, w, script, options);'));
+    });
+
     test('builder appends no evaluator tail (the call site owns that)', () {
       final script = buildWorkerShimScript([buildLanguageShim('en')])!;
-      expect(script.trimRight().endsWith('})();'), isTrue);
+      expect(script.trimRight(), endsWith(');'));
+      expect(script.trimRight(), isNot(endsWith(';null;')));
     });
+  });
+
+  // WORK-006 again, at the call site this time. The location shim is built
+  // for every site in every mode, so feeding it to the payload unconditionally
+  // put the blob wrapper (and the CSP violation its first worker pays for) on
+  // every site — including ones whose worker half is a no-op. Only the
+  // timezone override survives worker scope, so only a site that has one is
+  // spoofing anything there.
+  group('WORK-006: the location shim reaches workers only for a timezone', () {
+    test('a zone-less site propagates nothing', () {
+      expect(LocationSpoofService.affectsWorkerScope(null), isFalse);
+      expect(LocationSpoofService.affectsWorkerScope(''), isFalse);
+      expect(LocationSpoofService.affectsWorkerScope('Europe/Paris'), isTrue);
+    });
+
+    test('the zone-less payload is inert in worker scope', () {
+      final shim = LocationSpoofService.buildScript((
+        mode: LocationMode.off,
+        latitude: null,
+        longitude: null,
+        accuracy: 50.0,
+        timezone: null,
+        granularity: LocationGranularity.gps,
+        webRtc: WebRtcPolicy.defaultPolicy,
+      ));
+      expect(shim, contains('"timezone":null'));
+      // Geolocation is absent from WorkerNavigator and WebRTC is gated on
+      // !IS_WORKER, so with TZ off nothing below applies there.
+      expect(shim, contains('if (TZ) {'));
+      expect(shim, contains('if (!IS_WORKER && WRTC'));
+      expect(shim, contains('&& navigator.geolocation) {'));
+    });
+
+    ScopedShims scoped({String? timezone, String? language}) => (
+          webGl: null,
+          antiFingerprinting: null,
+          identity: null,
+          location: 'LOCATION',
+          timezone: timezone,
+          language: language,
+        );
+
+    test('the worker payload carries the location shim only with a zone', () {
+      expect(workerScopeBodies(scoped()), isEmpty,
+          reason: 'an unguarded add puts the blob wrapper on every site');
+      expect(buildWorkerShimScript(workerScopeBodies(scoped())), isNull);
+      expect(workerScopeBodies(scoped(timezone: 'UTC')), ['LOCATION']);
+    });
+  });
+
+  test('worker bodies keep page-injection order', () {
+    final bodies = workerScopeBodies((
+      webGl: 'A',
+      antiFingerprinting: 'B',
+      identity: 'C',
+      location: 'D',
+      timezone: 'Asia/Tokyo',
+      language: 'E',
+    ));
+    expect(bodies, ['A', 'B', 'C', 'D', 'E']);
   });
 }

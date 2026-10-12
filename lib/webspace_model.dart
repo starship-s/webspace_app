@@ -2,12 +2,11 @@ import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
 
-// Special ID for the "All" webspace that contains all sites
 const String kAllWebspaceId = '__all_webspace__';
 
 class Webspace {
-  String id; // Unique identifier for the webspace
-  String name; // Display name for the webspace
+  String id;
+  String name;
   /// Persisted membership by `siteId`, ordered by display order.
   /// Single source of truth: archive open/close, app-tier index
   /// reshuffling from add/delete, and move-to-archive all preserve
@@ -34,7 +33,6 @@ class Webspace {
         siteIds = siteIds ?? <String>[],
         siteIndices = siteIndices ?? <int>[];
 
-  // Serialization methods
   Map<String, dynamic> toJson() => {
         'id': id,
         'name': name,
@@ -42,8 +40,9 @@ class Webspace {
       };
 
   factory Webspace.fromJson(Map<String, dynamic> json) {
-    final rawSiteIds = json['siteIds'] as List<dynamic>?;
-    final legacyIndices = json['siteIndices'] as List<dynamic>?;
+    final rawSiteIds = json['siteIds'] is List ? json['siteIds'] as List : null;
+    final legacyIndices =
+        json['siteIndices'] is List ? json['siteIndices'] as List : null;
     // Legacy migration: old persisted form used positional `siteIndices`
     // (master schema). New form uses `siteIds` as source of truth. We
     // tolerate either or neither — `_loadWebspaces` wraps this in try/
@@ -53,14 +52,13 @@ class Webspace {
     // `_migrateLegacyWebspaceIndices` in main.dart promotes it to
     // siteIds once `_webViewModels` is loaded.
     return Webspace(
-      id: json['id'] as String?,
-      name: json['name'] as String? ?? 'Untitled',
+      id: json['id'] is String ? json['id'] as String : null,
+      name: json['name'] is String ? json['name'] as String : 'Untitled',
       siteIds: rawSiteIds?.whereType<String>().toList(),
       siteIndices: legacyIndices?.whereType<int>().toList(),
     );
   }
 
-  // Create a copy of this webspace with updated fields
   Webspace copyWith({
     String? id,
     String? name,
@@ -77,10 +75,8 @@ class Webspace {
     );
   }
 
-  // Check if this is the special "All" webspace
   bool get isAll => id == kAllWebspaceId;
 
-  // Factory method to create the "All" webspace
   factory Webspace.all() {
     return Webspace(
       id: kAllWebspaceId,

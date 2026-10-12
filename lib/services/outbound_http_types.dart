@@ -6,8 +6,10 @@
 
 import 'package:http/http.dart' as http;
 
-import 'package:webspace/settings/global_outbound_proxy.dart';
+import 'package:webspace/services/tor_engine.dart';
+import 'package:webspace/services/global_outbound_proxy.dart';
 import 'package:webspace/settings/proxy.dart';
+import 'package:webspace/services/proxy_library.dart';
 
 /// Resolve the effective proxy for a per-site outbound call.
 ///
@@ -17,14 +19,97 @@ import 'package:webspace/settings/proxy.dart';
 /// site I haven't customized should also go through it." When the per-site
 /// type is anything else, the site's own settings win.
 ///
+/// What a setting takes from the proxy library (a saved proxy, a saved
+/// gateway, saved credentials), on the site or on the global, is resolved
+/// here (PROXY-030). A reference that resolves to nothing comes back SAVED
+/// with no address and fails closed downstream; it never falls through to
+/// the global, which is a route the user did not pick for that site.
+///
 /// Apply this at every per-site outbound seam — Dart-side HTTP *and* the
 /// native webview proxy — so a site set to DEFAULT doesn't silently bypass
 /// the global proxy in either direction.
-UserProxySettings resolveEffectiveProxy(UserProxySettings perSite) {
+/// [siteId] only affects [ProxyType.TOR]: it becomes the SOCKS5
+/// stream-isolation tag, so each site rides its own circuit. A site left on
+/// DEFAULT that inherits a global TOR gets the app-global tag instead of its
+/// own — inheriting the app's default proxy is not the same request as
+/// opting into per-site isolation, and conflating them would hand every
+/// uncustomized site a circuit of its own (PROXY-011). Null names no site:
+/// app-global traffic, or settings that already carry their tag
+/// (`WebViewModel.outboundProxySettings`).
+UserProxySettings resolveEffectiveProxy(
+  UserProxySettings perSite, {
+  required String? siteId,
+}) {
   if (perSite.type == ProxyType.DEFAULT) {
-    return GlobalOutboundProxy.current;
+    final global = resolveLibraryProxy(GlobalOutboundProxy.current);
+    return global.type == ProxyType.TOR
+        ? _torTagged(global, siteId: kTorAppGlobalTag)
+        : global;
   }
-  return perSite;
+  if (perSite.type == ProxyType.TOR) return _torTagged(perSite, siteId: siteId);
+  return resolveLibraryProxy(perSite);
+}
+
+/// Stamp the isolation tag into `username`, where the SOCKS5 expansion later
+/// reads it. Carrying the tag on the settings object keeps `clientFor` a
+/// one-argument function all the way down.
+/// Precedence: an explicit [siteId] from the call site, else a tag the
+/// settings object already carries (WebViewModel stamps its `siteId` there
+/// so the ~15 places that pass `model.proxySettings` straight through don't
+/// each have to thread an id), else app-global.
+UserProxySettings _torTagged(UserProxySettings s, {required String? siteId}) {
+  final existing = s.username;
+  final tag = (siteId != null && siteId.isNotEmpty)
+      ? siteId
+      : (existing != null && existing.isNotEmpty)
+          ? existing
+          : kTorAppGlobalTag;
+  return UserProxySettings(
+    type: ProxyType.TOR,
+    address: s.address,
+    username: tag,
+    password: null,
+    // The pin rides the effective settings so a site left on DEFAULT that
+    // inherits a global Tor inherits the global's country too, rather than
+    // reading as unpinned and evicting every pinned neighbour (TOR-014).
+    torExitCountry: s.torExitCountry,
+  );
+}
+
+/// Split a `host:port` proxy address, or null if it is not one.
+///
+/// Splits on the LAST colon so a bracketed IPv6 literal (`[::1]:8080`)
+/// keeps its host. Both per-site proxy mechanisms, the native per-WebView
+/// binding and the Android router's route table, parse addresses through
+/// here, so they cannot disagree on IPv6.
+({String host, int port})? splitProxyAddress(String? address) {
+  if (address == null || address.isEmpty) return null;
+  final separator = address.lastIndexOf(':');
+  if (separator <= 0) return null;
+  final host = address.substring(0, separator);
+  if (host.isEmpty) return null;
+  final port = int.tryParse(address.substring(separator + 1));
+  if (port == null || port < 1 || port > 65535) return null;
+  return (host: host, port: port);
+}
+
+/// Expands a tagged [ProxyType.TOR] into live SOCKS5 settings, or returns
+/// null when the runtime is not up.
+typedef TorProxyResolver = UserProxySettings? Function(String isolationTag);
+
+/// Installed once at startup from `TorService`. Left null, every TOR request
+/// blocks — which is the correct default: a missing resolver must never mean
+/// "connect directly" (TOR-008).
+TorProxyResolver? torProxyResolver;
+
+/// Shared TOR expansion for both outbound seams (Dart HTTP and the native
+/// webview). Null means block.
+UserProxySettings? expandTorProxy(UserProxySettings settings) {
+  if (settings.type != ProxyType.TOR) return settings;
+  final tag = (settings.username == null || settings.username!.isEmpty)
+      ? kTorAppGlobalTag
+      : settings.username!;
+  return torProxyResolver?.call(tag);
 }
 
 /// Result of asking the [OutboundHttpFactory] to build a client honoring a
@@ -90,3 +175,13 @@ abstract class OutboundHttpFactory {
   if (port == null || port <= 0 || port > 65535) return null;
   return (host, port);
 }
+
+/// TOR-008: whether a site's webview must wait for the Tor runtime. Resolves
+/// DEFAULT through the global proxy (PROXY-011), so a site that inherits a
+/// global Tor is gated exactly like one that opted into Tor itself.
+bool waitsForTor(
+  UserProxySettings perSite, {
+  String? siteId,
+  required bool torUp,
+}) =>
+    !torUp && resolveEffectiveProxy(perSite, siteId: siteId).type == ProxyType.TOR;

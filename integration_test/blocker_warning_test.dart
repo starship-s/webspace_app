@@ -32,8 +32,9 @@ import 'package:webspace/screens/settings.dart';
 import 'package:webspace/screens/site_privacy.dart';
 import 'package:webspace/services/adblock_engine.dart';
 import 'package:webspace/services/content_blocker_service.dart';
-import 'package:webspace/services/webview.dart';
 import 'package:webspace/web_view_model.dart';
+import 'package:webspace/widgets/stat_chip.dart';
+import 'package:webspace/services/cookie_manager.dart';
 
 void main() {
   IntegrationTestWidgetsFlutterBinding.ensureInitialized();
@@ -45,7 +46,7 @@ void main() {
   setUp(ContentBlockerService.instance.reset);
   tearDown(ContentBlockerService.instance.reset);
 
-  Future<void> pump(WidgetTester tester, Widget home) async {
+  Future<void> pump(WidgetTester tester, {required Widget home}) async {
     await tester.pumpWidget(MaterialApp(
       localizationsDelegates: AppLocalizations.localizationsDelegates,
       supportedLocales: AppLocalizations.supportedLocales,
@@ -87,48 +88,49 @@ void main() {
         reason: 'the Privacy row must open the Privacy screen');
   }
 
-  Future<Finder> revealTile(WidgetTester tester, String title) async {
-    final tile = find.descendant(
-      of: find.byType(SitePrivacyScreen),
-      matching: find.widgetWithText(SwitchListTile, title),
-    );
-    // Scope to the Privacy screen's own ListView: the pushed route leaves
-    // the settings ListView in the tree underneath, and a bare
-    // find.byType(Scrollable).first can also land on a nested horizontal
-    // scrollable and scroll the wrong axis forever.
-    final listScrollable = find
-        .descendant(
-            of: find.byType(SitePrivacyScreen), matching: find.byType(Scrollable))
-        .first;
-    await tester.scrollUntilVisible(tile, 200, scrollable: listScrollable);
-    await tester.pumpAndSettle();
-    return tile;
-  }
+Future<Finder> revealTile(WidgetTester tester, {required String title}) async {
+  final tile = find.descendant(
+    of: find.byType(SitePrivacyScreen),
+    matching: find.widgetWithText(SwitchListTile, title),
+  );
+  // Scope to the Privacy screen's own ListView: the pushed route leaves
+  // the settings ListView in the tree underneath, and a bare
+  // find.byType(Scrollable).first can also land on a nested horizontal
+  // scrollable and scroll the wrong axis forever.
+  final listScrollable = find
+      .descendant(
+          of: find.byType(SitePrivacyScreen), matching: find.byType(Scrollable))
+      .first;
+  await tester.scrollUntilVisible(tile, 200, scrollable: listScrollable);
+  await tester.pumpAndSettle();
+  return tile;
+}
 
   /// Taps the row's title text rather than the tile's centre. Both toggle
   /// the switch (the text has no gesture of its own, so the tap falls
   /// through to the ListTile), but the centre is not always the tile: the
   /// title carries a hint button, and how far along the row it sits depends
   /// on the rendered width of the title.
-  Future<void> tapTile(WidgetTester tester, Finder tile, String title) async {
-    await tester.tap(find.descendant(of: tile, matching: find.text(title)));
-    await tester.pump();
-  }
+Future<void> tapTile(WidgetTester tester,
+    {required Finder tile, required String title}) async {
+  await tester.tap(find.descendant(of: tile, matching: find.text(title)));
+  await tester.pump();
+}
 
   final warnIcon = find.byIcon(Icons.warning_amber_rounded);
   final warnSnack = find.textContaining('has no data downloaded yet');
 
   testWidgets('enabling unconfigured Content Blocker warns and flips',
       (tester) async {
-    await pump(tester, SettingsScreen(webViewModel: freshModel()));
+    await pump(tester, home: SettingsScreen(webViewModel: freshModel()));
     await openPrivacy(tester);
     expect(warnIcon, findsNothing);
 
-    final tile = await revealTile(tester, 'Content Blocker');
+    final tile = await revealTile(tester, title: 'Content Blocker');
     expect(find.descendant(of: tile, matching: find.text('Not configured')),
         findsOneWidget);
 
-    await tapTile(tester, tile, 'Content Blocker');
+    await tapTile(tester, tile: tile, title: 'Content Blocker');
 
     expect(tester.widget<SwitchListTile>(tile).value, isTrue);
     expect(warnSnack, findsOneWidget);
@@ -137,11 +139,11 @@ void main() {
 
   testWidgets('enabling unconfigured DNS blocklist warns and flips',
       (tester) async {
-    await pump(tester, SettingsScreen(webViewModel: freshModel()));
+    await pump(tester, home: SettingsScreen(webViewModel: freshModel()));
     await openPrivacy(tester);
 
-    final tile = await revealTile(tester, 'DNS Blocklist');
-    await tapTile(tester, tile, 'DNS Blocklist');
+    final tile = await revealTile(tester, title: 'DNS Blocklist');
+    await tapTile(tester, tile: tile, title: 'DNS Blocklist');
 
     expect(tester.widget<SwitchListTile>(tile).value, isTrue);
     expect(warnSnack, findsOneWidget);
@@ -150,11 +152,11 @@ void main() {
 
   testWidgets('enabling Tracking Protection warns for both forced deps',
       (tester) async {
-    await pump(tester, SettingsScreen(webViewModel: freshModel()));
+    await pump(tester, home: SettingsScreen(webViewModel: freshModel()));
     await openPrivacy(tester);
 
-    final tile = await revealTile(tester, 'Tracking Protection');
-    await tapTile(tester, tile, 'Tracking Protection');
+    final tile = await revealTile(tester, title: 'Tracking Protection');
+    await tapTile(tester, tile: tile, title: 'Tracking Protection');
 
     expect(warnSnack, findsOneWidget);
     expect(find.textContaining('DNS Blocklist, Content Blocker'),
@@ -164,7 +166,7 @@ void main() {
     // ETP one and the forced-subtitle join on the DNS tile).
     expect(find.descendant(of: tile, matching: warnIcon), findsOneWidget);
 
-    final dnsTile = await revealTile(tester, 'DNS Blocklist');
+    final dnsTile = await revealTile(tester, title: 'DNS Blocklist');
     expect(find.descendant(of: dnsTile, matching: warnIcon), findsOneWidget);
     expect(
         find.descendant(
@@ -190,20 +192,21 @@ void main() {
     expect(svc.engineBlockedSinceTimingOn, 5);
     expect(svc.engineAllowedSinceTimingOn, 1);
 
-    await pump(tester, DevToolsScreen(cookieManager: CookieManager()));
+    await pump(tester, home: DevToolsScreen(cookieManager: CookieManager()));
 
     // host == null and engine active: the ABP tab is first and selected.
-    String chip(String label, String value) => '$label $value';
-    for (final expected in [
-      chip('blocked', '5'),
-      chip('allowed', '1'),
-      chip('consulted', '6'),
+    for (final (label, value) in [
+      ('blocked', '5'),
+      ('allowed', '1'),
+      ('consulted', '6'),
     ]) {
       expect(
-          find.byWidgetPredicate((w) =>
-              w is RichText && w.text.toPlainText() == expected),
+          find.descendant(
+              of: find.byWidgetPredicate(
+                  (w) => w is StatChip && w.label == label),
+              matching: find.text(value)),
           findsOneWidget,
-          reason: 'ABP tab should render "$expected"');
+          reason: 'ABP tab should show $value over "$label"');
     }
     // The native drain produced one untimed sample row for the host.
     expect(find.text('ads.example.net'), findsOneWidget);

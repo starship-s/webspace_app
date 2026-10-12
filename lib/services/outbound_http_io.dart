@@ -1,6 +1,5 @@
-// dart:io half of the outbound HTTP seam. Unchanged from when this was one
-// file: the native proxy, SOCKS5 and certificate-pinning behaviour must not
-// vary because the web target exists.
+// dart:io half of the outbound HTTP seam. The native proxy, SOCKS5 and
+// certificate-pinning behaviour must not vary because the web target exists.
 
 import 'dart:io';
 
@@ -12,11 +11,15 @@ import 'package:webspace/services/outbound_http_types.dart';
 import 'package:webspace/services/trusted_hosts_service.dart';
 import 'package:webspace/services/trusted_hosts_x509.dart';
 import 'package:webspace/settings/proxy.dart';
+import 'package:webspace/services/proxy_library.dart';
 
 /// Default factory backed by `dart:io`'s [HttpClient].
 ///
 /// - DEFAULT  → direct client (system proxy, if any, is honored by dart:io)
-/// - HTTP/HTTPS → [HttpClient.findProxy] override pointing at the host:port
+/// - HTTP     → [HttpClient.findProxy] override pointing at the host:port
+/// - HTTPS    → the same, over a TLS session to the proxy: `findProxy` alone
+///            makes dart:io write `CONNECT` and `Proxy-Authorization` on a
+///            plain socket before any handshake (LEAK-008)
 /// - SOCKS5  → connection factory tunnels every request via the
 ///            [socks5_proxy] package; the SOCKS5 server resolves the
 ///            destination hostname, so the user's local resolver never
@@ -26,6 +29,22 @@ class DefaultOutboundHttpFactory implements OutboundHttpFactory {
 
   @override
   OutboundClient clientFor(UserProxySettings settings) {
+    // Callers that hand over the app-wide proxy as stored, without going
+    // through `resolveEffectiveProxy`, still reach what it names in the
+    // proxy library. A resolved route names nothing, so this runs once.
+    if (settings.type == ProxyType.SAVED ||
+        settings.type == ProxyType.GATEWAY ||
+        settings.credentialsId != null) {
+      final route = resolveLibraryProxy(settings);
+      if (route.type == ProxyType.SAVED) {
+        return const OutboundClientBlocked(
+          'The saved proxy, gateway or credentials this setting names no '
+          'longer exist or do not fit together. Outbound request blocked to '
+          'avoid leaking the device IP via a direct fallback.',
+        );
+      }
+      return clientFor(route);
+    }
     switch (settings.type) {
       case ProxyType.DEFAULT:
         return OutboundClientReady(IOClient(_newHttpClient()));
@@ -46,21 +65,33 @@ class DefaultOutboundHttpFactory implements OutboundHttpFactory {
             'avoid leaking the device IP via a direct fallback.',
           );
         }
-        final inner = _newHttpClient();
-        inner.findProxy = (uri) {
-          final host = uri.host.toLowerCase();
-          if (_isLocalhost(host)) return 'DIRECT';
-          return 'PROXY $addr';
-        };
-        if (settings.hasCredentials) {
-          inner.addProxyCredentials(
-            hostPort.$1,
-            hostPort.$2,
-            '',
-            HttpClientBasicCredentials(settings.username!, settings.password!),
+        return _httpProxyClient(
+          settings,
+          addr: addr,
+          hostPort: hostPort,
+          tls: settings.type == ProxyType.HTTPS,
+        );
+
+      case ProxyType.TOR:
+        // TOR carries no address of its own; it expands at use-time into
+        // the loopback SOCKS5 endpoint plus this caller's isolation tag.
+        // A null expansion means the runtime is not up, and the only safe
+        // answer is to block: falling through to SOCKS5-with-no-address or
+        // to a direct client would put the request on the device IP, which
+        // is the exact thing the user turned Tor on to prevent (TOR-008).
+        final tor = expandTorProxy(settings);
+        if (tor == null) {
+          return const OutboundClientBlocked(
+            'Tor is not bootstrapped yet. Outbound request blocked to avoid '
+            'leaking the device IP via a direct fallback.',
           );
         }
-        return OutboundClientReady(IOClient(inner));
+        return clientFor(tor);
+
+      case ProxyType.SAVED:
+      case ProxyType.GATEWAY:
+        // Resolved above; unreachable.
+        return const OutboundClientBlocked('Unresolved proxy library route.');
 
       case ProxyType.SOCKS5:
         final addr = settings.address;
@@ -96,11 +127,62 @@ class DefaultOutboundHttpFactory implements OutboundHttpFactory {
   /// the moment any non-webview code touched the same site.
   static HttpClient _newHttpClient() {
     final client = HttpClient();
-    client.badCertificateCallback = _isTrustedBadCert;
+    client.badCertificateCallback = (cert, host, port) =>
+        _isTrustedBadCert(cert, host: host, port: port);
     return client;
   }
 
-  static bool _isTrustedBadCert(X509Certificate cert, String host, int port) {
+  /// [http.Client] routed through the HTTP proxy at [addr]. With [tls] the
+  /// hop to the proxy is a TLS session: the factory hands dart:io a
+  /// `SecureSocket` to the proxy, so `CONNECT` and the Basic credentials go
+  /// out inside it, and dart:io nests the origin's own TLS through the
+  /// tunnel as it would over a plain socket. The proxy's certificate is
+  /// checked against system trust, or a fingerprint the user pinned.
+  static OutboundClient _httpProxyClient(
+    UserProxySettings settings, {
+    required String addr,
+    required (String, int) hostPort,
+    required bool tls,
+  }) {
+    final inner = _newHttpClient();
+    inner.findProxy = (uri) {
+      final host = uri.host.toLowerCase();
+      if (_isLocalhost(host)) return 'DIRECT';
+      return 'PROXY $addr';
+    };
+    if (settings.hasCredentials) {
+      inner.addProxyCredentials(
+        hostPort.$1,
+        hostPort.$2,
+        '',
+        HttpClientBasicCredentials(settings.username!, settings.password!),
+      );
+    }
+    if (tls) {
+      inner.connectionFactory = (uri, proxyHost, proxyPort) {
+        if (proxyHost == null || proxyPort == null) {
+          return uri.scheme == 'https'
+              ? SecureSocket.startConnect(
+                  uri.host,
+                  uri.port,
+                  onBadCertificate: (cert) =>
+                      _isTrustedBadCert(cert, host: uri.host, port: uri.port),
+                )
+              : Socket.startConnect(uri.host, uri.port);
+        }
+        return SecureSocket.startConnect(
+          proxyHost,
+          proxyPort,
+          onBadCertificate: (cert) =>
+              _isTrustedBadCert(cert, host: proxyHost, port: proxyPort),
+        );
+      };
+    }
+    return OutboundClientReady(IOClient(inner));
+  }
+
+  static bool _isTrustedBadCert(X509Certificate cert,
+      {required String host, required int port}) {
     return TrustedHostsService.instance.isTrusted(
       host: host,
       port: port,
@@ -158,30 +240,31 @@ class DefaultOutboundHttpFactory implements OutboundHttpFactory {
             fingerprint: fingerprintFromX509(cert),
           ),
         );
-        return ConnectionTask.fromSocket(
-          secure,
-          () async => (await secure).close().ignore(),
-        );
+        return _cancellableConnect(secure);
       }
-      return ConnectionTask.fromSocket(
-        socket,
-        () async => (await socket).close().ignore(),
-      );
+      return _cancellableConnect(socket);
     };
     return OutboundClientReady(IOClient(inner));
   }
 }
 
+/// A SOCKS5 connect cannot be aborted mid-handshake, so cancelling it only
+/// marks it, and a socket that arrives after the cancel is destroyed on
+/// arrival. Errors stay on the one future dart:io observes: an `onCancel` that
+/// awaited the connect again gave a refused connect (Tor's `ttlExpired`) a
+/// second, unobserved future to escape through.
+ConnectionTask<S> _cancellableConnect<S extends Socket>(Future<S> connect) {
+  var cancelled = false;
+  final socket = connect.then((s) {
+    if (cancelled) s.destroy();
+    return s;
+  });
+  return ConnectionTask.fromSocket(socket, () => cancelled = true);
+}
+
 /// Whether [host] looks like an IPv4 / IPv6 literal — i.e. safe to pass
 /// directly to [InternetAddress] without a DNS lookup.
-bool _isIpLiteral(String host) {
-  try {
-    InternetAddress(host);
-    return true;
-  } catch (_) {
-    return false;
-  }
-}
+bool _isIpLiteral(String host) => InternetAddress.tryParse(host) != null;
 
 bool _isLocalhost(String host) {
   return host == 'localhost' || host == '127.0.0.1' || host == '::1';

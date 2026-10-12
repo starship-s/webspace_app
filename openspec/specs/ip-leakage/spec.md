@@ -61,6 +61,13 @@ precedence ladder: **explicit per-site override → app-global outbound proxy
 → system / direct**. The implementation lives in `resolveEffectiveProxy`
 in [`lib/services/outbound_http.dart`](../../lib/services/outbound_http.dart).
 
+The proxy library (PROXY-030) SHALL be resolved on whichever rung uses it: a
+site on a saved proxy or gateway takes it as its explicit override, and an
+app-wide proxy on one hands it to every DEFAULT site. A reference that does
+not resolve (a missing entry, or credentials paired with a gateway they do
+not list) SHALL stop the ladder there and fail closed; it SHALL NOT fall to
+the next rung.
+
 #### Scenario: Per-site DEFAULT inherits global
 
 **Given** the app-global outbound proxy is `HTTP 10.0.0.1:8080`
@@ -82,6 +89,21 @@ in [`lib/services/outbound_http.dart`](../../lib/services/outbound_http.dart).
 **And** site "Acme" has proxy type `DEFAULT`
 **When** the webview for "Acme" is created or reconfigured
 **Then** `ProxyController.setProxyOverride` is invoked with `HTTP 10.0.0.1:8080`
+
+#### Scenario: A saved proxy is the site's explicit override
+
+**Given** a saved proxy "Work VPN", `SOCKS5 10.8.0.1:1080`
+**And** site "Acme" names "Work VPN"
+**When** a per-site outbound call originates from "Acme"
+**Then** the call routes through `SOCKS5 10.8.0.1:1080`
+
+#### Scenario: A reference that does not resolve does not fall to the global
+
+**Given** the app-global outbound proxy is `HTTP 10.0.0.1:8080`
+**And** site "Acme" uses a saved gateway that no longer exists
+**When** a per-site outbound call originates from "Acme"
+**Then** the call is blocked
+**And** nothing is sent through `HTTP 10.0.0.1:8080` or direct
 
 ---
 
@@ -109,6 +131,35 @@ a recording fake (see `test/outbound_http_test.dart` and
 runs
 **Then** the recording fake observes `clientFor(HTTP 10.0.0.1:8080)`
 
+#### Scenario: Favicon bytes are rendered from the proxied client
+
+**Given** site "Acme" has proxy `HTTP 10.0.0.1:8080`
+**And** the winning favicon URL for "Acme" points at a host the page chose
+**When** the drawer, tab strip or site list renders that favicon
+**Then** the recording fake observes `clientFor(HTTP 10.0.0.1:8080)`
+**And** the image widget issues no HTTP request of its own
+
+#### Scenario: Blocked client renders the fallback icon
+
+**Given** site "Acme" has a proxy the factory cannot honor
+**When** its favicon is rendered
+**Then** the placeholder gives way to the fallback icon
+**And** no direct (unproxied) request is made for the icon
+
+#### Scenario: Timezone dataset download passes global proxy
+
+**Given** the app-global outbound proxy is `HTTP 10.0.0.1:8080`
+**When** the user taps "Download timezone data"
+**Then** the recording fake observes `clientFor(HTTP 10.0.0.1:8080)`
+**And** a `Blocked` result aborts the download and returns false
+
+#### Scenario: User-script editor download passes the site proxy
+
+**Given** the user saves a script whose URL source has not been fetched yet
+**When** the editor downloads that URL
+**Then** the recording fake observes the site's resolved proxy
+**And** a `Blocked` result surfaces its reason instead of downloading
+
 #### Scenario: OSM map tiles pass global proxy
 
 **Given** the app-global outbound proxy is `HTTP 10.0.0.1:8080`
@@ -116,6 +167,39 @@ runs
 **Then** the picker constructs a `NetworkTileProvider` whose `httpClient`
 came from `outboundHttp.clientFor(HTTP 10.0.0.1:8080)`
 **And** every subsequent tile request goes through that client
+
+#### Scenario: Media-session artwork passes the site proxy
+
+**Given** site "Acme" has proxy `HTTP 10.0.0.1:8080`
+**And** its page reports playback with an `artwork` URL
+**When** `MediaSessionService.report` fetches the artwork
+**Then** the recording fake observes `clientFor(HTTP 10.0.0.1:8080)`
+**And** a `Blocked` result drops the artwork and still raises the
+notification, rather than fetching direct
+
+#### Scenario: Page-title probe passes the resolved proxy
+
+**Given** the app-global outbound proxy is `SOCKS5 127.0.0.1:9050`
+**When** `getPageTitle` runs — from add-site, the title refresh in the site
+editor, the shortcut create-site path, or `LinkController._executeCreateSite`
+handling an inbound shared link
+**Then** the recording fake observes `clientFor(SOCKS5 127.0.0.1:9050)` for a
+site whose proxy is `DEFAULT`, and the site's own proxy otherwise
+**And** a `Blocked` result skips the title fetch and returns null
+
+**Because** the URL comes from a share intent or deep link on the
+`_executeCreateSite` path, so a direct `http.get` handed an
+attacker-authored host the device IP of a user who had configured Tor.
+
+#### Scenario: Artwork cannot be used to probe the local network
+
+**Given** a page reports playback with an `artwork` URL whose host is a
+loopback, RFC1918, unique-local or link-local literal (including
+`169.254.169.254`)
+**When** `MediaSessionService.report` runs
+**Then** no outbound client is requested and no request is made
+**Because** the URL is page-supplied and the media-session shim runs in
+every frame
 
 ---
 
@@ -126,6 +210,21 @@ Every Dart-side outbound seam SHALL route SOCKS5 traffic through the [`socks5_pr
 Webview navigation continues to use SOCKS5 via its native channel — the
 patched iOS / macOS plugins' `WKWebsiteDataStore.proxyConfigurations` and
 Android's `inapp.ProxyController` — independently of the Dart-side path.
+
+The native binding SHALL be verified by its effect rather than by the
+call that requests it: the plugin's settings parser discards a field it
+cannot see, so a webview can report a proxy it never bound (BUG-014). A
+site whose proxy refuses connections SHALL therefore never reach its
+origin.
+
+#### Scenario: A refused proxy does not become a direct load
+
+**Given** site "Acme" has proxy `SOCKS5 127.0.0.1:<closed port>`
+**And** the platform binds the proxy per WebView (iOS 17+ / macOS 14+)
+**When** the site loads a page served from a loopback origin
+**Then** the origin receives no request for it
+**And** an unproxied control load from the same harness does reach that
+origin, so a page that simply failed to load cannot pass for a bound proxy
 
 #### Scenario: SOCKS5 favicon fetch tunnels through the SOCKS5 server
 
@@ -155,11 +254,169 @@ tunnel
 
 ---
 
+### Requirement: LEAK-010 - An unprovable navigation is cancelled and said so
+
+A site whose effective proxy is not `DEFAULT` SHALL NOT issue a main-frame
+request the app cannot establish is proxied. Where coverage cannot be
+established the navigation SHALL be cancelled before any byte leaves the
+device, and the cancellation SHALL be made legible rather than left as a page
+that silently did not load.
+
+Coverage is decided by a pure engine
+([`ProxyCoverageEngine`](../../../lib/services/proxy_coverage_engine.dart))
+over the named binding of PROXY-027, never by a platform test at the call
+site. Under `ProxyBinding.processWide` the rule sits outside the WebView and
+catches every request it makes. Under `ProxyBinding.perSite` the proxy is
+written onto `WKWebsiteDataStore.proxyConfigurations` when the view is
+constructed and covers every navigation that store makes thereafter. **On
+both bindings, therefore, a configured proxy establishes coverage for every
+main-frame navigation**, and no navigation is cancelled by this requirement
+today.
+
+This used to distinguish them: under `perSite`, every post-mount navigation
+was unprovable and was cancelled, on a measurement that could not have
+read anything else (BUG-014 caution 2). Those readings are void. Every proxy arm behind them pointed its origins
+at an address of the test machine, which macOS routes over `lo0` and never
+proxies, so they read DIRECT whether or not the proxy was bound. Attempt 102
+remeasured against a destination the machine does not own and found the
+binding covers every navigation, at any distance from the first frame, on
+both store shapes and on a second navigation to a different origin. The gate
+was cancelling traffic the proxy was already carrying.
+
+The requirement is kept rather than withdrawn because the guarantee it states
+is the one that matters and the engine is where a future platform's answer
+belongs: if any binding is ever shown not to cover a navigation, this is the
+seam that fails it closed.
+
+The interstitial SHALL name the site, state that the navigation was blocked
+to avoid revealing the device IP, and name the destination it did not
+request. It SHALL offer exactly two actions: go back, and open this site's
+proxy settings. It SHALL NOT offer any way to make the request unproxied,
+and no setting, gesture or menu elsewhere may provide one.
+
+It SHALL NOT offer a retry either, and this is the same rule rather than a
+second one. Reopening the destination on a fresh WebView looks like the
+proxied way to reach it, and is not: the runs that establish the mount rule
+read `later-pair=0 of 2 proxied` for stores built after the app's first
+frame, against their own live `pair=2 of 2` control. An action that issues a
+direct request while naming the proxy is worse than no action, so the way
+out is back, or the setting that caused the block.
+
+`ProxyCoverage.established` for a mounting navigation is the claim the app
+already makes when it binds a store (PROXY-027) and not a stronger one made
+here. No affordance may be built on top of it.
+
+Copy SHALL NOT describe the proxy as having failed or the site as
+unreachable. Nothing was attempted: what the app could not do is establish
+that the request would be proxied, and so it did not make it. The gate is
+enforced by `test/unproxied_block_test.dart`.
+
+Every surface that advertises proxied status SHALL distinguish "a proxy is
+configured" from "this request went through it". The per-site proxy row
+carries the platform's coverage in its subtitle and the explanation behind
+its `HintButton`, per
+[settings-hints](../settings-hints/spec.md). No other surface in the app
+claims proxied status today; one added later inherits this requirement.
+
+Each block SHALL write one `LogService` entry under the `Proxy` tag at
+`LogSensitivity.sensitive`, the level proxy events already use, so it is
+visible in Developer Tools and never written to disk or to a shared export.
+
+Known gaps, tracked rather than hidden: the gate covers main-frame
+navigations, which are what an interstitial can stand in for. Sub-resource
+and subframe requests issued by an already-loaded page, and the captcha popup
+of CAPTCHA-010, are not gated by it; the popup mounts its own view, so its own
+first navigation is covered, and its later ones are not.
+
+A server redirect out of the mounting navigation is treated as post-mount and
+so as unprovable, which is the conservative reading and the costly one: a
+proxied site that redirects its landing page shows the interstitial on first
+open. Whether the platform's store carries the proxy across a redirect hop is
+a measurement BUG-014 has not made. It belongs to the coverage decision, not
+to this UI: when it is made, `isMountNavigation` is the one input that
+changes.
+
+That gap used to be stated far more widely, on the strength of BUG-014
+a reading of `later-pair=0 of 2 proxied` for stores built after
+the app's first frame. Those readings are void: every proxy arm pointed its
+origins at an address of the test machine, which macOS routes over `lo0` and
+never proxies, so they read DIRECT whether or not the proxy was bound.
+The remeasurement against a destination the machine does not own and
+found the per-store binding covers every navigation, at any frame, on both
+store shapes. A mounting navigation is covered, and so is what follows it.
+
+#### Scenario: A navigation that cannot be shown to be proxied is cancelled
+
+**Given** site "Acme" has proxy `SOCKS5 127.0.0.1:1080`
+**And** the platform's binding is per store
+**And** Acme's webview has already made its mounting navigation
+**When** the page navigates to `https://tracker.example.org/`
+**Then** the navigation is cancelled
+**And** `tracker.example.org` receives no connection, no TLS handshake and
+no DNS lookup from the device
+**And** the interstitial is rendered over the page, naming "Acme" and
+`tracker.example.org`
+**And** one `Proxy` log entry records the block
+
+#### Scenario: The interstitial offers no way to proceed unproxied
+
+**Given** the interstitial is on screen for a blocked destination
+**Then** it offers going back and this site's proxy settings
+**And** it offers nothing else, a retry included
+**And** dismissing it returns to the page the user was already on, which
+never navigated
+
+#### Scenario: A nested webview blocks identically
+
+**Given** a cross-domain link on "Acme" opened a nested `InAppWebViewScreen`
+**And** that screen has made its mounting navigation
+**When** the nested page navigates onwards
+**Then** the nested screen cancels it and renders the same interstitial
+**And** its proxy-settings action opens the parent site's proxy settings
+**And** it offers no retry there either
+
+#### Scenario: Routing to a nested webview is not itself a block
+
+**Given** site "Acme" has a non-DEFAULT proxy
+**When** a cross-domain link is followed and the routing decision hands it to
+a nested webview
+**Then** no interstitial is shown
+**And** the nested webview mounts on that destination, which its own proxy
+binding covers
+
+#### Scenario: A site on DEFAULT is unaffected
+
+**Given** site "Acme" has proxy `DEFAULT`
+**And** no app-global outbound proxy is set
+**When** the page navigates anywhere
+**Then** coverage is `notClaimed`
+**And** nothing is blocked and no interstitial is shown
+
+#### Scenario: A process-wide rule blocks nothing
+
+**Given** site "Acme" has proxy `SOCKS5 127.0.0.1:1080`
+**And** the platform's binding is process-wide
+**When** the page navigates anywhere, before or after the mounting
+navigation
+**Then** coverage is `established`
+**And** the navigation proceeds through the proxy
+
+#### Scenario: The proxy row does not claim more than the platform gives
+
+**Given** site "Acme" has a non-DEFAULT proxy
+**When** the user opens its proxy row in site settings
+**Then** the subtitle says whether the proxy covers every request or only the
+one each page is opened with
+**And** the explanation of what that means is behind the row's hint button,
+not in the subtitle
+
+---
+
 ### Requirement: LEAK-004 - Global outbound proxy persistence
 
 The app-global outbound proxy SHALL be persisted under the SharedPreferences
 key `globalOutboundProxy` as a JSON-encoded `UserProxySettings`. The key
-SHALL be registered in `kExportedAppPrefs` so it round-trips through
+SHALL be registered in `AppPref` so it round-trips through
 settings backup / restore. The in-memory cache (`GlobalOutboundProxy.current`)
 SHALL be initialized at app startup before any service that may emit
 outbound traffic runs.
@@ -202,10 +459,26 @@ The recommended posture for users behind a proxy is:
 - **`webRtcPolicy = disabled`** for sites that don't legitimately need
   WebRTC — neuters `RTCPeerConnection` entirely.
 
-#### Scenario: Default policy with proxy is a documented gap
+Tracking Protection applies the first of these for the user: on a site whose
+traffic resolves to a proxy under LEAK-001, a stored `defaultPolicy` runs as
+`relayOnly` while the umbrella is on ([ETP-031](../tracking-protection/spec.md)).
+The umbrella is on by default, so the gap below is left only to a site the
+user has taken out of Tracking Protection.
+
+#### Scenario: Tracking Protection closes the default-policy gap
 
 **Given** the user has configured a global SOCKS5 proxy
 **And** site "Acme" has `webRtcPolicy = defaultPolicy` (the default)
+**And** "Acme" has `trackingProtectionEnabled = true` (the default)
+**When** "Acme"'s page calls `RTCPeerConnection().createOffer()`
+**Then** the webview runs `relayOnly`, and the SDP carries only `typ relay`
+candidates
+
+#### Scenario: Default policy with proxy and no umbrella is a documented gap
+
+**Given** the user has configured a global SOCKS5 proxy
+**And** site "Acme" has `webRtcPolicy = defaultPolicy` (the default)
+**And** "Acme" has `trackingProtectionEnabled = false`
 **When** the user navigates to a STUN-fingerprinting page on "Acme"
 **Then** WebRTC may expose the device IP **— this is a known gap**
 **And** the per-site settings UI surfaces a hint encouraging
@@ -255,6 +528,19 @@ documented gap that the implementation already avoids leaking through.
 **Then** the destination hostname is sent through the SOCKS5 server
 **And** the local resolver is **not** asked to resolve it
 
+#### Scenario: Add-site preview does not probe the local resolver
+
+**Given** any non-DEFAULT proxy resolves for the app
+**When** the user types a hostname into Add Site and the preview updates
+**Then** no `InternetAddress.lookup` is issued for that hostname
+**And** the preview card is shown without a reachability probe
+
+#### Scenario: Add-site preview still probes with no proxy
+
+**Given** no proxy is configured
+**When** the user types a hostname that does not resolve
+**Then** the reachability probe runs and the preview card stays hidden
+
 ---
 
 ### Requirement: LEAK-007 - Coverage matrix
@@ -266,15 +552,18 @@ spec violation.
 | Category | Trigger | Proxy applied | Implementation |
 |---|---|---|---|
 | Webview navigation (HTTP/HTTPS/CONNECT) | Site load, in-page request | Per-site (DEFAULT → global) | `ProxyManager.setProxySettings`, `lib/services/webview.dart:164` |
-| Webview WebRTC | RTCPeerConnection / STUN | Per-site `webRtcPolicy` | `lib/services/location_spoof_service.dart` |
+| Webview WebRTC | RTCPeerConnection / STUN | Per-site `webRtcPolicy`, raised to relay only behind a proxy under Tracking Protection (ETP-031) | `lib/services/location_spoof_service.dart`, `WebViewModel.effectiveWebRtcPolicy` |
 | Favicon: DDG, Google, FaviconFinder, SVG body | `getFaviconUrl(Stream)`, `getSvgContent`, `FaviconFinder.getAll` | Per-site (DEFAULT → global) | `lib/services/icon_service.dart`, `lib/third_party/favicon/favicon.dart` |
+| Favicon raster render | Drawer / tab strip / site list paints an icon | Per-site (DEFAULT → global) | `getIconBytes` in `lib/services/icon_service.dart`, `lib/screens/favicon_image_io.dart` |
 | Per-site downloads (HTTP/HTTPS) | `onDownloadStartRequest` | Per-site (DEFAULT → global) | `DownloadEngine`, `lib/services/webview.dart:_handleHttpDownload` |
 | User-script remote fetches | `__ws_s_*` / `__ws_f_*` JS handlers | Per-site (DEFAULT → global) | `lib/services/user_script_service.dart` |
+| User-script URL-source download | Saving a script with a URL in the editor | Per-site (DEFAULT → global) | `fetchUserScriptSource`, `lib/screens/user_scripts.dart` |
 | OSM tile fetches | Location-picker "Load map" | Global only | `lib/screens/location_picker.dart` |
 | ClearURLs rules download | "Update ClearURLs rules" | Global only | `ClearUrlService.downloadRules` |
 | DNS blocklist download | "Update DNS blocklist" | Global only | `DnsBlockService.downloadList` |
 | Content-blocker list download | "Update content-blocker list" | Global only | `ContentBlockerService.downloadList` |
 | LocalCDN catalog download | LocalCDN cache populate | Global only | `LocalCdnService._downloadAndCache` |
+| Timezone polygon dataset download | "Download timezone data" | Global only | `TimezoneLocationService.download` |
 
 #### Scenario: New outbound code path
 
@@ -285,7 +574,227 @@ spec violation.
   - the spec's coverage matrix gains a row justifying why the call is
     exempt (e.g. localhost-only, app-bundle resource fetch)
 
+#### Scenario: The matrix is checked by machine, not only by review
+
+**Given** the Linux integration tier running under the deny-by-default
+egress guard ([INTEG-016](../integration-tests/spec.md))
+**When** any scenario reaches a destination outside loopback that
+[`scripts/egress_allowlist.txt`](../../../scripts/egress_allowlist.txt)
+does not cover
+**Then** the run records the host and, in `enforce` mode, fails
+**And** the three outcomes above are the three ways to clear it — route it
+through the seam, point it at a loopback fixture, or add an argued
+allowlist entry alongside the matrix row
+
 ---
+
+### Requirement: LEAK-008 - Proxy hops authenticate the far end
+
+Any hop the app terminates to a *proxy* — as opposed to an origin — SHALL
+authenticate that proxy's identity before writing anything that identifies the
+user or their destination. The app terminates two such hops. On Android the
+credentialed-proxy relay's TLS handshake to an HTTPS upstream MUST verify the
+certificate identity against the configured upstream hostname (the normative
+requirement is [PROXY-012](../proxy/spec.md)). The Dart-side outbound client
+(`DefaultOutboundHttpFactory`, behind favicons, downloads, page-title probes,
+user-script and list downloads) MUST open a TLS session to an `HTTPS`-type
+proxy before it writes `CONNECT` or `Proxy-Authorization`, verified against
+system trust or a fingerprint the user pinned in `TrustedHostsService`;
+`findProxy` alone would have dart:io write both on a plain socket. Gated by
+`test/outbound_https_proxy_hop_test.dart` against real sockets.
+
+An unverified handshake there is a total compromise of the proxy's purpose,
+not a partial one: the impostor collects the proxy credentials, every
+`CONNECT host:port` the proxy existed to conceal, and every plaintext body.
+Chain-only validation does not prevent it — any attacker holding a valid
+certificate for a name they own passes it.
+
+#### Scenario: Impostor upstream learns nothing
+
+**Given** an on-path attacker answers for the configured HTTPS upstream with a
+chain-valid certificate for a domain the attacker owns
+**When** the webview issues any request through the relay
+**Then** the relay's handshake fails before its first write
+**And** the attacker observes no proxy credentials and no `CONNECT` target
+**And** the client receives `502` — the relay does not fall back to a direct
+connection
+
+#### Scenario: A Dart-side fetch under an HTTPS-type proxy
+
+**Given** a site whose proxy is `HTTPS` with Basic credentials
+**When** the favicon fetch or a download opens its connection to the proxy
+**Then** the first bytes on the wire are a TLS ClientHello
+**And** `CONNECT host:port` and the credentials are written only inside that session
+**And** the origin's own TLS handshake runs through the tunnel as before
+
+---
+
+### Requirement: LEAK-012 - Android webview auth-proxy fail-closed
+
+On Android, applying a credentialed proxy to the WebView SHALL NOT degrade
+to a direct connection on failure. Credentials SHALL NOT be embedded in the
+`inapp.ProxyController` proxy rule (Chromium rejects userinfo and silently
+goes direct); they SHALL instead be injected by the native loopback relay
+(see PROXY-021 / PROXY-022), which only ever connects to the configured
+upstream. Credentials SHALL travel to the relay only over the loopback
+method channel and SHALL NOT appear in any `ProxyController` rule or on any
+non-loopback socket from the app. If the relay cannot be established, the
+webview proxy application SHALL fail closed (no override cleared, no direct
+fallback) consistent with the SOCKS5 fail-closed posture in LEAK-003.
+
+#### Scenario: Credentialed Android proxy never sets a userinfo rule
+
+- **GIVEN** the app runs on Android with a credentialed effective proxy
+- **WHEN** the proxy is applied
+- **THEN** the `ProxyController` rule is `http://127.0.0.1:<port>` with no userinfo
+- **AND** the username and password are present only in the relay's upstream connection
+
+#### Scenario: Relay failure does not leak the IP
+
+- **GIVEN** a credentialed Android proxy whose relay cannot start
+- **WHEN** the proxy is applied
+- **THEN** no direct-connection override is left active for that site's traffic
+- **AND** the failure is logged at error level
+
+### Requirement: LEAK-009 - The loopback relay authenticates its callers
+
+The relay's listening socket SHALL admit only callers presenting a
+credential in its current route table. A connection with no credential
+SHALL be answered `407`; one bearing an unknown credential SHALL be
+answered `502` and SHALL NOT be re-challenged. No connection SHALL be
+routed to any upstream, or to a direct connection, without a match.
+
+Android places every installed app on one loopback interface and offers no
+way for a normal app to identify the peer of a local TCP connection
+(`ConnectivityManager.getConnectionOwnerUid` is restricted to VPN apps
+over their own tunnel, and `/proc/net/tcp` is denied outright from API 29,
+so the peer check bites on API 24-28 and is inert above it). The
+credential is therefore the admission control that holds on every version,
+and the ephemeral port is not one: 64K loopback ports are scanned in about
+a second. The random address the listener binds within 127/8 adds ~24 bits
+to that search but is likewise not admission control: it raises the cost
+of finding the socket, it does not decide who may use it.
+
+Tokens SHALL be at least 128 bits from a cryptographic RNG, SHALL live in
+memory for one app run only, SHALL never be persisted, and SHALL never be
+written to a log or forwarded upstream.
+
+#### Scenario: Another app on the device cannot borrow the user's proxy
+
+**Given** the relay is running with a route for Site A
+**When** any local process connects to the relay port without a credential
+**Then** it receives `407`
+**And** no upstream connection is opened
+
+#### Scenario: A guessed credential does not get a retry loop
+
+**Given** the relay is running
+**When** a caller presents a credential that is not in the route table
+**Then** it receives `502` with no `Proxy-Authenticate` header
+**And** no upstream connection is opened
+
+#### Scenario: The site token is not disclosed to the proxy operator
+
+**Given** Site A routes through an authenticated upstream
+**When** the relay opens that upstream
+**Then** the upstream receives the user's own proxy credentials
+**And** it does NOT receive the site's router token
+
+---
+
+### Requirement: LEAK-010 - Page JS cannot obtain or forge a router token
+
+A site's own content SHALL NOT be able to present another site's router
+credential, nor read its own.
+
+`Proxy-Authorization` is a forbidden header name, so `fetch` and `XHR`
+cannot set it; the token is held in Chromium's per-profile auth cache and
+is exposed to no web API; and the relay strips the header before opening
+the upstream, so an origin never observes it. The app SHALL additionally
+refuse to answer any auth challenge that is not the relay's, matching on
+both the loopback host and the current realm nonce — Android's callback
+drops `is_proxy` and the port, so a site's own `401` is otherwise
+indistinguishable.
+
+#### Scenario: A page cannot put Proxy-Authorization on the wire
+
+**Given** a page under the app's WebView
+**When** it issues a `fetch` or `XHR` carrying a `Proxy-Authorization`
+header
+**Then** the header does not reach the server
+
+#### Scenario: A site's own 401 is never answered with a token
+
+**Given** router mode is active
+**When** a site serves `401 WWW-Authenticate: Basic realm="<the nonce>"`
+**Then** the app cancels the challenge
+**And** no credential is sent
+
+#### Scenario: An origin never sees the token
+
+**Given** Site A loads an `http://` page through its proxy
+**Then** the origin's request headers carry no `Proxy-Authorization`
+
+### Requirement: LEAK-011 - No proxy bypass list exempts a site
+
+The proxy override the app installs SHALL carry no bypass entry that can
+exempt a site's traffic. In particular it SHALL NOT pass `<local>`.
+
+Chromium reads `<local>` as "send simple, dotless hostnames direct", so a
+site at `http://intranet/` leaves the device without touching the proxy at
+all -- and under router mode, without touching the relay that decides
+which upstream it is allowed. That is the defeat this spec's purpose
+names: one outbound path that bypasses the proxy defeats the proxy.
+
+`<local>` is not what makes the loopback relay reachable. Chromium
+bypasses loopback of its own accord, which is why the browser tier has to
+pass `<-loopback>` to defeat it and reach a fake origin on 127.0.0.1.
+
+The exemption is decided on the URL host alone, before anything is
+resolved: any host with no dot in it takes it. Two properties make that
+reachable by an attacker rather than merely untidy.
+
+**Any page can emit the request.** A single-label host is not something
+only the user can type. `<img src="http://intranet/p?id=...">`, a `fetch`,
+a subframe, or a `302` to `http://intranet/` all take the same exemption,
+so a remote page chooses when the device opens an unproxied connection.
+LEAK-002's artwork scenario already treats page-supplied hosts as hostile
+on the Dart side; the webview path must not be softer.
+
+**The network decides what the host means.** A single-label name has no
+global meaning. It resolves through the platform resolver, whose servers
+and search list come from the network the device is attached to (DHCP /
+router advertisement), so whoever runs that network -- or can answer for
+it on the path -- chooses the address `intranet` resolves to, a public
+address they own included. Under SOCKS5 this inverts LEAK-006: the
+webview would otherwise hand the name to the proxy to resolve remotely,
+and `<local>` handed precisely the network-controlled names back to the
+local resolver.
+
+Together they compose: a remote page names a single-label host, the local
+network resolves it to a collector, and the device connects direct. The
+parties the user configured a proxy to hide from -- the local network and
+the ISP -- are the ones that receive the connection and the device's real
+address.
+
+#### Scenario: A page-supplied subresource on a single-label host
+
+**Given** a proxy is configured
+**When** a loaded page requests `http://intranet/beacon` as a subresource
+**Then** the request goes through the proxy like every other subresource
+**And** no connection is made outside it
+
+#### Scenario: A site on a dotless hostname
+
+**Given** a proxy is configured, in router mode or not
+**When** the WebView navigates to a host with no dot in it
+**Then** the request goes through the proxy
+**And** it is not sent direct
+
+#### Scenario: The installed override carries no exemption
+
+**Given** the app applies a proxy override
+**Then** its bypass list is empty
 
 ## Architecture
 
@@ -334,7 +843,7 @@ spec violation.
 ### Created
 - `lib/services/outbound_http.dart` — `OutboundHttpFactory`, default impl,
   `resolveEffectiveProxy`, test override hook.
-- `lib/settings/global_outbound_proxy.dart` — persistence + in-memory
+- `lib/services/global_outbound_proxy.dart` — persistence + in-memory
   cache for the app-global outbound proxy.
 - `test/outbound_http_test.dart` — unit tests for the factory, host:port
   parser, persistence, and `resolveEffectiveProxy`.
@@ -386,9 +895,11 @@ spec violation.
 
 ## Threat Model — Known Gaps
 
-- **WebRTC default policy under a proxy**: per LEAK-005, sites with
-  `webRtcPolicy = defaultPolicy` can still leak the device IP via STUN.
-  The defense is to flip the per-site `webRtcPolicy` to `relayOnly` /
+- **WebRTC default policy under a proxy, umbrella off**: per LEAK-005,
+  a proxied site with `webRtcPolicy = defaultPolicy` and Tracking
+  Protection turned off can still leak the device IP via STUN. With the
+  umbrella on (the default) it runs `relayOnly` (ETP-031). The defense
+  for the rest is to flip the per-site `webRtcPolicy` to `relayOnly` /
   `disabled`. The settings UI hints at this when a proxy is configured.
 - **The app's own update / metrics**: WebSpace does not phone home, so
   there's no app-level analytics path to proxy. If telemetry is ever

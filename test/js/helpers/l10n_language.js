@@ -1,5 +1,5 @@
 // Shared language-identity logic for the ARB locale files, used by both the
-// CI guard (test/js/l10n_language_test.js) and the manual per-string review
+// CI guard (test/js/l10n_language.test.js) and the manual per-string review
 // tool (tool/check_l10n_language.js).
 //
 // Detection uses CLD3 (Google's Compact Language Detector v3) via cld3-asm,
@@ -53,9 +53,8 @@ function localeValues(file) {
 
 function localeText(file) {
   return localeValues(file)
-    .map(([, v]) => v)
-    .join(' ')
-    .replace(/\{[^}]*\}/g, ' '); // drop {placeholder} tokens
+    .map(([, v]) => cleanValue(v))
+    .join(' ');
 }
 
 // --- Per-string check -------------------------------------------------
@@ -104,7 +103,22 @@ const STOP_WORDS = new Set(
   + 'such only other also').split(' '),
 );
 
-const cleanValue = (v) => v.replace(/\{[^}]*\}/g, ' ').replace(/[a-z]+:\/\/\S+/gi, ' ');
+// Strips placeholders and ICU select/plural constructs. Brace-counting
+// rather than /\{[^}]*\}/, which stops at the first `}` of a nested ICU
+// message and leaves its keywords — `other`, `plural` — behind as bare
+// words. `other` is a stop word, so every plural-carrying value in a Latin
+// locale then sat one common word away from being called English: adding
+// "do" to an English string was enough to flag a correct Portuguese plural.
+function cleanValue(v) {
+  let out = '';
+  let depth = 0;
+  for (const ch of v) {
+    if (ch === '{') depth += 1;
+    else if (ch === '}') depth = Math.max(0, depth - 1);
+    else if (depth === 0) out += ch;
+  }
+  return out.replace(/[a-z]+:\/\/\S+/gi, ' ');
+}
 const wordsOf = (v) => (cleanValue(v).toLowerCase().match(/[a-zà-ÿ]{2,}/gi) || []).map((w) => w.toLowerCase());
 
 let _enVocab;
@@ -146,6 +160,67 @@ async function loadDetector() {
   return _factory;
 }
 
+// Share of [text] written in the locale's expected script. CLD3 picks a
+// *language*, and for a locale whose script is used by exactly one shipped
+// language that guess is redundant: Hebrew characters cannot be Mongolian
+// however confident the model is. Where the script settles it, the script
+// wins.
+function scriptShare(stem, text) {
+  const scripts = SCRIPTS[stem];
+  if (!scripts) return null;
+  const ranges = scripts.map((s) => SCRIPT_RANGES[s]).filter(Boolean);
+  if (!ranges.length) return null;
+  const letters = text.match(/\p{L}/gu) || [];
+  if (!letters.length) return null;
+  const inScript = letters.filter((ch) => ranges.some((re) => re.test(ch)));
+  return inScript.length / letters.length;
+}
+
+// Han locales share a script, so SCRIPTS cannot separate Simplified from
+// Traditional. These characters were simplified in the PRC reform and each
+// pair means the same word, so a file written in one variant carries that
+// side's forms and effectively none of the other's.
+const HAN_SIMPLIFIED_ONLY = '网设开关讯据个这来对时产严复语页读闭还没证权错';
+const HAN_TRADITIONAL_ONLY = '網設開關訊據個這來對時產嚴複語頁讀閉還沒證權錯';
+
+function hanVariant(text) {
+  const count = (chars) => [...text].filter((c) => chars.includes(c)).length;
+  return {
+    simplified: count(HAN_SIMPLIFIED_ONLY),
+    traditional: count(HAN_TRADITIONAL_ONLY),
+  };
+}
+
+// The locale an ARB declares for itself. Authoritative over the filename:
+// gen_l10n demands a base `app_zh.arb` exist whenever `app_zh_Hant.arb` does,
+// so the base is a symlink to the Traditional file and its declared locale is
+// what says which variant it must be written in.
+function declaredLocale(file) {
+  const json = JSON.parse(fs.readFileSync(path.join(arbDir, file), 'utf8'));
+  return typeof json['@@locale'] === 'string' ? json['@@locale'] : null;
+}
+
+// The app ships exactly one Chinese locale and it is Traditional.
+//
+// gen_l10n allows only two shapes here: a lone `app_zh.arb`, or `app_zh.arb`
+// plus `app_zh_Hant.arb` -- it demands a base file whenever a script-qualified
+// one exists (gen_l10n_types.dart:751) and demands @@locale match the filename
+// (:661), so "zh_Hant only" cannot be expressed. `zh` is BCP-47 for Chinese,
+// not for Simplified, so the base file carries the Traditional strings and the
+// picker labels it 繁體中文. Simplified is not shipped; a zh file containing
+// Simplified characters means someone reintroduced it.
+const SHIPPED_HAN_VARIANT = 'traditional';
+
+// Which Han variant a locale code must be written in, or null when the code
+// is not Chinese.
+function expectedHanVariant(stem) {
+  return stem === 'zh' || stem.startsWith('zh_') ? SHIPPED_HAN_VARIANT : null;
+}
+
+// Minimum share of letters that must sit in the locale's own script before
+// the script overrides CLD3's language guess.
+const SCRIPT_MAJORITY = 0.7;
+
 // { ok, lang, prob, reliable, accept } for one locale file's aggregate text.
 // Pass a CLD3 factory from loadDetector(). Do NOT set create()'s byte-range
 // args: a non-default maxNumBytes truncates mid-codepoint and corrupts
@@ -155,13 +230,18 @@ function verifyLocale(factory, file) {
   const accept = acceptedCodes(stem);
   const detector = factory.create();
   try {
-    const r = detector.findLanguage(localeText(file));
+    const text = localeText(file);
+    const r = detector.findLanguage(text);
+    const share = scriptShare(stem, text);
+    const scriptSettles = share !== null && share >= SCRIPT_MAJORITY;
     return {
-      ok: r.is_reliable && accept.includes(r.language),
+      ok: scriptSettles || (r.is_reliable && accept.includes(r.language)),
       lang: r.language,
       prob: r.probability,
       reliable: r.is_reliable,
       accept,
+      scriptShare: share,
+      scriptSettles,
     };
   } finally {
     detector.dispose && detector.dispose();
@@ -179,6 +259,12 @@ module.exports = {
   loadDetector,
   verifyLocale,
   SCRIPTS,
+  SCRIPT_RANGES,
+  scriptShare,
+  hanVariant,
+  expectedHanVariant,
+  SHIPPED_HAN_VARIANT,
+  declaredLocale,
   STOP_WORDS,
   englishVocab,
   suspectStrings,

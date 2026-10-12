@@ -23,16 +23,18 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const http = require('node:http');
-const {
-  setupBrowser, requireBrowser, readFixture,
-} = require('./helpers/launch');
+const CAPTURE = require('../js/helpers/capture_shims');
+const LOC = require('../js/helpers/location_configs');
+const { setupBrowser, requireBrowser, pageJs } = require('./helpers/launch');
+const { startBlankServer } = require('./helpers/blank_server');
 
-const LINUX = readFixture('desktop_mode/linux.js');
-const FULL_COMBO = readFixture('location_spoof/full_combo.js');
-const THEME_DARK = readFixture('theme_color_scheme/dark.js');
-const BLOB_SHIM = readFixture('blob_url_capture/shim.js');
-const CAMERA_SHIM = readFixture('camera_stream/shim.js');
+const LINUX = pageJs('desktop_mode', { platform: 'Linux x86_64' });
+const FULL_COMBO = LOC.FULL_COMBO;
+const THEME_DARK = pageJs('theme_color_scheme', { theme: 'dark' });
+const BLOB_SHIM = pageJs('blob_url_capture');
+const CAMERA_SHIM = CAPTURE.CAMERA;
+const MICROPHONE_SHIM = CAPTURE.MICROPHONE;
+const AF_ALPHA = pageJs('anti_fingerprinting', { seed: 'alpha-fixture-seed', letterbox: false });
 
 const browser = setupBrowser();
 
@@ -112,6 +114,164 @@ test('desktop_mode: Object.getOwnPropertyNames(navigator) does not list override
         assert.equal(ownProps.includes(k), false,
           `${k} leaks as own-property of navigator: ${JSON.stringify(ownProps)}`);
       }
+    });
+  });
+
+// ---------- Absent-property leak ----------
+
+// navigator.deviceMemory and navigator.getBattery are Chromium-only AND
+// secure-context-gated: absent from every WebKit build (so from iOS, macOS
+// and Linux WPE), and absent from Chromium itself on a plain-http page.
+// Defining them unconditionally therefore announced the shim on three of
+// four platforms and on every insecure origin, by one expression and with
+// no measurement: `'deviceMemory' in navigator`.
+
+test('anti_fingerprinting: the shim adds no navigator property Chromium lacks',
+  async (t) => {
+    // The mirror of the own-property probe above, over both context kinds.
+    // Compared against a pristine page in the same browser rather than a
+    // fixed list, so a future Chromium's own surface changes with it.
+    if (!requireBrowser(browser, t)) return;
+    const keysOf = () => {
+      const seen = [];
+      for (let o = navigator; o; o = Object.getPrototypeOf(o)) {
+        for (const k of Object.getOwnPropertyNames(o)) {
+          if (!seen.includes(k)) seen.push(k);
+        }
+      }
+      return seen.sort();
+    };
+    const server = await startBlankServer();
+    try {
+      for (const url of ['about:blank',
+                         `http://127.0.0.1:${server.address().port}/`]) {
+        const clean = await browser.browser.newPage();
+        const shimmed = await browser.browser.newPage();
+        try {
+          await shimmed.evaluateOnNewDocument(AF_ALPHA);
+          await clean.goto(url, { waitUntil: 'load' });
+          await shimmed.goto(url, { waitUntil: 'load' });
+          const before = await clean.evaluate(keysOf);
+          const after = await shimmed.evaluate(keysOf);
+          const added = after.filter((k) => !before.includes(k));
+          const removed = before.filter((k) => !after.includes(k));
+          assert.deepEqual(added, [], `${url}: shim added ${added.join(', ')}`);
+          assert.deepEqual(removed, [],
+            `${url}: shim removed ${removed.join(', ')}`);
+        } finally {
+          await clean.close();
+          await shimmed.close();
+        }
+      }
+    } finally {
+      server.close();
+    }
+  });
+
+test('anti_fingerprinting: deviceMemory and getBattery are still spoofed here',
+  async (t) => {
+    // The other direction of the same guard: on a secure origin Chromium HAS
+    // both, so skipping them where they are absent must not have skipped
+    // them where they are present.
+    if (!requireBrowser(browser, t)) return;
+    const server = await startBlankServer();
+    const page = await browser.browser.newPage();
+    try {
+      await page.evaluateOnNewDocument(AF_ALPHA);
+      await page.goto(`http://127.0.0.1:${server.address().port}/`,
+        { waitUntil: 'load' });
+      const r = await page.evaluate(async () => {
+        const battery = await navigator.getBattery();
+        return {
+          deviceMemory: navigator.deviceMemory,
+          charging: battery.charging,
+          level: battery.level,
+          dischargingIsInfinite: battery.dischargingTime === Infinity,
+        };
+      });
+      assert.ok(r.deviceMemory === 4 || r.deviceMemory === 8,
+        `deviceMemory=${r.deviceMemory} not in {4, 8}`);
+      assert.equal(r.charging, true);
+      assert.equal(r.level, 1);
+      assert.equal(r.dischargingIsInfinite, true);
+    } finally {
+      await page.close();
+      server.close();
+    }
+  });
+
+test('anti_fingerprinting: navigator.connection is corrected, not extended',
+  async (t) => {
+    // ETP-026. Chromium exposes effectiveType / rtt / downlink / saveData and
+    // NOT type / downlinkMax, so this checks both halves at once: the values
+    // are the fixed ones, and the key set is byte-for-byte the clean one.
+    if (!requireBrowser(browser, t)) return;
+    const connKeys = () => {
+      const c = navigator.connection;
+      if (!c) return null;
+      const seen = [];
+      for (let o = c; o; o = Object.getPrototypeOf(o)) {
+        for (const k of Object.getOwnPropertyNames(o)) {
+          if (!seen.includes(k)) seen.push(k);
+        }
+      }
+      return seen.sort();
+    };
+    const server = await startBlankServer();
+    const url = `http://127.0.0.1:${server.address().port}/`;
+    const clean = await browser.browser.newPage();
+    const shimmed = await browser.browser.newPage();
+    try {
+      await shimmed.evaluateOnNewDocument(AF_ALPHA);
+      await clean.goto(url, { waitUntil: 'load' });
+      await shimmed.goto(url, { waitUntil: 'load' });
+      const before = await clean.evaluate(connKeys);
+      if (before === null) {
+        t.skip('this Chromium exposes no navigator.connection');
+        return;
+      }
+      const after = await shimmed.evaluate(connKeys);
+      assert.deepEqual(after, before,
+        `connection key set changed: ${JSON.stringify({ before, after })}`);
+      const values = await shimmed.evaluate(() => ({
+        effectiveType: navigator.connection.effectiveType,
+        rtt: navigator.connection.rtt,
+        downlink: navigator.connection.downlink,
+        saveData: navigator.connection.saveData,
+      }));
+      assert.deepEqual(values,
+        { effectiveType: '4g', rtt: 50, downlink: 10, saveData: false });
+    } finally {
+      await clean.close();
+      await shimmed.close();
+      server.close();
+    }
+  });
+
+test('anti_fingerprinting: connection.onchange round-trips as it does natively',
+  async (t) => {
+    // ETP-026. Chromium returns the assigned handler; a slot that answers
+    // null instead is detectable in one expression.
+    await withShim(t, AF_ALPHA, async (page) => {
+      const r = await page.evaluate(() => {
+        const c = navigator.connection;
+        if (!c) return null;
+        const initial = c.onchange;
+        const fn = () => {};
+        c.onchange = fn;
+        const roundTrip = c.onchange === fn;
+        c.onchange = 42;
+        const nonFunction = c.onchange;
+        c.onchange = null;
+        return { initial, roundTrip, nonFunction };
+      });
+      if (r === null) {
+        t.skip('this Chromium exposes no navigator.connection');
+        return;
+      }
+      assert.equal(r.initial, null);
+      assert.equal(r.roundTrip, true);
+      assert.equal(r.nonFunction, null);
     });
   });
 
@@ -324,21 +484,11 @@ test('blob_url_capture: capture still works after the toString hardening',
 // so this section serves its page from 127.0.0.1 (a Chromium secure-origin
 // exception) instead of reusing withShim().
 
-function startSecureOriginServer() {
-  return new Promise((resolve) => {
-    const server = http.createServer((_req, res) => {
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end('<!doctype html><html><head></head><body></body></html>');
-    });
-    server.listen(0, '127.0.0.1', () => resolve(server));
-  });
-}
-
 // Runs `fn(page)` with the camera shim installed and the bridge answering
 // `virtual` with a 1x1 image, so a stream can actually be served.
 async function withCameraShim(t, fn) {
   if (!requireBrowser(browser, t)) return;
-  const server = await startSecureOriginServer();
+  const server = await startBlankServer();
   const page = await browser.browser.newPage();
   try {
     await page.evaluateOnNewDocument(() => {
@@ -469,12 +619,188 @@ test('camera_stream: install markers are invisible on window', async (t) => {
   t.todo('repo-wide: __ws* install markers enumerable via getOwnPropertyNames(window)');
 });
 
+// One realm's Function.prototype.toString, called on an override that lives in
+// a same-origin child realm (or the other way round), used to print the shim's
+// source: each realm kept its own map of the functions it disguises.
 test('camera_stream: cross-realm toString hides the override source',
   async (t) => {
-    // `Function.prototype.toString.call(iframe.contentWindow.navigator
-    // .mediaDevices.getUserMedia)` from the PARENT realm prints the shim
-    // source: the stub WeakMap is per-realm, so the parent's patched
-    // toString does not recognise the child's function. Verified identical
-    // for location_spoof, so this is the shared funnel's gap.
-    t.todo('repo-wide: parent-realm toString reveals a child realm override');
+    await withCameraShim(t, async (page) => {
+      const r = await page.evaluate(async () => {
+        const f = document.createElement('iframe');
+        f.src = location.href;
+        await new Promise((resolve) => { f.onload = resolve; document.body.appendChild(f); });
+        const w = f.contentWindow;
+        return {
+          parentOnChild: Function.prototype.toString.call(w.MediaDevices.prototype.getUserMedia),
+          childOnParent: w.Function.prototype.toString.call(MediaDevices.prototype.getUserMedia),
+          parentOnChildToString: Function.prototype.toString.call(w.Function.prototype.toString),
+        };
+      });
+      for (const [probe, source] of Object.entries(r)) {
+        assert.match(source, /\{ \[native code\] \}$/, `${probe}: ${source}`);
+      }
+    });
+  });
+
+test('location_spoof: cross-realm toString hides the override source',
+  async (t) => {
+    await withShim(t, FULL_COMBO, async (page) => {
+      const r = await page.evaluate(async () => {
+        const f = document.createElement('iframe');
+        document.body.appendChild(f);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        const w = f.contentWindow;
+        return {
+          parentOnChild: Function.prototype.toString.call(w.Date.prototype.getTimezoneOffset),
+          childOnParent: w.Function.prototype.toString.call(Date.prototype.getTimezoneOffset),
+          parentOnChildToString: Function.prototype.toString.call(w.Function.prototype.toString),
+        };
+      });
+      for (const [probe, source] of Object.entries(r)) {
+        assert.match(source, /\{ \[native code\] \}$/, `${probe}: ${source}`);
+      }
+    });
+  });
+
+test('location_spoof: a cross-origin frame keeps a map of its own', async (t) => {
+  // Reading a cross-origin parent's map throws; the frame must still install
+  // its shims and disguise its own overrides.
+  if (!requireBrowser(browser, t)) return;
+  const top = await startBlankServer();
+  const other = await startBlankServer();
+  const page = await browser.browser.newPage();
+  try {
+    await page.evaluateOnNewDocument(FULL_COMBO);
+    await page.goto(`http://127.0.0.1:${top.address().port}/`, { waitUntil: 'load' });
+    await page.evaluate(async (src) => {
+      const f = document.createElement('iframe');
+      f.src = src;
+      await new Promise((resolve) => { f.onload = resolve; document.body.appendChild(f); });
+    }, `http://localhost:${other.address().port}/`);
+    const frame = page.frames().find((f) => f !== page.mainFrame());
+    const r = await frame.evaluate(() => ({
+      timeZone: new Intl.DateTimeFormat().resolvedOptions().timeZone,
+      source: Function.prototype.toString.call(Date.prototype.getTimezoneOffset),
+    }));
+    assert.equal(r.timeZone, 'Europe/Paris');
+    assert.match(r.source, /\{ \[native code\] \}$/);
+  } finally {
+    await page.close();
+    top.close();
+    other.close();
+  }
+});
+
+// The same probes against the microphone shim. MIC-009 claims the substituted
+// microphone is not detectable by shape, in the same words CAM-008 uses, and
+// until now no probe in this tier ever loaded the audio shim: the jsdom tier
+// asserts override placement, and the real-engine tier asserts that the clip
+// carries signal. Neither is a fingerprinter.
+
+// A 0.1 s silent mono WAV. Generated here rather than committed: it is a
+// derivative of these four numbers.
+function makeWavDataUrl(seconds = 0.1, rate = 8000) {
+  const frames = Math.round(seconds * rate);
+  const buf = Buffer.alloc(44 + frames * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + frames * 2, 4); buf.write('WAVE', 8);
+  buf.write('fmt ', 12); buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22); buf.writeUInt32LE(rate, 24);
+  buf.writeUInt32LE(rate * 2, 28); buf.writeUInt16LE(2, 32);
+  buf.writeUInt16LE(16, 34); buf.write('data', 36);
+  buf.writeUInt32LE(frames * 2, 40);
+  return `data:audio/wav;base64,${buf.toString('base64')}`;
+}
+
+async function withMicrophoneShim(t, fn) {
+  if (!requireBrowser(browser, t)) return;
+  const server = await startBlankServer();
+  const page = await browser.browser.newPage();
+  const dataUrl = makeWavDataUrl();
+  try {
+    await page.evaluateOnNewDocument((clip) => {
+      window.flutter_inappwebview = {
+        callHandler: (name) => Promise.resolve(
+          name === 'webMicrophoneMode'
+            ? 'virtual'
+            : { mode: 'virtual', source: { dataUrl: clip } }),
+      };
+    }, dataUrl);
+    await page.evaluateOnNewDocument(MICROPHONE_SHIM);
+    await page.goto(`http://127.0.0.1:${server.address().port}/`,
+      { waitUntil: 'load' });
+    await fn(page);
+  } finally {
+    await page.close();
+    server.close();
+  }
+}
+
+test('microphone_stream: getUserMedia and enumerateDevices stringify as native',
+  async (t) => {
+    await withMicrophoneShim(t, async (page) => {
+      const r = await page.evaluate(() => {
+        const s = (fn) => Function.prototype.toString.call(fn);
+        return {
+          gum: s(navigator.mediaDevices.getUserMedia),
+          enumerate: s(navigator.mediaDevices.enumerateDevices),
+        };
+      });
+      assert.match(r.gum, /\[native code\]/,
+        `getUserMedia leaks its source: ${r.gum}`);
+      assert.match(r.enumerate, /\[native code\]/,
+        `enumerateDevices leaks its source: ${r.enumerate}`);
+    });
+  });
+
+test('microphone_stream: overrides sit on MediaDevices.prototype, not the instance',
+  async (t) => {
+    await withMicrophoneShim(t, async (page) => {
+      const r = await page.evaluate(() => ({
+        own: Object.getOwnPropertyNames(navigator.mediaDevices),
+        protoHasGum: Object.getOwnPropertyNames(MediaDevices.prototype)
+          .includes('getUserMedia'),
+      }));
+      assert.deepEqual(r.own, [],
+        `overrides leak as own-properties of mediaDevices: ${JSON.stringify(r.own)}`);
+      assert.equal(r.protoHasGum, true);
+    });
+  });
+
+test('microphone_stream: the synthetic track passes for an ordinary mic track',
+  async (t) => {
+    await withMicrophoneShim(t, async (page) => {
+      const r = await page.evaluate(async () => {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        const track = stream.getAudioTracks()[0];
+        const s = (fn) => Function.prototype.toString.call(fn);
+        const labelDesc =
+          Object.getOwnPropertyDescriptor(MediaStreamTrack.prototype, 'label');
+        return {
+          own: Object.getOwnPropertyNames(track),
+          ctor: Object.getPrototypeOf(track).constructor.name,
+          kind: track.kind,
+          readyState: track.readyState,
+          label: track.label,
+          labelOnInstance: !!Object.getOwnPropertyDescriptor(track, 'label'),
+          labelGetter: labelDesc && labelDesc.get ? s(labelDesc.get) : 'none',
+          getSettings: s(track.getSettings),
+          settings: track.getSettings(),
+        };
+      });
+      assert.deepEqual(r.own, [],
+        `track carries own-properties a real one lacks: ${JSON.stringify(r.own)}`);
+      assert.equal(r.ctor, 'MediaStreamTrack');
+      assert.equal(r.kind, 'audio');
+      assert.equal(r.readyState, 'live');
+      assert.equal(r.labelOnInstance, false);
+      assert.match(r.labelGetter, /\[native code\]/,
+        `the label getter leaks its source: ${r.labelGetter}`);
+      assert.match(r.getSettings, /\[native code\]/);
+      assert.equal(r.label, 'Microphone Array');
+      // A WebAudio destination track otherwise reports an empty settings bag,
+      // which is the tell this fills in.
+      assert.equal(typeof r.settings.deviceId, 'string');
+      assert.equal(typeof r.settings.sampleRate, 'number');
+      assert.equal(typeof r.settings.echoCancellation, 'boolean');
+    });
   });

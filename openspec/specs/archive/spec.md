@@ -6,23 +6,30 @@ Implemented; manual hardware validation pending. All requirements
 ARCH-001 through ARCH-009 are wired end-to-end:
 
 - **ARCH-001 (active-state neutrality):** enforced by filtering on
-  `WebViewModel.isArchiveTier` in `_saveWebViewModels`,
-  `_syncShortcutSites`, and `_exportSettings`. Regression tests in
+  `WebViewModel.isArchiveTier` in `_persistSites`,
+  `ShortcutController.syncSites`, and `BackupController.export`. Regression tests in
   `test/archive_neutrality_test.dart`.
-- **ARCH-002 (passphrase KDF):** `ArchiveCrypto.deriveSalt` (HKDF) +
-  `deriveKey` (Argon2id 64 MiB / t=3 / p=4 / 32 bytes).
+- **ARCH-002 (passphrase KDF):** `ArchiveStorage.ensureKdfSalt` (16 random
+  bytes per install, minted with the slot pool) + `ArchiveCrypto.deriveKey`
+  (Argon2id 64 MiB / t=3 / p=4 / 32 bytes). `ArchiveCrypto.deriveSalt` is the
+  superseded passphrase-derived salt, kept only to open pre-upgrade slots,
+  which are re-sealed under the stored salt on first open.
 - **ARCH-003 (fixed slot pool):** 16 slots × 128 KiB each in
   `flutter_secure_storage`; slot bytes = full AEAD wire size with
   length-prefixed plaintext padding.
-- **ARCH-004 (open/close lifecycle):** `_openArchive` / `_createArchive`
-  / `_closeArchive` / `_closeAllArchives` on `_WebSpacePageState`.
-  In-memory key only; zeroed on close.
+- **ARCH-004 (open/close lifecycle):** `ArchiveController.open` /
+  `create` / `close` / `closeAll` (`lib/controllers/archive_controller.dart`),
+  each committing its rows through the page's `_commitSites`. In-memory key
+  only; zeroed on close.
 - **ARCH-005 (multi-archive concurrency):** per-handle slices in
-  `_archiveSlices`; closing one leaves the others intact.
+  `ArchiveController`; closing one leaves the others intact.
 - **ARCH-006 (per-site override matrix):** `effectiveNotificationsEnabled`
   / `effectiveLocalCdnEnabled` getters; home-shortcut menu hides for
   archive-tier sites; persistence and iOS App Intents shortcut sync
-  filter on `isArchiveTier`.
+  filter on `isArchiveTier`. The effective getters are the whole
+  mechanism, so a consumer that reads the raw field instead is the
+  recurring failure — the legacy cookie engine and the nested-webview
+  launch both did.
 - **ARCH-007 (opaque container ids):** HMAC-derived
   `archiveContainerId` plumbed through `WebViewConfig`; teardown on
   close via `ContainerNative.deleteContainer`.
@@ -34,8 +41,8 @@ ARCH-001 through ARCH-009 are wired end-to-end:
   at least one archive is open.
 
 **Archive-tier collections:** an open archive's named collections are
-materialised into `_webspaces` (marked `isArchiveTier`, a runtime-only
-flag) so a restored archive keeps its grouping. `_saveWebspaces`
+materialised into `_sites.webspaces` (marked `isArchiveTier`, a runtime-only
+flag) so a restored archive keeps its grouping. `ShellStore.saveWebspaces`
 filters on the flag so they never enter app-tier SharedPreferences;
 their membership rides the archive's own encrypted state and is
 re-captured on close. Reopening restores the grouping; closing falls
@@ -44,7 +51,8 @@ back to the "All" view if the user was inside an archive collection.
 **ARCH-010 (export opt-in):** when one or more archives are open, the
 settings export prompts whether to bundle them. Each open archive is
 sealed into a self-contained base64 section (`Archive.exportSection`,
-AES-256-GCM under the passphrase-derived key, no slot AAD) stored under
+AES-256-GCM under the archive key, no slot AAD, prefixed with the exporting
+install's ARCH-002 salt so another device can derive the same key) stored under
 the optional `extraSections` key in the backup JSON. The prompt only
 appears while archives are open — at which point their content is
 already visible in the switcher — so a backup taken with none open is
@@ -85,7 +93,7 @@ This spec adds an archive feature that satisfies both. Crucially, when no archiv
 
 ### Internal model
 
-- An *archive key* `MK_arch` is derived from the user's passphrase via Argon2id. The same passphrase always produces the same key — the passphrase **is** the archive's identity.
+- An *archive key* `MK_arch` is derived from the user's passphrase via Argon2id over the install's stored random salt. On a given install the same passphrase always produces the same key — the passphrase **is** the archive's identity there; across installs the same passphrase yields different keys, which is what stops one precomputed table from covering every device. An exported section carries its salt so it can still be restored elsewhere.
 - All archive state — webspace list, per-site `WebViewModel` JSON, cookies — is packed into a single ciphertext entry per archive in `flutter_secure_storage`, encrypted under `MK_arch` with AES-256-GCM.
 - The ciphertext entry lives in one of a fixed pool of K slots allocated at first launch. Slots are indistinguishable from random when unpopulated; slot count is constant regardless of how many archives exist. Restoration scans the pool, trial-decrypting each slot with the candidate key.
 - Per-site features that touch disk, background scheduling, or OS-level UI are disabled or forced for archive-tier sites (notifications, home-shortcuts, LocalCDN, file-import-sites, authenticated proxies). Incognito mode is forced on so localStorage / IndexedDB / ServiceWorker state stays inside the container and doesn't persist beyond a session.
@@ -103,15 +111,15 @@ The active app state SHALL be byte-identical regardless of whether the device ha
 **And** a snapshot of the SharedPreferences XML on disk after first launch
 **When** the user creates an archive, adds a site to it, closes it, reopens it, and closes it again
 **Then** the SharedPreferences XML on disk equals the snapshot byte-for-byte
-**And** the `kExportedAppPrefs` registry contains no archive-related key
+**And** the `AppPref` registry contains no archive-related key
 
 #### Scenario: app-tier WebViewModel collection unchanged
 
-**Given** a process with M app-tier sites in `_webViewModels`
+**Given** a process with M app-tier sites in `_sites.models`
 **When** the user opens an archive, switches between its sites, and closes the archive
-**Then** `_webViewModels.length == M` before and after
-**And** `_loadedIndices` for app-tier indices is unchanged
-**And** the selected app-tier index and `_selectedWebspaceId` are unchanged
+**Then** `_sites.models.length == M` before and after
+**And** `_sites.loaded` for app-tier indices is unchanged
+**And** the selected app-tier index and `_sites.selectedWebspaceId` are unchanged
 
 #### Scenario: settings-backup export bytes equal across archive operations
 
@@ -125,26 +133,51 @@ The active app state SHALL be byte-identical regardless of whether the device ha
 **Given** an app process where no archive has been created and no passphrase has been entered
 **When** the app runs normally through startup, site activation, settings, export, import
 **Then** every code path that touches `ArchiveStorage` returns early as a no-op
-**And** no `flutter_secure_storage` write occurs that wouldn't have occurred on a build without the feature, except for the one-time slot-pool initialization on first launch
+**And** no `flutter_secure_storage` write occurs that wouldn't have occurred on a build without the feature, except for the one-time slot-pool initialization (the K slots plus the ARCH-002 salt entry, written together and independently of whether any archive exists)
 
 ### Requirement: ARCH-002 — Passphrase-based key derivation
 
-Archive keys SHALL be derived from the user's passphrase via Argon2id, deterministically — the same passphrase produces the same key. No salt, key, or key-derivation parameter is persisted to disk in plaintext.
+Archive keys SHALL be derived from the user's passphrase via Argon2id over a **random per-install salt**, deterministically within one install — the same passphrase produces the same key on the device that minted the salt. The salt SHALL be 16 bytes from `Random.secure()`, stored in `flutter_secure_storage` under a single fixed entry name. No key and no passphrase-derived material is persisted.
+
+The salt SHALL NOT be a function of the passphrase. A passphrase-derived salt carries no anti-precomputation entropy: it maps passphrase P to the same `MK_arch` on every install, which turns the Argon2id cost into a one-time table-building cost amortized across all users instead of a per-target cost, and lets a precomputed wordlist table trial-decrypt a seized device's slots at AES-GCM speed.
 
 #### Scenario: Derivation parameters are explicit and stable
 
 **Given** the archive key derivation service
 **When** a key is derived from passphrase P
-**Then** the salt is `HKDF-SHA256(P, info: "archive-salt-v1", L: 16)`
+**Then** the salt is the 16 random bytes stored for this install by `ArchiveStorage.ensureKdfSalt`
 **And** the key is `Argon2id(password: P, salt: salt, m: 64MiB, t: 3, p: 4, hashLen: 32)`
 **And** the derivation completes in roughly 0.5–2 seconds on target hardware
-**And** the parameters are constants in `ArchiveKeyDerivation`, not configurable at runtime
+**And** the parameters are constants in `ArchiveCrypto`, not configurable at runtime
 
-#### Scenario: Same passphrase yields same key across devices
+#### Scenario: The salt is minted with the slot pool, not with the first archive
 
-**Given** two devices running the same app build
+**Given** a device where the slot pool has been initialized and no archive has ever been created
+**When** the secure-storage namespace is inspected
+**Then** the salt entry is present and holds the fixed entry length
+**And** its presence, name, and length are identical to those on a device holding N closed archives (ARCH-001)
+
+#### Scenario: Two installs derive different keys from one passphrase
+
+**Given** two installs of the same app build with different stored salts
 **When** each derives a key from the same passphrase P
-**Then** both devices produce the same 32-byte `MK_arch`
+**Then** the two 32-byte `MK_arch` values differ
+**And** a table precomputed against one install is worthless against the other
+
+#### Scenario: Same passphrase across devices via an exported section
+
+**Given** an archive exported with `Archive.exportSection` on device A
+**When** the section is imported on device B under the same passphrase P
+**Then** device B derives the section's key using the salt carried in the section's cleartext header
+**And** the archive is re-sealed under device B's own stored salt before it is written to a slot
+
+#### Scenario: An archive sealed before the stored salt still opens
+
+**Given** a slot sealed under the legacy `HKDF-SHA256(P, info: "archive-salt-v1")` salt
+**When** the user opens it with passphrase P after upgrading
+**Then** the open path first tries the stored-salt key, then the legacy key
+**And** the slot is re-sealed under the stored-salt key on that first successful open
+**And** subsequent opens of that archive need only the stored-salt derivation
 
 #### Scenario: Key material lives only in memory
 
@@ -215,6 +248,15 @@ The archive open/close lifecycle SHALL keep `MK_arch` in memory only, persisting
 **And** `MK_arch` is zero-filled in memory
 **And** the switcher no longer shows the archive's webspaces
 
+#### Scenario: Closing keeps the app-tier sites where they were
+
+**Given** a site moved into an open archive keeps its row above app-tier sites, and app-tier sites below it are loaded, one of them on screen
+**When** the archive is closed
+**Then** the same app-tier sites stay loaded and the same one stays on screen
+**And** a site of the archive that was on screen leaves the page on the webspace list
+**And** a Tor site of the archive no longer holds the Tor runtime up (TOR-002)
+**Because** the close goes through `_commitSites(ArchiveClosed(...))`, whose `SiteRuntime.apply` removes each row through `SiteLifecycleEngine.computeDeletionPatch`, and which reconciles the Tor refcount after every change (BUG-029)
+
 #### Scenario: Close on process exit
 
 **Given** an archive is open
@@ -264,9 +306,13 @@ The override matrix:
 | Per-site authenticated proxies | password not persisted | `ProxyPasswordSecureStorage` keys by `siteId` in app-tier secure storage; unauthenticated (host/port-only) proxies are fine. |
 | Auto-load at startup | never | Archive `siteId`s never enter `_loadedIndices` at startup regardless of any per-site flag — loading happens only after archive open. |
 | Tracking-protection's LocalCDN sub-component | silently no-op | The umbrella ETP feature still applies (ClearURLs, DNS, content blocker, fingerprinting shim — all runtime-only); only the LocalCDN sub-component is skipped. |
-| HTML cache (`HtmlCacheService.saveHtml` / `getHtmlSync`) | disabled | The cache file path is keyed by `siteId`; even though the bytes are AES-encrypted, the file's existence correlates to specific archive sites on disk inspection. Gated by `effectiveHtmlCachingEnabled` (false for archive-tier) in the `onHtmlLoaded` / `shouldFetchHtml` / `initialHtml` paths in `lib/main.dart`. Archive sites always load live from URL; first paint is slightly slower but on-disk footprint stays empty. |
+| HTML cache (`HtmlCacheService.saveHtml` / `getHtmlSync`) | disabled | The cache file path is keyed by `siteId`; even though the bytes are AES-encrypted, the file's existence correlates to specific archive sites on disk inspection. Gated by `htmlSourceFor` ([html_source.dart](../../../../../lib/services/html_source.dart)), which returns `HtmlSource.none` for archive-tier sites, read by the HTML save path in `lib/main.dart` and the first-paint path in `lib/widgets/site_webview_stack.dart`. Archive sites always load live from URL; first paint is slightly slower but on-disk footprint stays empty. |
 | Webview navigation state (`SecureWebViewStateStorage.saveState` / `loadState`) | disabled | Same shape as HTML cache: per-`siteId` encrypted file containing `controller.saveState()` bytes (back/forward URL stack, Apple form data). Gated by an explicit `isArchiveTier` check in `_captureStateBytes` and the load path in `_setCurrentIndex`. Archive sites lose the in-process back/forward stack on memory-pressure eviction; acceptable trade for not leaking the URL stack to disk. `_closeArchive` calls `removeState(siteId)` for every owned site as a defensive back-erasure pass — covers any pre-fix bytes plus future code paths that forget the gate. |
 | `cameraMode` (web camera access) | effectively `block` | `effectiveCameraMode` denies without prompting: the Block/Use-file/Allow popup, the file picker, and Android's OS permission dialog are OS-level UI, and a real grant lights the system camera indicator. Stored mode and any picked `virtualCameraSource` preserved for when the site leaves the archive. See [web-camera-access](../web-camera-access/spec.md) CAM-006. |
+| Cookie persistence in the legacy engine | never written | `CookieIsolationEngine` reads `effectiveIncognito`, not the raw `incognito` field, at every guard. The raw field made an archive site's non-Secure cookies land in plaintext SharedPreferences (`cookies_fallback`) keyed by its cleartext `siteId` — underneath `_saveWebViewModels`'s `!isArchiveTier` filter, and a direct ARCH-001 break. See [per-site-cookie-isolation](../per-site-cookie-isolation/spec.md) ISO-005. |
+| Tor exit-country pin | uses a kept GeoIP table, never downloads one | The table a pin needs (TOR-014) is a file outside the archive's keyspace; downloaded for an archived site alone, its presence and timestamp would say one pinned a country. `SiteUnloadEngine.torExitPinIsArchiveOnly` decides it. With no table kept, the pin fails closed (`exitCountryData`) rather than being dropped, since dropping it would route the site through a country it did not ask for. |
+| Saved sign-ins (HTTP authentication) | never read or saved | `HttpAuthSecureStorage` keys by `siteId` in app-tier secure storage. `effectiveHttpAuthMemory` is `off`, so the sign-in prompt still works for the session but offers no Remember and reads nothing; the Saved sign-ins row is hidden. See [http-auth-prompt](../http-auth-prompt/spec.md) HTTPAUTH-004. |
+| Nested webviews (`InAppWebViewScreen`) | inherit the effective values | The two `launchUrlFunc` call sites pass `effectiveNotificationsEnabled` / `effectiveCameraMode` / `effectiveMicrophoneMode` / `effectiveProtectedContentAllowed` / `effectiveIncognito`, not the stored fields. Passing a raw value let an archive site post OS notifications naming itself from a nested webview, and those persist in the shade after the archive is closed. |
 | Logging that mentions any per-`siteId` identifier | `LogSensitivity.sensitive` | The tier-aware [`LogService`](../../../lib/services/log_service.dart) routes sensitive entries to a memory-only ring; they never reach disk, `debugPrint`, exports, or `adb logcat` / Console.app. Any new log call that includes a `siteId`, container name, cookie hostname, URL, or page title MUST be tagged sensitive (audit per #354 already covers every existing call site in `lib/`). The archive runtime flow (`_materialiseArchive`, `_openArchive`, `_closeArchive`, `_moveSiteToArchive`, `_promptRestoreArchive`) adds no log calls at all — strongest possible posture. |
 
 Adding any new per-site feature SHALL re-run this audit. The CLAUDE.md per-site checklist gains an explicit "archive-tier compatibility" item.
@@ -280,6 +326,28 @@ Adding any new per-site feature SHALL re-run this audit. The CLAUDE.md per-site 
 **And** the site is not added to the `BGAppRefreshTask` / `WorkManager` periodic refresh set
 **And** the site does not enter `_loadedIndices` at startup
 
+#### Scenario: Legacy cookie engine writes nothing for an archive site
+
+**Given** the device has no container support, so `CookieIsolationEngine` is
+the live engine
+**And** an archive-tier site is loaded with a live session in the shared jar
+**When** the user switches sites, triggering
+`unloadSiteForDomainSwitch` / `restoreCookiesForSite`, or deletes a site,
+triggering `preDeleteCookieCleanup`
+**Then** `CookieSecureStorage.saveCookiesForSite` is never called with a
+non-empty list for the archive site's `siteId`
+**And** the app-tier cookie store has no entry keyed by that `siteId`
+**And** an app-tier site loaded at the same time still round-trips its own
+cookies normally
+
+#### Scenario: Nested webview from an archive site posts no notifications
+
+**Given** an archive-tier site whose stored `notificationsEnabled` is `true`
+**When** it opens an outbound link in an `InAppWebViewScreen`
+**Then** the nested `WebViewConfig.notificationsEnabled` is `false`
+**And** the `webNotification` JavaScript handler is not registered, so
+nothing reaches `NotificationService`
+
 #### Scenario: Settings UI hides overridden controls for archive sites
 
 **Given** the user is editing a site in an archive-tier webspace
@@ -290,6 +358,10 @@ Adding any new per-site feature SHALL re-run this audit. The CLAUDE.md per-site 
 ### Requirement: ARCH-007 — Container lifecycle for archive-tier sites
 
 For archive-tier sites on container-capable platforms, per-site containers SHALL use opaque, key-derived identifiers and SHALL be torn down on archive close. The archive feature is unavailable on platforms without container support.
+
+Every webview that runs as an archive-tier site SHALL bind by that opaque identifier: the site's own webview, and a nested `InAppWebViewScreen` opened from its links, from its URL bar, or routed to it (link-intent-routing LIR-015). `archiveContainerId` is therefore part of the nested chain (`LaunchUrlFunc`, `launchUrl`, `InAppWebViewScreen`), like any posture field (NESTED-010). A nested screen that bound `ws-<siteId>` instead would, on Android, where incognito sites still bind a named profile, run in a persistent profile named after the archived site's cleartext id, signed out of the site, and left on disk by the close.
+
+On close, after deleting the archive's opaque containers, `_closeArchive` SHALL also delete `ws-<siteId>` for each of the archive's sites whose id no app-tier site holds, so a path that ever binds one without the opaque id leaves nothing behind. An id an app-tier site also holds (a backup can bring one back) is skipped: that container is the app-tier site's own.
 
 #### Scenario: Opaque container id for archive sites
 
@@ -305,6 +377,27 @@ For archive-tier sites on container-capable platforms, per-site containers SHALL
 **When** the archive is closed
 **Then** for each `C_i`, `ContainerNative.deleteContainer(C_i)` is called
 **And** no on-disk container directory survives the close (best-effort — see Limitations)
+
+#### Scenario: A nested screen of an archive site binds its opaque container
+
+**Given** an open archive holding site S, whose container is `ws-<X>`
+**When** the user taps a cross-domain link in S and it opens in a nested screen, on Android
+**Then** the nested webview binds `ws-<X>`
+**And** no container named `ws-<S>` is created
+**And** the nested screen's site info sheet (NAV-011) names `ws-<X>`
+
+#### Scenario: Close sweeps a cleartext-named container
+
+**Given** a container `ws-<S>` exists for archive site S (left by a build before this rule)
+**And** no app-tier site has id S
+**When** the archive is closed
+**Then** `ws-<S>` is deleted with the archive's opaque containers
+
+#### Scenario: Close leaves an app-tier site's container alone
+
+**Given** archive A holds site S and an app-tier site also has id S (restored from an old backup)
+**When** A is closed
+**Then** the app-tier site's container `ws-<S>` is not deleted
 
 #### Scenario: Cookies survive across archive sessions
 
@@ -377,21 +470,28 @@ When at least one archive is open and the app is backgrounded, the visible UI SH
 
 ### Requirement: ARCH-010 — Settings export/import never includes archives without explicit opt-in
 
-`SettingsBackupService.createBackup` / `exportToJson` SHALL operate exclusively on the app-tier `_webViewModels` and `kExportedAppPrefs`. Archive-tier state is not included in exports by default. A user-controlled "include open archives" tick on the export dialog MAY add archive blobs to the export file at the user's explicit request; the resulting file's archive section is itself encrypted under each included archive's `MK_arch`.
+`SettingsBackupService.createBackup` / `exportToJson` SHALL operate exclusively on the app-tier `_sites.models` and `AppPref` values. Archive-tier state is not included in exports by default. A user-controlled "include open archives" tick on the export dialog MAY add archive blobs to the export file at the user's explicit request; the resulting file's archive section is itself encrypted under each included archive's `MK_arch`.
 
 #### Scenario: Default export excludes archives entirely
 
 **Given** an archive is open with sites
 **When** the user exports settings without ticking "include open archives"
-**Then** the export JSON contains only app-tier sites, app-tier webspaces, and `kExportedAppPrefs`
+**Then** the export JSON contains only app-tier sites, app-tier webspaces, and `AppPref` values
 **And** the export bytes are equal to the bytes a user without any archives would produce with identical app-tier state
 
 #### Scenario: Default import targets only app-tier
 
 **Given** the user imports a backup JSON
 **When** the import flow runs
-**Then** the restored webspaces and sites enter `_webViewModels` (app-tier)
+**Then** the restored webspaces and sites enter `_sites.models` (app-tier)
 **And** no archive is created or opened by the import flow
+
+#### Scenario: Import while an archive is open
+
+**Given** an archive is open with sites materialised in `_sites.models`
+**When** the user confirms a settings import
+**Then** every open archive is closed and sealed as it stands before the runtime lists are cleared
+**And** a close that finds fewer of its rows in the runtime than the archive opened with leaves the sealed state as opened rather than sealing the truncated set
 
 #### Scenario: V1 scope note
 
@@ -399,6 +499,56 @@ When at least one archive is open and the app is backgrounded, the visible UI SH
 **When** the user is on the export dialog
 **Then** the "include open archives" tick MAY be absent in v1 — the export remains app-tier-only.
 **Note:** v1 ships export/import as app-tier-only; the tick is deferred to a follow-up. The byte-identity invariant in ARCH-001 makes adding the tick later additive, not breaking.
+
+### Requirement: ARCH-011 — An archive with no room left changes nothing
+
+An archive's sealed state SHALL fit its one slot (`kArchiveSlotMaxPayload`). Every path that seals into an archive SHALL check that the state it is about to write fits (`Archive.fits`) before it changes anything, and when it does not fit SHALL leave everything as it was and say so with one neutral message ("An archive is full and was left open as it was. Close some of its tabs or move sites out of it, then try again."):
+
+- **Closing an archive** SHALL leave it open: its sites stay in the lists, its slice stays registered, and its slot keeps the last state that fitted. "Close all archives" closes every other archive and reports the one left open.
+- **Moving a site into an archive** SHALL leave the site in the app tier: its tier, container, cookies and tabs untouched.
+- **Importing settings while an archive is open** (ARCH-010) SHALL seal the open archives before it applies anything; when one does not fit, nothing of the import is applied.
+
+`Archive.save` refusing a state that does not fit stays as the last line, never the first.
+
+#### Scenario: A full archive stays open
+
+**Given** an open archive whose sites have grown past what its slot holds
+**When** the user closes it
+**Then** it stays open with every site and tab where it was
+**And** its slot still holds the state sealed at the last close or move
+**And** after the user closes some of its tabs, closing it seals and closes it
+
+#### Scenario: A site that does not fit is not moved
+
+**Given** an open archive near its slot size and an app-tier site with many tabs
+**When** the user moves the site into the archive
+**Then** the site stays in the app tier with its cookies and tabs as they were
+
+#### Scenario: An import waits for a full archive
+
+**Given** an open archive that does not fit its slot
+**When** the user confirms a settings import
+**Then** no app preference, site or collection of the import is applied
+**And** the archive stays open
+
+### Requirement: ARCH-012 — Opening an archive restores what it sealed
+
+Closing an archive SHALL seal each of its sites with its tab list (TAB-009), which tab is active, its address and its page title, and opening the archive SHALL bring each site back exactly so. This holds for every site, Always open Home and incognito ones included: an archive is encrypted, and opening one is neither a cold start nor a shortcut launch, so it is not the fresh entry that sends such a site home (AOH-002, TAB-014, INC-008). Moving a site into an archive and back out SHALL leave its tabs as they were. Per-tab back stacks are not sealed (ARCH-006: archive-tier sites write no navigation state), so each tab reloads with no history.
+
+The sealed form is `WebViewModel.toArchiveJson`, read back by `WebViewModel.fromJson(..., isArchiveTier: true)`.
+
+#### Scenario: Close and open bring every site back
+
+**Given** an archive holding a site with a tab tree whose active tab is not the first, an Always open Home site and an incognito site each away from home, a kiosk site and a site with Tabs off
+**When** the user closes the archive and opens it again, twice
+**Then** each site has the same tabs, the same active tab, address and title as before the first close
+**And** no tab was added
+
+#### Scenario: Moving in and out keeps the tree
+
+**Given** an app-tier site with tabs
+**When** the user moves it into an archive and back out
+**Then** its tabs and active tab are as they were
 
 ## Implementation Details
 
@@ -427,7 +577,7 @@ class ArchiveCrypto {
 
 ### Slot pool
 
-`lib/services/archive_storage.dart` owns the K slots in `flutter_secure_storage`. Slot count `K = 16`. Slot size `S = 128 KiB` (covers a typical archive — webspace list + cookies for ~50 sites — with comfortable headroom; oversize archives currently fail at write time, surfacing as a "this archive is too large" error to the user). Slot entry names are `ws_slot_00 ... ws_slot_15` — fixed constants.
+`lib/services/archive_storage.dart` owns the K slots in `flutter_secure_storage`. Slot count `K = 16`. Slot size `S = 128 KiB` (covers a typical archive — webspace list, cookies and tab lists for ~50 sites — with comfortable headroom; a change that would not fit is refused before anything moves, ARCH-011). Slot entry names are `ws_slot_00 ... ws_slot_15` — fixed constants.
 
 Initialization on first launch writes `K` slots of `S` random bytes each. The check is idempotent: missing slots are filled; existing ones are not rewritten.
 
@@ -460,9 +610,9 @@ class Archive {
 
 ### Runtime integration
 
-`_WebSpacePageState` gains a separate `List<WebViewModel> _archiveWebViewModels` and `List<Webspace> _archiveWebspaces`. These are parallel to `_webViewModels` / `_webspaces` and never merged in persistence or export paths. The UI's switcher concatenates the two for display (app-tier first, archive-tier appended in archive-open order). When an archive closes, only its slice of the archive-tier collections is removed; the app-tier slice is byte-untouched (see ARCH-001).
+`_WebSpacePageState` gains a separate `List<WebViewModel> _archiveWebViewModels` and `List<Webspace> _archiveWebspaces`. These are parallel to `_sites.models` / `_sites.webspaces` and never merged in persistence or export paths. The UI's switcher concatenates the two for display (app-tier first, archive-tier appended in archive-open order). When an archive closes, only its slice of the archive-tier collections is removed; the app-tier slice is byte-untouched (see ARCH-001).
 
-The archive-tier flag is a single boolean on `WebViewModel` (`isArchiveTier`), defaulted to false and never serialized. It's set when the archive's plaintext is materialized into `WebViewModel` instances on open. The override matrix in ARCH-006 reads this flag in `WebViewModel.toWebViewConfig` (and in the per-site settings sheet builder) to clamp the per-site fields.
+The archive-tier flag is a single boolean on `WebViewModel` (`isArchiveTier`), defaulted to false and never serialized. It's set when the archive's plaintext is materialized into `WebViewModel` instances on open. The override matrix in ARCH-006 reads this flag in the `effective*` getters that `WebViewModel.sitePosture` resolves every webview's posture through (and in the per-site settings sheet builder) to clamp the per-site fields.
 
 ### Container lifecycle
 
@@ -496,7 +646,7 @@ The per-webspace long-press menu adds "Close this archive" when the webspace's h
 `test/archive_neutrality_test.dart` runs the following with an injected `FakeFlutterSecureStorage` + `MemoryArchiveStorage`:
 
 - Initial SharedPreferences snapshot vs post-archive-cycle snapshot — assert byte-equal.
-- `_webViewModels` length, `_loadedIndices`, `_selectedWebspaceId` before / after archive ops — assert equal.
+- `_sites.models` length, `_sites.loaded`, `_sites.selectedWebspaceId` before / after archive ops — assert equal.
 - `SettingsBackupService.exportToJson` before / after archive ops with `exportedAt` pinned — assert byte-equal.
 - A "feature-not-used" run (no passphrase ever entered) vs a "feature-used" run that opens and closes archives — assert app-tier state files identical.
 
@@ -534,7 +684,8 @@ These tests run in CI and are the regression-prevention spine of ARCH-001.
 - **Best-effort deletion.** Flutter `flutter_secure_storage` and underlying OS-level secure stores do not guarantee bit-level erasure of overwritten or deleted entries. The same caveat applies to per-site container directory deletion — the underlying filesystem may retain freed blocks. Documented; not addressable at app layer.
 - **Memory zeroization is best-effort.** Dart strings are immutable; the passphrase string can't be reliably zero-filled. We keep the passphrase as a `String` only for the brief moment between dialog submit and KDF call, then immediately drop it. The derived `MK_arch` is held in `Uint8List` and zero-filled on close.
 - **Live-device forensics is out of scope.** An adversary executing code inside the running app process while an archive is open can read `MK_arch` and the archive's plaintext from memory. There is no software-only mitigation at the app layer.
-- **Slot size cap.** Archives larger than 128 KiB of packed state (typically: cookies + webspace JSON for ~50 sites) currently fail at write with a clear error to the user. v1 does not split archives across slots.
+- **Slot size cap.** An archive holds at most 128 KiB of packed state (cookies, webspace JSON and tab lists). A close, move or import that would exceed it is refused with nothing changed (ARCH-011). v1 does not split archives across slots.
+- **Slot collision is bounded, not eliminated.** The slot for a new archive is picked at random among the slots the process does not know to be occupied: open handles plus every slot that decrypted or was written since launch (`_knownOccupied`, memory only, since a persisted occupancy marker would vary with archive count and break ARCH-001). A closed archive under a passphrase that has not been entered since launch is invisible to the scan and still eligible, with probability `unseen / (16 - known)` per create or import; it is lost if picked. Entering each passphrase once after launch removes the risk for that archive.
 - **Per-site browser state beyond cookies does not migrate on move-to-archive.** Cookies are captured from the running container and pushed into the new opaque container on next webview build. `localStorage`, `IndexedDB`, `ServiceWorker` registrations, and `HTTP cache` are not — the new container is a fresh slate. Sites that store user preferences (theme, language, layout) in `localStorage` will revert to defaults the first time they're opened from an archive after a move. The move-to-archive snackbar warns the user. Mitigation would require fork-side API to read/write per-container `localStorage`; tracked but out of scope for v1.
 - **Dart-side console leakage is closed.** Every `LogService` call in `lib/` that interpolated a URL, host, site JSON, or stack trace is now `LogSensitivity.sensitive` (download / blob errors, share-intent failures, malformed-site-JSON boot warnings, proxy-apply failures), so it lands in the memory-only ring and never reaches disk / `debugPrint` / `adb logcat` / Console.app.
 - **Native (fork) console leakage — Android mitigated in release, iOS/macOS low-exposure.** The leaking lines are upstream `flutter_inappwebview` code (re-audited at `v6.2.0-beta.3-privacy-v3`, unchanged):
@@ -562,7 +713,7 @@ These tests run in CI and are the regression-prevention spine of ARCH-001.
 ### Modified
 
 - `pubspec.yaml` — adds `cryptography: ^2.7.0`
-- `lib/web_view_model.dart` — `isArchiveTier` flag (runtime-only, never serialized) + override matrix in `toWebViewConfig`
+- `lib/web_view_model.dart` — `isArchiveTier` flag (runtime-only, never serialized) + override matrix in the `effective*` getters, applied by `sitePosture`
 - `lib/services/cookie_secure_storage.dart` — archive-aware variants
 - `lib/services/container_isolation_engine.dart` — `ensureArchiveContainer` / `tearDownArchiveContainers`
 - `lib/main.dart` — `_archiveWebViewModels` / `_archiveWebspaces` parallel collections, runtime integration, background-snapshot mask

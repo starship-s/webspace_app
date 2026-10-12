@@ -17,9 +17,9 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
+const { read } = require('./helpers/source');
 
-const repoRoot = path.resolve(__dirname, '..', '..');
-const WORKFLOW = path.join('.github', 'workflows', 'build-and-test.yml');
+const WORKFLOW = '.github/workflows/build-and-test.yml';
 
 // Pull out every `bash -c '` ... `'` block: the body runs from the line after
 // the opener to the line whose only non-whitespace character is the closing
@@ -41,7 +41,7 @@ function extractSingleQuotedShellBlocks(text) {
   return blocks;
 }
 
-const workflowText = fs.readFileSync(path.join(repoRoot, WORKFLOW), 'utf8');
+const workflowText = read(WORKFLOW);
 const blocks = extractSingleQuotedShellBlocks(workflowText);
 
 test('the workflow embeds at least one single-quoted shell block', () => {
@@ -76,3 +76,69 @@ for (const block of blocks) {
     }
   });
 }
+
+// The `[ci-only: ...]` marker exists so a bisection that reads one tier does
+// not pay for the other four. Its failure modes are asymmetric: a job that
+// wrongly runs costs runner minutes, a job that wrongly skips costs coverage
+// silently, and a marker left in a merged commit could silence master
+// forever. So the guardrails are gated rather than trusted.
+test('every heavy job is gated on the plan job', () => {
+  const text = read(WORKFLOW);
+  for (const [job, output] of [
+    ['validate', 'validate'],
+    ['design-web', 'design'],
+    ['build-android', 'android'],
+    ['build-linux', 'linux'],
+    ['build-apple', 'apple'],
+  ]) {
+    const header = text.slice(text.indexOf(`\n  ${job}:\n`));
+    const block = header.slice(0, header.indexOf('\n    steps:'));
+    assert.match(
+      block,
+      /\n {4}needs: plan\n/,
+      `${job} does not depend on the plan job, so its guard cannot be read`,
+    );
+    assert.match(
+      block,
+      new RegExp(`if: needs\\.plan\\.outputs\\.${output} === ?'true'`.replace('===', '==')),
+      `${job} is not gated on needs.plan.outputs.${output}`,
+    );
+  }
+});
+
+test('the ci-only marker is honoured on pull requests only', () => {
+  const text = read(WORKFLOW);
+  const plan = text.slice(text.indexOf('\n  plan:\n'), text.indexOf('\n  validate:\n'));
+  assert.match(
+    plan,
+    /if \[ "\$\{\{ github\.event_name \}\}" = pull_request \]; then/,
+    'the plan job reads the marker outside a pull_request guard; a marker ' +
+      'that survives a merge would then silence master',
+  );
+  assert.match(
+    plan,
+    /ci-only/,
+    'the plan job no longer parses a ci-only marker',
+  );
+  // Comma-delimited matching, so `apple` cannot be enabled by `pineapple`.
+  assert.match(
+    plan,
+    /case ",\$only," in/,
+    'token matching is not comma-delimited, so one token can enable another',
+  );
+});
+
+// PASSKEY-012 runs inside the Android job rather than a job of its own, so no
+// plan token guards it and nothing above would notice the step going missing.
+test('the Android job runs the passkey gate', () => {
+  const text = read(WORKFLOW);
+  const start = text.indexOf('\n  build-android:\n');
+  assert.notEqual(start, -1, 'build-android job not found');
+  const rest = text.slice(start + 1);
+  const next = rest.search(/\n {2}[a-z][a-z-]*:\n/);
+  const job = next === -1 ? rest : rest.slice(0, next);
+  assert.ok(
+    /\n +bash scripts\/run_android_passkey_tests\.sh\n/.test(job),
+    'build-android no longer runs scripts/run_android_passkey_tests.sh',
+  );
+});

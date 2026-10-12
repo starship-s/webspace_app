@@ -122,20 +122,20 @@ The system SHALL delete every incognito site's native container during app start
 #### Scenario: Incognito container is wiped on startup
 
 **Given** the previous app session left disk artifacts in the container `ws-<siteId>` for an incognito site (localStorage, IDB rows, cached resources)
-**When** the app starts and `_restoreAppState` runs
+**When** the app starts and `StartupController.restore` runs
 **Then** `ContainerIsolationEngine.wipeContainers([siteId])` runs before any site activation
 **And** the on-disk container is deleted
 
 #### Scenario: Wipe is platform-aware no-op
 
-**Given** the running platform does not support the Container API (Windows, web, Android System WebView <110, iOS <17, macOS <14, WPE WebKit <2.40)
+**Given** the running platform does not support the Container API (Windows, web, an Android System WebView not reporting `MULTI_PROFILE`, iOS <17, macOS <14, WPE WebKit <2.40)
 **When** `wipeContainers([...])` runs
 **Then** it returns 0 without error
 
 #### Scenario: Non-incognito containers are preserved
 
 **Given** the user has a mix of incognito and non-incognito sites
-**When** `_restoreAppState` runs
+**When** `StartupController.restore` runs
 **Then** only the incognito sites' containers are deleted
 **And** non-incognito sites' containers (with their localStorage / IDB / cookies / SW / cache) are intact
 

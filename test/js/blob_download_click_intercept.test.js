@@ -17,7 +17,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { makeDom, readFixture, runInDom } = require('./helpers/load_shim');
+const { makeDom, runInDom, pageJs } = require('./helpers/load_shim');
 
 function bootDom() {
   const dom = makeDom();
@@ -37,7 +37,7 @@ function bootDom() {
       calls.push({ name, args });
     },
   };
-  runInDom(dom, readFixture('blob_url_capture/click_intercept.js'));
+  runInDom(dom, pageJs('blob_download_click_intercept'));
   return { dom, calls };
 }
 
@@ -199,7 +199,7 @@ test('re-evaluating the shim is idempotent (no double bridge)', () => {
   // skip re-installing both the document listener and the prototype
   // patch — otherwise a single click fires the handler twice and
   // DownloadsService starts two tasks for one click.
-  runInDom(dom, readFixture('blob_url_capture/click_intercept.js'));
+  runInDom(dom, pageJs('blob_download_click_intercept'));
   const a = dom.window.document.createElement('a');
   a.href = 'blob:https://example.com/dupe';
   a.download = 'dupe.bin';
@@ -217,8 +217,8 @@ test('toString stub is registered with __wsFnStubs when available', () => {
   const dom = makeDom();
   dom.window.flutter_inappwebview = { callHandler() {} };
   // Pre-install the capture shim so the WeakMap exists.
-  runInDom(dom, readFixture('blob_url_capture/shim.js'));
-  runInDom(dom, readFixture('blob_url_capture/click_intercept.js'));
+  runInDom(dom, pageJs('blob_url_capture'));
+  runInDom(dom, pageJs('blob_download_click_intercept'));
   const stub = dom.window.__wsFnStubs.get(
     dom.window.HTMLAnchorElement.prototype.click);
   assert.equal(stub, 'function click() { [native code] }');

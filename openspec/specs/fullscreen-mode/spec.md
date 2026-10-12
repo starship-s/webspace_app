@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Allow users to view sites in full screen mode, hiding the app bar, tab strip, and URL bar. Android keeps its status and navigation bars visible while other platforms hide system UI for an immersive experience. Supports both on-demand toggling and a per-site auto-fullscreen setting.
+Allow users to view sites in full screen mode, hiding the app bar, tab strip, URL bar, and system UI for an immersive experience. Supports both on-demand toggling and a per-site auto-fullscreen setting.
 
 ## Status
 
@@ -13,7 +13,7 @@ Allow users to view sites in full screen mode, hiding the app bar, tab strip, an
 
 ## Problem Statement
 
-Users who use WebSpace as a web-app launcher want a full app experience without browser chrome. The app bar, tab strip, and URL bar consume screen space that could be used by the web content; on non-Android platforms, system status/navigation bars can also consume space. A full screen mode gives users an immersive, app-like experience.
+Users who use WebSpace as a web-app launcher want a full app experience without browser chrome. The app bar, tab strip, and system status/navigation bars consume screen space that could be used by the web content. A full screen mode gives users an immersive, app-like experience.
 
 ---
 
@@ -27,11 +27,8 @@ The system SHALL allow users to enter full screen mode from the overflow menu or
 
 **Given** the user has a site loaded
 **When** the user opens the overflow menu (app bar or tab strip) and taps "Full Screen"
-**Then** the app bar, tab strip, URL bar, and find toolbar are hidden
-**And** Android keeps the status and navigation bars visible
-**And** other platforms hide system UI
-**And** on non-Android platforms, the webview fills the entire screen
-**And** on Android, the webview fills the area available around its system bars
+**Then** the app bar, tab strip, URL bar, find toolbar, and system UI are hidden
+**And** the webview fills the entire screen
 
 #### Scenario: Toggle full screen by double-tapping title
 
@@ -73,17 +70,16 @@ The system SHALL allow the user to exit full screen by tapping the top edge of t
 
 **Given** the user enters full screen mode
 **Then** a brief SnackBar is shown: "Tap the top of the screen to exit full screen"
-**And** an invisible centered exit target spans the safe-area height just below the status bar / notch area
+**And** a visible translucent handle is displayed just below the status bar / notch area
 
-**Rationale:** The exit zone spans `MediaQuery.padding.top + 20px` vertically but only an invisible centered 96px-wide target catches the tap; the top corners stay transparent to pointers so web-app controls there (e.g. a sidebar toggle) remain tappable instead of exiting fullscreen. The back gesture is not consumed by fullscreen so users can navigate normally while immersed.
+**Rationale:** The exit zone spans `MediaQuery.padding.top + 20px` vertically but only a centered 96px-wide band catches the tap; the top corners stay transparent to pointers so web-app controls there (e.g. a sidebar toggle) receive the tap instead of exiting fullscreen. The back gesture is not consumed by fullscreen so users can navigate normally while immersed.
 
 #### Scenario: Web control in top corner stays tappable
 
 **Given** the user is in full screen mode on a site with a control in the top-left or top-right corner
 **When** the user taps that corner
 **Then** the tap reaches the web content (full screen is not exited)
-**And** the top corners remain tappable
-**And** tapping the centered invisible target still exits full screen
+**And** tapping the centered handle still exits full screen
 
 ---
 
@@ -128,7 +124,7 @@ The system SHALL maintain the correct full screen state across app lifecycle tra
 
 **Given** the user is in full screen mode
 **When** the app is backgrounded and then resumed
-**Then** the platform-appropriate fullscreen system UI mode is re-applied
+**Then** the immersive system UI mode is re-applied
 
 ---
 
@@ -153,9 +149,7 @@ The system SHALL support a global option to keep the site tab strip visible in f
 **Given** "Site Tab Strip" is enabled
 **And** "Keep Tab Strip in Full Screen" is enabled
 **When** the user enters full screen mode
-**Then** the app bar, URL bar, and find toolbar are hidden
-**And** Android keeps the status and navigation bars visible
-**And** other platforms hide system UI
+**Then** the app bar, URL bar, find toolbar, and system UI are hidden
 **And** the tab strip remains visible at the bottom
 
 #### Scenario: Tab strip hidden in full screen (default)
@@ -171,49 +165,41 @@ The system SHALL support a global option to keep the site tab strip visible in f
 
 ---
 
-### Requirement: FS-008 - Full Screen on Direct Entry
+### Requirement: FS-008 - Full Screen on Shortcut Launch
 
-The system SHALL support a global option, enabled by default, to enter full screen automatically when a site is opened from a home-screen shortcut (Android pinned shortcut / iOS App Intents) or notification tap. The option is independent of the per-site `fullscreenMode` setting and applies to cold and warm shortcut launches and notification taps.
+The system SHALL support a global option, enabled by default, to enter full screen automatically when a site is opened from a home-screen shortcut (Android pinned shortcut / iOS App Intents). The option is independent of the per-site `fullscreenMode` setting and applies to both cold and warm shortcut launches.
 
 #### Scenario: Cold launch from shortcut
 
-**Given** "Full screen on shortcuts and notifications" is enabled
+**Given** "Full screen on shortcut launch" is enabled
 **And** the app is not running
 **When** the user taps a pinned home-screen shortcut for a site
 **Then** the app launches that site directly in full screen mode
 
 #### Scenario: Warm launch from shortcut
 
-**Given** "Full screen on shortcuts and notifications" is enabled
+**Given** "Full screen on shortcut launch" is enabled
 **And** the app is already running in the background
 **When** the user taps a pinned home-screen shortcut for a site
 **Then** the app switches to that site and enters full screen mode
 
-#### Scenario: Notification tap
-
-**Given** "Full screen on shortcuts and notifications" is enabled
-**When** the user taps a notification for a known site
-**Then** the app returns to the root/main route
-**And** the app switches to that site
-**And** the site is shown in full screen mode
-
 #### Scenario: Option disabled
 
-**Given** "Full screen on shortcuts and notifications" is disabled
-**When** the user opens a site from a home-screen shortcut or notification
-**Then** full screen is governed only by the site's per-site `fullscreenMode` (not entered just because it was opened via a shortcut or notification)
+**Given** "Full screen on shortcut launch" is disabled
+**When** the user opens a site from a home-screen shortcut
+**Then** full screen is governed only by the site's per-site `fullscreenMode` (not entered just because it was opened via a shortcut)
 
 #### Scenario: Normal site switch is unaffected
 
-**Given** "Full screen on shortcuts and notifications" is enabled
-**When** the user switches sites from inside the app (tab strip, drawer) rather than via a shortcut or notification
+**Given** "Full screen on shortcut launch" is enabled
+**When** the user switches sites from inside the app (tab strip, drawer) rather than via a shortcut
 **Then** full screen is governed only by the target site's `fullscreenMode`
 
 ---
 
 ### Requirement: FS-006 - Content Reachable Under Persistent System Bars
 
-The system SHALL keep the site's content reachable in full screen when Android keeps the status and navigation bars visible and when a non-Android platform leaves a system bar visible.
+The system SHALL keep the site's content reachable in full screen even when the platform fails to hide the system bars (e.g. Android 15 edge-to-edge, where `immersiveSticky` does not always hide the status/navigation bars).
 
 #### Scenario: System bar persists in full screen
 
@@ -223,7 +209,7 @@ The system SHALL keep the site's content reachable in full screen when Android k
 
 #### Scenario: System bars fully hidden
 
-**Given** the user is in full screen mode on a non-Android platform where `immersiveSticky` hides both bars
+**Given** the user is in full screen mode on a device where `immersiveSticky` hides both bars
 **Then** the body safe-area inset is ~0
 **And** the webview fills the entire screen
 
@@ -246,6 +232,37 @@ The system SHALL render the webview into the display cutout (notch) region on th
 **Given** a device with a landscape display cutout
 **And** the user is NOT in full screen
 **Then** the body insets around the cutout (left/right `SafeArea` active) so the app bar and content avoid the notch
+
+---
+
+### Requirement: FS-011 - App Controls Reachable Under Revealed System Bars
+
+The system SHALL keep the tab strip and the tab-bar button usable while the user has swiped the system bars in during full screen. When full screen shows any of the app's own controls (the tab strip kept in full screen, FS-007, or the tab-bar button and the strip it reveals, FS-009), a bar the user reveals SHALL be one the layout insets around, and the system SHALL hide the bars again after a short delay. A full screen that shows none of the app's controls, including a locked kiosk session (KIOSK-002), keeps the bars transient.
+
+**Rationale:** Android's sticky immersive mode shows swiped-in bars as transient overlays and keeps reporting them hidden to the app: no insets arrive and the system UI visibility listener does not fire. Nothing the app keeps at the bottom edge can then move out from under the navigation bar, so the strip under it takes no taps until the bar times out (github #672). The non-sticky immersive mode makes the reveal real: the insets arrive, the strip's bottom `SafeArea` lifts it above the bar, and the platform reports the change so the app can hide the bars again. See [BUG-023](../../../docs/bugs/023-system-bar-covers-fullscreen-controls.md).
+
+#### Scenario: Navigation bar swiped in over a kept tab strip
+
+**Given** "Keep Tab Strip in Full Screen" is enabled
+**And** the user is in full screen mode
+**When** the user swipes the navigation bar in
+**Then** the tab strip moves above the navigation bar and its tabs and menu stay tappable
+**And** the navigation bar's buttons stay tappable
+**And** about 3 seconds later the bars are hidden again and the strip returns to the bottom edge
+
+#### Scenario: Tab-bar button in full screen
+
+**Given** the tab strip presentation is set to Button
+**And** the user is in full screen mode
+**When** the user swipes the system bars in
+**Then** the button, and the strip if it was revealed, inset around the bars instead of sitting under them
+
+#### Scenario: Full screen without app controls
+
+**Given** "Keep Tab Strip in Full Screen" is disabled and the tab strip presentation is not Button
+**And** the user is in full screen mode
+**When** the user swipes the system bars in
+**Then** the bars overlay the content transiently and hide on their own, as before
 
 ---
 
@@ -341,36 +358,37 @@ The presentation is backed by two booleans, `showTabStrip` (pinned) and `tabBarB
 
 ### Runtime State
 
-**_WebSpacePageState** (`lib/main.dart`):
-- `bool _isFullscreen = false` - Current fullscreen state (not persisted; runtime only)
-- `bool _tabStripInFullscreen = false` - Global pref mirror of the `tabStripInFullscreen` SharedPreferences key (registered in `kExportedAppPrefs`, round-trips through settings backup)
-- `bool _tabBarButton = false` - Global pref mirror of the `tabBarButton` SharedPreferences key (registered in `kExportedAppPrefs`). When set, a floating button reveals the tab strip (and its overflow menu) on demand, in and out of full screen (FS-009). Read falls back to the legacy `tabBarButtonInFullscreen` key (and backup field) once on upgrade. `bool _tabBarButtonOnRight` is the legacy app-wide corner default, mapped to a bottom corner via `_tabBarButtonCornerEffective` only for sites whose per-site `tabBarButtonCorner` is null (still read from prefs/backups, never written by UI anymore); `bool _tabBarOverlayVisible` is the runtime-only flag for "the button has revealed the strip" (reset on exit-fullscreen and site switch, never persisted).
-- `bool _fullscreenOnShortcut = true` - Global pref mirror of the `fullscreenOnShortcut` SharedPreferences key (registered in `kExportedAppPrefs`, on by default). Both shortcut launch paths — `_openShortcutIndex` (warm) and the cold-launch restore path (`indexToRestore != null`) — plus notification taps route the decision through the pure `StartupRestoreEngine.shouldEnterFullscreen(directEntry, fullscreenOnShortcut, perSiteFullscreenMode)` policy and call `_enterFullscreen()` when it returns true. The persisted key remains backward compatible even though the setting covers shortcuts and notifications. The policy returns `perSiteFullscreenMode || (directEntry && fullscreenOnShortcut)`, so a normal in-app switch (`directEntry: false`) is never pulled into fullscreen by the global option. Covered by `test/startup_restore_engine_test.dart`.
+**FullscreenController** (`lib/controllers/fullscreen_controller.dart`) and app preferences:
+- `FullscreenController.active` - Current fullscreen state (not persisted; runtime only)
+- `AppPref.tabStripInFullscreen` (`lib/settings/app_prefs.dart`, default off) - Global pref under the `tabStripInFullscreen` SharedPreferences key; round-trips through settings backup
+- `AppPref.tabBarButton` (default off) - Global pref under the `tabBarButton` SharedPreferences key. When set, a floating button reveals the tab strip (and its overflow menu) on demand, in and out of full screen (FS-009). Read falls back to the legacy `tabBarButtonInFullscreen` key (and backup field) once on upgrade. `AppPref.tabBarButtonOnRight` is the legacy app-wide corner default, mapped to a bottom corner via `_tabBarButtonCornerEffective` only for sites whose per-site `tabBarButtonCorner` is null (still read from prefs/backups, never written by UI anymore); `bool FullscreenController.tabBarOverlayVisible` is the runtime-only flag for "the button has revealed the strip" (reset on exit-fullscreen and site switch, never persisted).
+- `AppPref.fullscreenOnShortcut` (on by default) - Global pref under the `fullscreenOnShortcut` SharedPreferences key. Warm and cold shortcut launches and notification direct-entry route the decision through `StartupRestoreEngine.shouldEnterFullscreen(directEntry: true, ...)`; ordinary site switches use `directEntry: false`. The policy returns `perSiteFullscreenMode || (directEntry && fullscreenOnShortcut)`, so a normal in-app switch is not pulled into fullscreen by the global option. Covered by `test/startup_restore_engine_test.dart`.
 
 ### UI Changes
 
-- **App bar**: Hidden when `_isFullscreen` is true (`appBar: _isFullscreen ? null : _buildAppBar()`)
-- **Tab strip**: `_buildTabStrip()` returns null when `_isFullscreen` unless the global `tabStripInFullscreen` pref is set (then it stays in `bottomNavigationBar` and owns the bottom safe-area inset). The `_tabStripShown` getter also renders it on demand in either mode when `_tabBarButton && _tabBarOverlayVisible`; the revealed strip carries an inline close button.
-- **Tab bar button**: the `_tabBarButtonShown` getter places `TabBarCornerButton` (`lib/widgets/tab_bar_corner_button.dart`) in the body `Stack` inside a hit-test-transparent `Positioned.fill > Padding > AnimatedAlign`, resting at the corner from `_tabBarButtonCornerEffective` (the active site's `tabBarButtonCorner`, or the legacy app-wide default mapped to a bottom corner when null). Shown when `_tabBarButton` is on, a site is loaded, the overlay is not already revealed, and the strip is not pinned for the current mode (`_showTabStrip` out of fullscreen / `_tabStripInFullscreen` in fullscreen). Tapping sets `_tabBarOverlayVisible = true` (FS-009). The widget recognizes both an immediate pan and a long-press drag (same callbacks; one recognizer wins per gesture); the drag tracks the finger through the runtime-only `_tabBarButtonDragAlignment` (fractional position from `tabBarCornerDragFraction`, measured against the body `Stack` keyed by `_bodyStackKey`; `AnimatedAlign` runs with `Duration.zero` while dragging so the button follows instantly). On release `_endTabBarButtonDrag` picks `tabBarCornerNearest` (quadrant of the drop point), stores it on the current site's model, persists via `_saveWebViewModels`, and the `AnimatedAlign` glides the button to its corner (250ms ease-out). Corner math is pure and covered by `test/tab_bar_corner_test.dart`; gesture recognition by `test/tab_bar_corner_button_test.dart`.
-- **Input bar**: `_buildInputBar()` returns null when `_isFullscreen`
-- **Body insets**: The fullscreen body keeps top/bottom `SafeArea` active (`top: _isFullscreen`, `bottom: _isFullscreen || ...`). Android uses `edgeToEdge`, so its status/navigation bars remain visible; on non-Android platforms, `immersiveSticky` hides them when supported. When a bar persists, the inset keeps the site's top/bottom controls clear of it. When the bars are truly hidden the inset is ~0 and the webview still fills the screen. Left/right insets are dropped in fullscreen (`left: !_isFullscreen`, `right: !_isFullscreen`) so the webview uses the display-cutout strip beside a landscape notch (FS-010); out of fullscreen they stay active so chrome avoids the notch.
-- **Display cutout (FS-010)**: `MainActivity.onCreate` sets `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` (API 28+) so the window may extend into the cutout on short edges. This keeps Android edge-to-edge content from letterboxing the cutout strip black.
-- **Exit zone**: top edge when fullscreen (`MediaQuery.padding.top + 20px`, measured inside the body `SafeArea`) with an invisible centered 96px-wide `GestureDetector` target. Only that target catches the exit tap; the rest of the strip is transparent to pointers so web-app controls in the top corners stay tappable (github #401)
+- **App bar**: Hidden when `FullscreenController.active` is true (`appBar: _fullscreen.active ? null : _buildAppBar()`)
+- **Tab strip**: `_buildTabStrip()` returns null when `_fullscreen.active` unless the global `tabStripInFullscreen` pref is set (then it stays in `bottomNavigationBar` and owns the bottom safe-area inset). The `_tabStripShown` getter also renders it on demand in either mode when `_tabBarButton && FullscreenController.tabBarOverlayVisible`; the revealed strip carries an inline close button.
+- **Tab bar button**: the `_tabBarButtonShown` getter places `TabBarCornerOverlay` (`lib/widgets/tab_bar_corner_button.dart`, a hit-test-transparent `Padding > AnimatedAlign` around `TabBarCornerButton`) in the body `Stack` inside a `Positioned.fill`, resting at the corner from `_tabBarButtonCornerEffective` (the active site's `tabBarButtonCorner`, or the legacy app-wide default mapped to a bottom corner when null). Shown when `_tabBarButton` is on, a site is loaded, the overlay is not already revealed, and the strip is not pinned for the current mode (`_showTabStrip` out of fullscreen / `_tabStripInFullscreen` in fullscreen). Tapping sets `FullscreenController.tabBarOverlayVisible = true` (FS-009). The widget recognizes both an immediate pan and a long-press drag (same callbacks; one recognizer wins per gesture); the drag tracks the finger through the overlay's runtime-only drag alignment (fractional position from `tabBarCornerDragFraction`, measured against the area the overlay fills; `AnimatedAlign` runs with `Duration.zero` while dragging so the button follows instantly). On release the overlay picks `tabBarCornerNearest` (quadrant of the drop point) and reports it through `onCornerChosen`; the page stores it on the current site's model and persists it through `_commitSites`, and the `AnimatedAlign` glides the button to its corner (`Motion.settle`, 250ms ease-out). Corner math is pure and covered by `test/tab_bar_corner_test.dart`; gesture recognition by `test/tab_bar_corner_button_test.dart`.
+- **Input bar**: `_buildInputBar()` returns null when `_fullscreen.active`
+- **Body insets**: The fullscreen body keeps top/bottom `SafeArea` active (`top: _fullscreen.active`, `bottom: _fullscreen.active || ...`). Android uses `edgeToEdge`, so its visible status and navigation bars retain their insets. Other platforms use the controller's immersive mode policy. Left/right insets are dropped in fullscreen (`left: !_fullscreen.active`, `right: !_fullscreen.active`) so the webview uses the display-cutout strip beside a landscape notch (FS-010); out of fullscreen they stay active so chrome avoids the notch.
+- **Display cutout (FS-010)**: `MainActivity.onCreate` sets `LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES` (API 28+) so the window may extend into the cutout on short edges. Without it, hiding the system bars makes Android letterbox the cutout strip black.
+- **Exit zone**: top edge when fullscreen (`MediaQuery.padding.top + 20px`, measured inside the body `SafeArea`) with an invisible centered 96px-wide `GestureDetector` target. Only that target catches the exit tap; the rest of the strip is transparent to pointers so web-app controls in the top corners stay tappable (github #401).
 - **Fullscreen hint**: SnackBar shown on entering fullscreen to explain exit method
 - **Menu items**: "Full Screen" added to both app bar and tab strip popup menus
 
 ### System UI
 
-- Policy: `fullscreenSystemUiMode(TargetPlatform)` in `lib/main.dart` returns `SystemUiMode.edgeToEdge` for Android and `SystemUiMode.immersiveSticky` otherwise.
-- Enter: `SystemChrome.setEnabledSystemUIMode(fullscreenSystemUiMode(defaultTargetPlatform))`
-- Exit: `SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge)`
-- Re-applied on app resume via `_resumeAfterLifecyclePause()`
+- Enter: `FullscreenController.apply()`, the one place full screen sets its mode. It asks for `FullscreenController._systemUiMode`, from the pure `fullscreenSystemUiMode` (`lib/services/fullscreen_system_ui.dart`): Android always uses `edgeToEdge`, keeping system bars visible; other platforms use `immersive` when tab controls are available and the session is not kiosk-locked, and `immersiveSticky` otherwise (FS-011).
+- On Android the system bars remain visible during fullscreen, including when the tab-strip overlay is enabled. The safe-area inset keeps page controls clear of them.
+- Exit: `SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge)`, cancelling a pending re-hide
+- Re-applied on app resume via `AppLifecycleController._resumeAfterPause()`, by `FullscreenController.enter()` when already in full screen (a shortcut launch can change the kiosk lock, an import the tab strip prefs), and when either tab strip pref changes in full screen
+- Gate: `test/js/fullscreen_system_ui_funnel.test.js` fails a `setEnabledSystemUIMode` call that names an immersive mode itself instead of going through `FullscreenController._systemUiMode`
 
 ### Site Switching
 
-In `_setCurrentIndex()`:
-- If target site has `fullscreenMode = true`, calls `_enterFullscreen()`
-- Otherwise, calls `_exitFullscreen()`
+In `setCurrentIndex()`:
+- If target site has `fullscreenMode = true`, calls `FullscreenController.enter()`
+- Otherwise, calls `FullscreenController.exit()`
 - Navigating to null index (webspaces list) always exits fullscreen
 
 ### Back Gesture
@@ -390,7 +408,7 @@ The back gesture/button is NOT consumed by fullscreen — it retains its normal 
 |------|---------|
 | `lib/web_view_model.dart` | Added `fullscreenMode` field, constructor param, toJson/fromJson |
 | `lib/screens/settings.dart` | Added fullscreen mode toggle switch |
-| `lib/main.dart` | Added `_isFullscreen` state, enter/exit/toggle methods, menu items, scaffold/body changes, back handler, lifecycle handling |
+| `lib/main.dart` | Added `_fullscreen.active` state, enter/exit/toggle methods, menu items, scaffold/body changes, back handler, lifecycle handling |
 
 ---
 
@@ -398,7 +416,7 @@ The back gesture/button is NOT consumed by fullscreen — it retains its normal 
 
 1. Open the app and navigate to a site
 2. Open the overflow menu and tap "Full Screen"
-3. Verify: app bar, tab strip, and URL bar are hidden; Android status/navigation bars remain visible and other platforms hide system bars
+3. Verify: app bar, tab strip, URL bar, and system bars are hidden
 4. Tap the top edge of the screen to exit full screen
 5. Verify: all UI elements are restored
 6. Enter full screen again, then perform a back gesture
@@ -409,4 +427,6 @@ The back gesture/button is NOT consumed by fullscreen — it retains its normal 
 11. Switch to a site without full screen mode enabled
 12. Verify: full screen is exited
 13. In full screen, background the app and resume
-14. Verify: the platform-appropriate fullscreen system UI mode is re-applied
+14. Verify: immersive mode is re-applied
+15. Enable "Keep Tab Strip in Full Screen", enter full screen, swipe the navigation bar in
+16. Verify: the tab strip sits above the navigation bar and both take taps; the bars hide again after about 3 seconds

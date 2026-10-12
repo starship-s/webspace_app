@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 0.3.0+25
+version: 0.3.5+30
 
 environment:
   sdk: '3.10.7'
@@ -42,6 +42,7 @@ dependencies:
   shared_preferences: ^2.1.0
   http: ^1.2.2
   crypto: ^3.0.0
+  meta: ^1.16.0
   cryptography: ^2.7.0
   socks5_proxy: ^2.1.1
   cached_network_image: ^3.4.1
@@ -63,6 +64,9 @@ dependencies:
   flutter_cache_manager: ^3.3.0
   path_provider: ^2.1.0
   encrypt: ^5.0.3
+  # Named for the exception a failed GCM tag check throws; encrypt's own
+  # engine, already locked through it.
+  pointycastle: ^3.9.1
   share_plus: ^12.0.0
   qr_flutter: ^4.1.0
   flutter_zxing: ^2.2.1
@@ -74,6 +78,9 @@ dependencies:
   # Already a transitive dependency of other packages; promoted to direct
   # so it has a stable version constraint we control.
   archive: ^4.0.0
+  # Parses the OpenSearch descriptions sites declare (LIR-035). Already a
+  # transitive dependency; promoted to direct for the same reason as archive.
+  xml: ^6.6.1
 
 dev_dependencies:
   flutter_test:
@@ -86,6 +93,16 @@ dev_dependencies:
   # transitively via flutter_test); declared direct for the surface-repaint
   # nudge-loop race test.
   fake_async: ^1.3.3
+  # The https arms of the proxy tiers mint their own certificate (with
+  # pointycastle, a main dependency): the macOS integration tier runs an app
+  # bundle, where no `openssl` binary is on PATH. Already locked transitively.
+  asn1lib: ^1.6.5
+  # test/helpers/real_app.dart registers the Android webview platform to pump
+  # the shipped app; the fork's ref is pinned by the overrides below.
+  flutter_inappwebview_android: any
+  # test/named_arguments_test.dart parses every Dart source to hold CLAUDE.md
+  # rule 2 (named arguments past the first).
+  analyzer: ^10.0.1
 
 # Per-site container isolation requires APIs not present in upstream
 # flutter_inappwebview. We maintain a fork that adds a first-class
@@ -100,32 +117,32 @@ dependency_overrides:
   flutter_inappwebview:
     git:
       url: https://github.com/starship-s/flutter_inappwebview
-      ref: 643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64
+      ref: 57b322872bb1a84283b908a56ab21acafd7cb77e
       path: flutter_inappwebview
   flutter_inappwebview_android:
     git:
       url: https://github.com/starship-s/flutter_inappwebview
-      ref: 1a8ed58fddea13cb5f2799b4bf64c120917fc5c1
+      ref: 57b322872bb1a84283b908a56ab21acafd7cb77e
       path: flutter_inappwebview_android
   flutter_inappwebview_ios:
     git:
       url: https://github.com/starship-s/flutter_inappwebview
-      ref: 643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64
+      ref: 57b322872bb1a84283b908a56ab21acafd7cb77e
       path: flutter_inappwebview_ios
   flutter_inappwebview_macos:
     git:
       url: https://github.com/starship-s/flutter_inappwebview
-      ref: 643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64
+      ref: 57b322872bb1a84283b908a56ab21acafd7cb77e
       path: flutter_inappwebview_macos
   flutter_inappwebview_linux:
     git:
       url: https://github.com/starship-s/flutter_inappwebview
-      ref: 643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64
+      ref: 57b322872bb1a84283b908a56ab21acafd7cb77e
       path: flutter_inappwebview_linux
   flutter_inappwebview_platform_interface:
     git:
       url: https://github.com/starship-s/flutter_inappwebview
-      ref: 643cf23eb6fb2cb63ed26ce3c1f0a0bff891ab64
+      ref: 57b322872bb1a84283b908a56ab21acafd7cb77e
       path: flutter_inappwebview_platform_interface
 
 flutter:
@@ -136,6 +153,7 @@ flutter:
     - assets/licenses/
     - assets/webspace_icon.png
     - assets/webspace_icon_dark.png
+    - lib/js/
 
 flutter_launcher_icons:
   android: true

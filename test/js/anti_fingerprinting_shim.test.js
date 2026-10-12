@@ -13,15 +13,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { JSDOM } = require('jsdom');
-const fs = require('node:fs');
-const path = require('node:path');
-
-const repoRoot = path.resolve(__dirname, '..', '..');
-const fixturesRoot = path.join(repoRoot, 'test', 'js_fixtures');
-
-function readFixture(rel) {
-  return fs.readFileSync(path.join(fixturesRoot, rel), 'utf8');
-}
+const { pageJs } = require('./helpers/load_shim');
 
 // Stubs for browser APIs jsdom omits. Each stub records every call onto
 // `window.__calls` so tests can assert the wrapper actually invoked the
@@ -29,6 +21,28 @@ function readFixture(rel) {
 function installFpStubs(window) {
   window.__calls = [];
   function record(name, args) { window.__calls.push({ name, args }); }
+
+  // jsdom has no TextMetrics. Model the interface rather than stubbing it:
+  // real values live behind prototype getters and the instance carries no own
+  // properties, which is what the shim patches and what a test can check.
+  class TextMetrics {
+    constructor(values) { Object.defineProperty(this, '_v', { value: values }); }
+  }
+  for (const name of ['width', 'actualBoundingBoxLeft', 'actualBoundingBoxRight',
+                      'actualBoundingBoxAscent', 'actualBoundingBoxDescent']) {
+    Object.defineProperty(TextMetrics.prototype, name, {
+      configurable: true, enumerable: true,
+      get() { return this._v[name]; },
+    });
+  }
+  window.TextMetrics = TextMetrics;
+
+  // jsdom returns an empty list for a detached element, so the shim's
+  // getClientRects wrapper would have nothing to jitter.
+  window.Element.prototype.getClientRects = function() {
+    record('el.getClientRects', []);
+    return [new window.DOMRect(10, 20, 30, 40), new window.DOMRect(50, 60, 70, 80)];
+  };
 
   // --- WebGL ---
   function WebGLRenderingContext() {}
@@ -64,10 +78,10 @@ function installFpStubs(window) {
   };
   CanvasRenderingContext2D.prototype.measureText = function(text) {
     record('ctx.measureText', [text]);
-    return {
+    return new window.TextMetrics({
       width: 42, actualBoundingBoxLeft: 1, actualBoundingBoxRight: 41,
       actualBoundingBoxAscent: 10, actualBoundingBoxDescent: 2,
-    };
+    });
   };
   CanvasRenderingContext2D.prototype.fillRect = function() { record('ctx.fillRect', [...arguments]); };
   CanvasRenderingContext2D.prototype.save = function() {};
@@ -103,9 +117,38 @@ function installFpStubs(window) {
   function OffscreenCanvasRenderingContext2D() {}
   OffscreenCanvasRenderingContext2D.prototype.measureText = function(text) {
     record('osc.measureText', [text]);
-    return { width: 24, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 1 };
+    return new window.TextMetrics(
+      { width: 24, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 1 });
   };
+  OffscreenCanvasRenderingContext2D.prototype.getImageData = function(x, y, w, h) {
+    record('osc.getImageData', [x, y, w, h]);
+    const data = new Uint8ClampedArray(w * h * 4);
+    for (let i = 0; i < data.length; i++) data[i] = 100;
+    return { data, width: w, height: h, colorSpace: 'srgb' };
+  };
+  OffscreenCanvasRenderingContext2D.prototype.fillRect = function() {
+    record('osc.fillRect', [...arguments]);
+  };
+  Object.defineProperty(OffscreenCanvasRenderingContext2D.prototype, 'fillStyle', {
+    configurable: true,
+    get() { return this._fillStyle; },
+    set(v) { this._fillStyle = v; },
+  });
   window.OffscreenCanvasRenderingContext2D = OffscreenCanvasRenderingContext2D;
+  function OffscreenCanvas(w, h) { this.width = w || 300; this.height = h || 150; }
+  OffscreenCanvas.prototype.getContext = function(type) {
+    record('osc.getContext', [type]);
+    if (type === '2d') {
+      if (!this.__ctx) this.__ctx = new OffscreenCanvasRenderingContext2D();
+      return this.__ctx;
+    }
+    return null;
+  };
+  OffscreenCanvas.prototype.convertToBlob = function() {
+    record('osc.convertToBlob', []);
+    return Promise.resolve(new (window.Blob || function() {})(['stub']));
+  };
+  window.OffscreenCanvas = OffscreenCanvas;
 
   // --- Audio ---
   function AudioBuffer() {}
@@ -173,15 +216,98 @@ function makeDom({ url = 'https://example.com/' } = {}) {
   return dom;
 }
 
-function loadShim(rel, options) {
+function loadShim(source, options, prepare) {
   const dom = makeDom(options);
-  dom.window.eval(readFixture(rel));
+  if (prepare) prepare(dom.window);
+  dom.window.eval(source);
   return dom;
 }
 
-const ALPHA = 'anti_fingerprinting/shim_seed_alpha.js';
-const BETA = 'anti_fingerprinting/shim_seed_beta.js';
-const ALPHA_LETTERBOX = 'anti_fingerprinting/shim_seed_alpha_letterbox.js';
+// jsdom's own navigator.plugins is already an empty PluginArray, so a test
+// that only reads it back passes whether or not the shim ran. Seeding a
+// populated collection first is what makes the assertion able to fail.
+function seedPlugins(window) {
+  function FakePluginArray() {}
+  Object.defineProperty(FakePluginArray.prototype, 'length', {
+    configurable: true, enumerable: true,
+    get: function() { return this.__entries.length; },
+  });
+  FakePluginArray.prototype.item = function(i) { return this.__entries[i] || null; };
+  FakePluginArray.prototype.namedItem = function(n) {
+    return this.__entries.find((e) => e.name === n) || null;
+  };
+  FakePluginArray.prototype.refresh = function() {};
+
+  function make(entries) {
+    const inst = Object.create(FakePluginArray.prototype);
+    inst.__entries = entries;
+    return inst;
+  }
+  const navProto = Object.getPrototypeOf(window.navigator);
+  for (const [prop, entries] of [
+    ['plugins', [{ name: 'PDF Viewer' }, { name: 'Chrome PDF Viewer' }]],
+    ['mimeTypes', [{ type: 'application/pdf' }]],
+  ]) {
+    Object.defineProperty(navProto, prop, {
+      configurable: true, enumerable: true, get: () => make(entries),
+    });
+  }
+}
+
+// jsdom's navigator has neither deviceMemory nor getBattery, and neither has
+// WebKit. The shim corrects them only where the engine already exposes them,
+// so a test of the spoofed value has to model a Chromium engine first, or it
+// asserts on the shim's own addition rather than on an override.
+function seedChromiumNav(window) {
+  const navProto = Object.getPrototypeOf(window.navigator);
+  Object.defineProperty(navProto, 'deviceMemory', {
+    configurable: true, enumerable: true, get: () => 2,
+  });
+  Object.defineProperty(navProto, 'getBattery', {
+    configurable: true, writable: true,
+    value: function getBattery() {
+      return Promise.resolve({ charging: false, level: 0.37 });
+    },
+  });
+}
+
+// jsdom has no NetworkInformation. Model desktop Chromium's: values behind
+// prototype accessors, an `onchange` slot, and no `type` / `downlinkMax`.
+function seedConnection(window) {
+  function NetworkInformation() {}
+  const real = { effectiveType: '3g', rtt: 275, downlink: 0.4, saveData: true };
+  for (const name of Object.keys(real)) {
+    Object.defineProperty(NetworkInformation.prototype, name, {
+      configurable: true, enumerable: true, get: () => real[name],
+    });
+  }
+  let handler = null;
+  Object.defineProperty(NetworkInformation.prototype, 'onchange', {
+    configurable: true, enumerable: true,
+    get() { return handler; }, set(v) { handler = v; },
+  });
+  window.__connListeners = [];
+  NetworkInformation.prototype.addEventListener = function(type) {
+    window.__connListeners.push(type);
+  };
+  const conn = new NetworkInformation();
+  Object.defineProperty(Object.getPrototypeOf(window.navigator), 'connection', {
+    configurable: true, enumerable: true, get: () => conn,
+  });
+}
+
+// Every key reachable on navigator, own and inherited.
+function navKeys(navigator) {
+  const seen = new Set();
+  for (let o = navigator; o; o = Object.getPrototypeOf(o)) {
+    for (const k of Object.getOwnPropertyNames(o)) seen.add(k);
+  }
+  return seen;
+}
+
+const ALPHA = pageJs('anti_fingerprinting', { seed: 'alpha-fixture-seed', letterbox: false });
+const BETA = pageJs('anti_fingerprinting', { seed: 'beta-fixture-seed', letterbox: false });
+const ALPHA_LETTERBOX = pageJs('anti_fingerprinting', { seed: 'alpha-fixture-seed', letterbox: true });
 
 // --- screen.* ---
 
@@ -281,6 +407,41 @@ test('matchMedia delegates non-device queries to the real implementation', () =>
   assert.ok(delegated.length >= 1, 'non-device query was not delegated');
 });
 
+test('compound, range and ratio device queries are rewritten, never delegated raw (SEC-019)', () => {
+  const seen = [];
+  const dom = loadShim(ALPHA, undefined, (w) => {
+    // A stand-in engine that evaluates only the two sentinel features the
+    // rewrite emits, joined by `and`.
+    w.matchMedia = function matchMedia(q) {
+      seen.push(q);
+      return {
+        matches: !/99999999px/.test(q), media: q, onchange: null,
+        addListener() {}, removeListener() {},
+        addEventListener() {}, removeEventListener() {},
+        dispatchEvent() { return false; },
+      };
+    };
+  });
+  const mm = dom.window.matchMedia;
+  assert.equal(mm('(max-device-width: 1920px) and (min-width: 0px)').matches, true);
+  assert.equal(mm('(max-device-width: 1919px) and (min-width: 0px)').matches, false);
+  assert.equal(mm('screen and (max-device-width: 1919px)').matches, false);
+  assert.equal(mm('(device-width >= 1920px)').matches, true);
+  assert.equal(mm('(device-width < 1920px)').matches, false);
+  assert.equal(mm('(1000px <= device-width <= 2000px)').matches, true);
+  assert.equal(mm('(1000px <= device-width < 1920px)').matches, false);
+  assert.equal(mm('(device-aspect-ratio: 16/9)').matches, true);
+  assert.equal(mm('(min-device-aspect-ratio: 2/1)').matches, false);
+  assert.equal(mm('(max-device-width: 120em)').matches, true);
+  assert.equal(mm('(max-device-height: 67.4em)').matches, false);
+  const q = '(max-device-width: 1919px) and (min-width: 0px)';
+  assert.equal(mm(q).media, q);
+  for (const s of seen) {
+    assert.doesNotMatch(s, /device-(width|height|aspect-ratio)/i,
+      `a raw device query reached the engine: ${s}`);
+  }
+});
+
 test('patched matchMedia stringifies as [native code]', () => {
   const dom = loadShim(ALPHA);
   const s = dom.window.Function.prototype.toString.call(dom.window.matchMedia);
@@ -297,7 +458,7 @@ test('navigator.hardwareConcurrency is in the seeded range [4, 8]', () => {
 });
 
 test('navigator.deviceMemory is one of {4, 8}', () => {
-  const dom = loadShim(ALPHA);
+  const dom = loadShim(ALPHA, undefined, seedChromiumNav);
   const dm = dom.window.navigator.deviceMemory;
   assert.ok(dm === 4 || dm === 8, `deviceMemory=${dm} not in {4,8}`);
 });
@@ -306,8 +467,8 @@ test('same seed → same hardwareConcurrency / deviceMemory across runs', () => 
   // Per-site stability: a given site must report the same hardware
   // fingerprint on every launch. Re-loading the same fixture twice
   // must produce the same numbers.
-  const a = loadShim(ALPHA);
-  const b = loadShim(ALPHA);
+  const a = loadShim(ALPHA, undefined, seedChromiumNav);
+  const b = loadShim(ALPHA, undefined, seedChromiumNav);
   assert.equal(a.window.navigator.hardwareConcurrency,
     b.window.navigator.hardwareConcurrency);
   assert.equal(a.window.navigator.deviceMemory,
@@ -319,8 +480,8 @@ test('different seeds may report different deviceMemory', () => {
   // disagree. Since deviceMemory is binary {4, 8} we check the values
   // are present and well-formed; the alpha/beta seeds were chosen to
   // straddle the threshold.
-  const a = loadShim(ALPHA).window.navigator.deviceMemory;
-  const b = loadShim(BETA).window.navigator.deviceMemory;
+  const a = loadShim(ALPHA, undefined, seedChromiumNav).window.navigator.deviceMemory;
+  const b = loadShim(BETA, undefined, seedChromiumNav).window.navigator.deviceMemory;
   assert.ok([4, 8].includes(a));
   assert.ok([4, 8].includes(b));
 });
@@ -342,13 +503,96 @@ test('navigator.mimeTypes is empty', () => {
   assert.equal(mt.item(0), null);
 });
 
+test('a populated plugin list is actually emptied', () => {
+  const dom = loadShim(ALPHA, undefined, seedPlugins);
+  const plugins = dom.window.navigator.plugins;
+  assert.equal(plugins.length, 0);
+  assert.equal(plugins.item(0), null);
+  assert.equal(plugins.namedItem('PDF Viewer'), null);
+  assert.equal(dom.window.navigator.mimeTypes.length, 0);
+});
+
+test('the emptied collections are not arrays and carry no own properties', () => {
+  const dom = loadShim(ALPHA, undefined, seedPlugins);
+  for (const c of [dom.window.navigator.plugins, dom.window.navigator.mimeTypes]) {
+    assert.equal(Array.isArray(c), false);
+    assert.deepEqual(Object.getOwnPropertyNames(c), []);
+  }
+});
+
 test('navigator.getBattery resolves to fixed values', async () => {
-  const dom = loadShim(ALPHA);
+  const dom = loadShim(ALPHA, undefined, seedChromiumNav);
   const battery = await dom.window.navigator.getBattery();
   assert.equal(battery.charging, true);
   assert.equal(battery.level, 1);
   assert.equal(battery.dischargingTime, Infinity);
   assert.equal(typeof battery.addEventListener, 'function');
+});
+
+test('the shim introduces no navigator property the engine lacks', () => {
+  // Class-level gate for ETP-010. An absent property that appears under the
+  // shim answers `'x' in navigator` differently from the real engine, which
+  // is the same leak as an own-property override and needs no measurement.
+  const dom = makeDom();
+  const before = navKeys(dom.window.navigator);
+  dom.window.eval(ALPHA);
+  const added = [...navKeys(dom.window.navigator)].filter((k) => !before.has(k));
+  assert.deepEqual(added, [], `shim added ${added.join(', ')} to navigator`);
+});
+
+test('deviceMemory stays absent on an engine without it', () => {
+  // Chromium-only, so on the WebKit builds behind iOS, macOS and Linux the
+  // spoofed value must not appear at all.
+  const dom = loadShim(ALPHA);
+  assert.equal('deviceMemory' in dom.window.navigator, false);
+  assert.equal(dom.window.navigator.deviceMemory, undefined);
+});
+
+test('navigator.connection reports fixed link values (ETP-026)', () => {
+  const dom = loadShim(ALPHA, undefined, seedConnection);
+  const c = dom.window.navigator.connection;
+  assert.equal(c.effectiveType, '4g');
+  assert.equal(c.rtt, 50);
+  assert.equal(c.downlink, 10);
+  assert.equal(c.saveData, false);
+});
+
+test('navigator.connection gains no field the engine lacks (ETP-026)', () => {
+  const dom = loadShim(ALPHA, undefined, seedConnection);
+  const c = dom.window.navigator.connection;
+  // Desktop Chromium has neither, and the seeded interface above has neither.
+  assert.equal('type' in c, false);
+  assert.equal('downlinkMax' in c, false);
+});
+
+test('a change listener on navigator.connection is not registered (ETP-026)', () => {
+  // Static values plus a change event is a contradiction, and the event's
+  // timing alone tracks the user moving between networks.
+  const dom = loadShim(ALPHA, undefined, seedConnection);
+  dom.window.navigator.connection.addEventListener('change', () => {});
+  dom.window.navigator.connection.addEventListener('typechange', () => {});
+  assert.deepEqual(dom.window.__connListeners, ['typechange']);
+});
+
+test('navigator.connection.onchange round-trips but never fires (ETP-026)', () => {
+  // A handler slot that answers null after an assignment is itself a
+  // one-expression tell. The value is kept, the engine never sees it.
+  const dom = loadShim(ALPHA, undefined, seedConnection);
+  const c = dom.window.navigator.connection;
+  assert.equal(c.onchange, null);
+  const fn = () => {};
+  c.onchange = fn;
+  assert.equal(c.onchange, fn);
+  c.onchange = 42;
+  assert.equal(c.onchange, null, 'a non-function assigns as null, as natively');
+  // Nothing reached the engine: the seeded interface records registrations.
+  assert.deepEqual(dom.window.__connListeners, []);
+});
+
+test('getBattery stays absent on an engine without it', () => {
+  const dom = loadShim(ALPHA);
+  assert.equal('getBattery' in dom.window.navigator, false);
+  assert.equal(dom.window.navigator.getBattery, undefined);
 });
 
 test('speechSynthesis.getVoices returns []', () => {
@@ -373,6 +617,31 @@ test('navigator overrides land on Navigator.prototype, not the instance', () => 
 
 // --- Canvas 2D ---
 
+test('OffscreenCanvasRenderingContext2D.getImageData is noised like the on-screen one (SEC-018)', () => {
+  const read = (fixture) => {
+    const dom = loadShim(fixture);
+    const ctx = new dom.window.OffscreenCanvas(64, 64).getContext('2d');
+    return Array.from(ctx.getImageData(0, 0, 64, 64).data);
+  };
+  const a = read(ALPHA);
+  assert.ok(a.some((v, i) => i % 4 === 0 && v !== 100), 'no pixel was touched');
+  assert.deepEqual(a, read(ALPHA), 'the noise must be stable per site');
+  assert.notDeepEqual(a, read(BETA));
+});
+
+test('OffscreenCanvas.convertToBlob nudges the canvas once (SEC-018)', async () => {
+  const dom = loadShim(ALPHA);
+  const c = new dom.window.OffscreenCanvas(8, 8);
+  await c.convertToBlob();
+  await c.convertToBlob();
+  const fills = dom.window.__calls.filter(x => x.name === 'osc.fillRect');
+  assert.equal(fills.length, 1);
+  assert.match(
+    dom.window.Function.prototype.toString.call(dom.window.OffscreenCanvas.prototype.convertToBlob),
+    /\[native code\]/,
+  );
+});
+
 test('CanvasRenderingContext2D.prototype.getImageData calls original and returns ImageData', () => {
   const dom = loadShim(ALPHA);
   const ctx = new dom.window.CanvasRenderingContext2D();
@@ -383,6 +652,36 @@ test('CanvasRenderingContext2D.prototype.getImageData calls original and returns
   // The original was invoked exactly once via the wrapper.
   const calls = dom.window.__calls.filter(c => c.name === 'ctx.getImageData');
   assert.equal(calls.length, 1);
+});
+
+test('the noise nudge is applied once per canvas, not once per read', () => {
+  // The nudge paints onto the canvas, so re-running it on the next read
+  // stacks a second pixel and two reads of one canvas disagree — the
+  // averaging weakness the noise exists to resist.
+  const dom = loadShim(ALPHA);
+  const canvas = dom.window.document.createElement('canvas');
+  canvas.width = 32; canvas.height = 32;
+  canvas.toDataURL('image/png');
+  canvas.toDataURL('image/png');
+  canvas.getContext('2d').getImageData(0, 0, 4, 4);
+  const fills = dom.window.__calls.filter((c) => c.name === 'ctx.fillRect');
+  assert.equal(fills.length, 1);
+
+  // A second canvas still gets its own.
+  const other = dom.window.document.createElement('canvas');
+  other.width = 32; other.height = 32;
+  other.toDataURL('image/png');
+  assert.equal(dom.window.__calls.filter((c) => c.name === 'ctx.fillRect').length, 2);
+});
+
+test('performance.now is quantized without becoming an own property', () => {
+  // A pristine engine reports no own properties on `performance`; assigning
+  // the wrapper to the instance announced the quantization through the one
+  // enumeration the rest of the shim stays out of.
+  const dom = loadShim(ALPHA);
+  assert.deepEqual(Object.getOwnPropertyNames(dom.window.performance), []);
+  const t = dom.window.performance.now();
+  assert.equal(t % 100, 0);
 });
 
 test('Canvas toDataURL invokes the original after a noise nudge', () => {
@@ -413,6 +712,17 @@ test('measureText returns jittered numeric fields and preserves shape', () => {
     `width=${m.width} jitter outside ±0.1% bound`);
   // Other numeric fields are jittered too; non-numeric fields untouched.
   assert.equal(typeof m.actualBoundingBoxAscent, 'number');
+});
+
+test('measureText hands back the engine TextMetrics, not a copy', () => {
+  // The old wrapper returned a plain object: `instanceof TextMetrics` false,
+  // prototype chain ending at Object, and zero own properties turned into
+  // five. All three are readable in one line.
+  const dom = loadShim(ALPHA);
+  const m = new dom.window.CanvasRenderingContext2D().measureText('hello');
+  assert.ok(m instanceof dom.window.TextMetrics);
+  assert.equal(Object.getPrototypeOf(m), dom.window.TextMetrics.prototype);
+  assert.deepEqual(Object.getOwnPropertyNames(m).filter((k) => k !== '_v'), []);
 });
 
 test('measureText jitter is deterministic per seed + text', () => {
@@ -566,6 +876,40 @@ test('Element.getBoundingClientRect returns a rect with sub-pixel jitter', () =>
   assert.ok(Math.abs(r.y) < 0.01, `y=${r.y} jitter outside bound`);
 });
 
+test('getBoundingClientRect returns a real DOMRect', () => {
+  // Same class of tell as TextMetrics: the object literal this used to build
+  // failed `instanceof DOMRect` and broke callers that type-checked it.
+  const dom = loadShim(ALPHA);
+  const el = dom.window.document.createElement('div');
+  assert.ok(el.getBoundingClientRect() instanceof dom.window.DOMRect);
+});
+
+test('getClientRects is jittered too, and agrees with the bounding rect', () => {
+  // Unwrapped, getClientRects handed back exact geometry for the same element
+  // whose bounding rect was jittered: a bypass, and a disagreement between two
+  // APIs that must agree.
+  const dom = loadShim(ALPHA);
+  const el = dom.window.document.createElement('div');
+  const rects = el.getClientRects();
+  assert.equal(rects.length, 2);
+  for (const r of rects) {
+    assert.ok(r instanceof dom.window.DOMRect);
+  }
+  assert.notEqual(rects[0].x, 10, 'first rect x must not be the raw value');
+  assert.ok(Math.abs(rects[0].x - 10) < 0.001);
+  assert.equal(rects[0].width, 30, 'width is not jittered');
+  assert.equal(typeof rects.item, 'function');
+  assert.equal(rects.item(0), rects[0]);
+  assert.equal(rects.item(5), null);
+});
+
+test('getClientRects jitter is deterministic per seed and differs per seed', () => {
+  const at = (fx) => loadShim(fx).window.document.createElement('div')
+      .getClientRects()[0].x;
+  assert.equal(at(ALPHA), at(ALPHA));
+  assert.notEqual(at(ALPHA), at(BETA));
+});
+
 test('getBoundingClientRect is deterministic per (seed, element identity)', () => {
   const dom = loadShim(ALPHA);
   const div = dom.window.document.createElement('div');
@@ -622,9 +966,9 @@ test('re-running the shim does not double-wrap (idempotent)', () => {
   // on every frame. The guard `__ws_anti_fp_shim__` must short-circuit
   // the second run so wrappers don't wrap themselves.
   const dom = makeDom();
-  dom.window.eval(readFixture(ALPHA));
+  dom.window.eval(ALPHA);
   const beforeWidth = new dom.window.CanvasRenderingContext2D().measureText('x').width;
-  dom.window.eval(readFixture(ALPHA));  // re-run
+  dom.window.eval(ALPHA);  // re-run
   const afterWidth = new dom.window.CanvasRenderingContext2D().measureText('x').width;
   // If re-running double-wrapped, the jitter would compound. Re-entrance
   // guard makes the second run a no-op so the width is identical.

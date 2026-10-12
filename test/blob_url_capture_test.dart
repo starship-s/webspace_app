@@ -2,48 +2,49 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/blob_url_capture.dart';
+import 'package:webspace/services/page_js.dart';
 
 void main() {
-  group('blobUrlCaptureScript', () {
+  group('PageJs.blobUrlCapture.script', () {
     test('emits the reentrance guard so repeat frames do not re-wrap', () {
       // initialUserScripts re-fire on every frame load; without the
       // `if (window.__webspaceBlobs) return` guard the wrapper would
       // re-wrap and forget the previously-captured blobs each time.
-      expect(blobUrlCaptureScript, contains('if (window.__webspaceBlobs) return'));
+      expect(PageJs.blobUrlCapture.script, contains('if (window.__webspaceBlobs) return'));
     });
 
     test('wraps both URL.createObjectURL and URL.revokeObjectURL', () {
       // If only createObjectURL is wrapped, the map grows without bound;
       // if only revokeObjectURL is wrapped, captures never happen.
-      expect(blobUrlCaptureScript, contains('URL.createObjectURL = _patchedCreate'));
-      expect(blobUrlCaptureScript, contains('URL.revokeObjectURL = _patchedRevoke'));
-      expect(blobUrlCaptureScript, contains('var origCreate = URL.createObjectURL'));
-      expect(blobUrlCaptureScript, contains('var origRevoke = URL.revokeObjectURL'));
+      expect(PageJs.blobUrlCapture.script, contains('URL.createObjectURL = _patchedCreate'));
+      expect(PageJs.blobUrlCapture.script, contains('URL.revokeObjectURL = _patchedRevoke'));
+      expect(PageJs.blobUrlCapture.script, contains('var origCreate = URL.createObjectURL'));
+      expect(PageJs.blobUrlCapture.script, contains('var origRevoke = URL.revokeObjectURL'));
     });
 
     test('only tracks values that are instanceof Blob', () {
       // URL.createObjectURL also accepts MediaSource on some platforms;
       // capturing those would put a non-Blob into the map and crash the
       // download IIFE when it hands a MediaSource to FileReader.
-      expect(blobUrlCaptureScript, contains('obj instanceof Blob'));
+      expect(PageJs.blobUrlCapture.script, contains('obj instanceof Blob'));
     });
 
     test('exposes the global the download IIFE looks up', () {
       // The IIFE in webview.dart reads window.__webspaceBlobs.get(url);
       // changing the export name here without updating the IIFE silently
       // disables the fix. The cross-check test below ties the two ends.
-      expect(blobUrlCaptureScript, contains("'__webspaceBlobs'"));
-      expect(blobUrlCaptureScript, contains('Object.defineProperty(window'));
-      expect(blobUrlCaptureScript, contains('enumerable: false'));
+      expect(PageJs.blobUrlCapture.script, contains("'__webspaceBlobs'"));
+      expect(PageJs.blobUrlCapture.script, contains('Object.defineProperty(window'));
+      expect(PageJs.blobUrlCapture.script, contains('enumerable: false'));
     });
 
     test('caps the map at MAX = 64 entries with FIFO eviction', () {
       // A page that mints blob URLs but never revokes (some SPAs) would
       // otherwise grow the map without limit and pin every Blob in
       // memory. The bound makes the leak survivable.
-      expect(blobUrlCaptureScript, contains('MAX = 64'));
-      expect(blobUrlCaptureScript, contains('keys.shift()'));
-      expect(blobUrlCaptureScript, contains('map.delete(oldest)'));
+      expect(PageJs.blobUrlCapture.script, contains('MAX = 64'));
+      expect(PageJs.blobUrlCapture.script, contains('keys.shift()'));
+      expect(PageJs.blobUrlCapture.script, contains('map.delete(oldest)'));
     });
 
     test('revokeObjectURL is a passthrough — map entry survives revoke', () {
@@ -55,12 +56,12 @@ void main() {
       // IIFE's fast-path lookup miss, the fallback fetch fires,
       // and CSP connect-src kills it. Holding the Blob reference
       // through revoke keeps FileReader access working.
-      expect(blobUrlCaptureScript,
+      expect(PageJs.blobUrlCapture.script,
           isNot(contains('map.delete(url)')));
       // The wrap must still chain to the original revoke so chromium's
       // public URL registry is cleaned up — the contract change is only
       // about our cache, not about the page-visible URL.
-      expect(blobUrlCaptureScript,
+      expect(PageJs.blobUrlCapture.script,
           contains('origRevoke.apply(URL, arguments)'));
     });
 
@@ -69,17 +70,13 @@ void main() {
       // If the registration is dropped (or moved past DOCUMENT_END), the
       // shim never gets a chance to wrap createObjectURL before the page
       // calls it, and github.com downloads silently break again.
-      final webviewSrc = File('lib/services/webview.dart').readAsStringSync();
-      expect(webviewSrc, contains("groupName: 'blob_url_capture'"));
-      // Find the registration block and make sure the injection time on it
-      // is DOCUMENT_START.
-      final blockStart = webviewSrc.indexOf("groupName: 'blob_url_capture'");
+      final webviewSrc = File('lib/services/page_scripts.dart').readAsStringSync();
+      final blockStart = webviewSrc.indexOf(
+          RegExp(r"pageShim\('blob_url_capture',\s*js: PageJs.blobUrlCapture.script"));
       expect(blockStart, greaterThan(0));
-      final blockEnd = webviewSrc.indexOf('));', blockStart);
-      expect(blockEnd, greaterThan(blockStart));
-      final block = webviewSrc.substring(blockStart, blockEnd);
-      expect(block, contains('AT_DOCUMENT_START'));
-      expect(block, contains(r'$blobUrlCaptureScript'));
+      final block =
+          webviewSrc.substring(blockStart, webviewSrc.indexOf(');', blockStart));
+      expect(block, isNot(contains('ShimTime.end')));
     });
 
     test('blob-download IIFE looks up the same global the shim exports', () {
@@ -96,7 +93,7 @@ void main() {
       expect(iife, contains('window.__webspaceBlobs.get(blobUrl)'));
       // The IIFE must call out to the shim's API with the same key the
       // shim uses internally, otherwise the fast path is dead code.
-      expect(blobUrlCaptureScript, contains("'__webspaceBlobs'"));
+      expect(PageJs.blobUrlCapture.script, contains("'__webspaceBlobs'"));
     });
   });
 
@@ -177,26 +174,26 @@ void main() {
     });
   });
 
-  group('blobDownloadClickInterceptScript', () {
+  group('PageJs.blobDownloadClickIntercept.script', () {
     test('emits the reentrance guard so repeat frames do not re-hook', () {
       // initialUserScripts re-fire on every frame load; without the
       // guard the click listener would be added repeatedly and the
       // anchor click() would re-wrap, breaking page-side toString
       // hardening.
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains('if (window.__webspaceBlobClickHooked) return'));
     });
 
-    test('blob interception requires <a> with download attr and blob: href', () {
+    test('only intercepts <a> with download attr AND blob: href', () {
       // A plain blob: anchor (no download attr) is a navigation, not a
       // download — the page wants to display the blob inline and we
       // must not preventDefault. The shape of the predicate is locked
       // in here as a contract.
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("el.tagName !== 'A'"));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("el.hasAttribute('download')"));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("downloadHref(el).indexOf('blob:') === 0"));
     });
 
@@ -205,17 +202,17 @@ void main() {
       // present. Both click paths remove only that attr; the attached path
       // returns without canceling the event, and the detached path reaches
       // the original click implementation.
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("href.indexOf('http:') === 0"));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("href.indexOf('https:') === 0"));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("el.removeAttribute('download')"));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains('else if (isHttpDownloadAnchor(el)) {\n'
               '          removeDownloadAttribute(el);\n'
               '        }'));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains('if (isHttpDownloadAnchor(this)) {\n'
               '          removeDownloadAttribute(this);\n'
               '        }\n'
@@ -230,9 +227,9 @@ void main() {
       // anchor is never appended to the DOM and the event never
       // bubbles to document. Dropping either leaves a major SaveAs
       // flow broken.
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("document.addEventListener('click'"));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains('HTMLAnchorElement.prototype.click'));
     });
 
@@ -240,9 +237,9 @@ void main() {
       // (blobUrl, filename). The Dart handler in webview.dart reads
       // args[0] as the URL and args[1] as the suggested filename;
       // reordering them silently misroutes the call.
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("'_webspaceBlobDownloadStart'"));
-      expect(blobDownloadClickInterceptScript,
+      expect(PageJs.blobDownloadClickIntercept.script,
           contains("'_webspaceBlobDownloadStart', href, name"));
     });
 
@@ -251,7 +248,7 @@ void main() {
       // The event target is the inner element, not the anchor; the
       // shim must walk up until it finds the download anchor (or
       // bottoms out at document).
-      expect(blobDownloadClickInterceptScript, contains('el.parentNode'));
+      expect(PageJs.blobDownloadClickIntercept.script, contains('el.parentNode'));
     });
 
     test('preventDefault + stopPropagation so the browser does not navigate', () {
@@ -260,8 +257,8 @@ void main() {
       // strands the user. stopPropagation keeps a page-side click
       // handler from also acting on the same event (e.g. analytics
       // beacons).
-      expect(blobDownloadClickInterceptScript, contains('e.preventDefault()'));
-      expect(blobDownloadClickInterceptScript, contains('e.stopPropagation()'));
+      expect(PageJs.blobDownloadClickIntercept.script, contains('e.preventDefault()'));
+      expect(PageJs.blobDownloadClickIntercept.script, contains('e.stopPropagation()'));
     });
 
     test('is wired into WebViewFactory at AT_DOCUMENT_START on Android', () {
@@ -269,17 +266,13 @@ void main() {
       // (b) be Android-gated, and (c) inject at DOCUMENT_START so the
       // shim is in place before any page script can mint a blob URL
       // and wire a click handler against it.
-      final webviewSrc = File('lib/services/webview.dart').readAsStringSync();
-      expect(
-          webviewSrc, contains("groupName: 'blob_download_click_intercept'"));
-      final blockStart =
-          webviewSrc.indexOf("groupName: 'blob_download_click_intercept'");
+      final webviewSrc = File('lib/services/page_scripts.dart').readAsStringSync();
+      final blockStart = webviewSrc.indexOf(RegExp(
+          r"'blob_download_click_intercept',\s*js: PageJs.blobDownloadClickIntercept.script"));
       expect(blockStart, greaterThan(0));
-      final blockEnd = webviewSrc.indexOf('));', blockStart);
-      expect(blockEnd, greaterThan(blockStart));
-      final block = webviewSrc.substring(blockStart, blockEnd);
-      expect(block, contains('AT_DOCUMENT_START'));
-      expect(block, contains(r'$blobDownloadClickInterceptScript'));
+      final block =
+          webviewSrc.substring(blockStart, webviewSrc.indexOf(');', blockStart));
+      expect(block, isNot(contains('ShimTime.end')));
       // Android gate: the registration sits inside a hostIsAndroid block
       // (the web-safe Platform.isAndroid) so iOS/macOS keep using
       // onDownloadStartRequest natively.
@@ -293,19 +286,19 @@ void main() {
 
     test('Dart handler for _webspaceBlobDownloadStart is registered', () {
       // The JS shim is dead weight without a matching addJavaScriptHandler.
-      final webviewSrc = File('lib/services/webview.dart').readAsStringSync();
+      final webviewSrc = File('lib/services/page_handlers.dart').readAsStringSync();
       expect(webviewSrc, contains("handlerName: '_webspaceBlobDownloadStart'"));
-      // The handler must funnel into the same _handleBlobDownload entry
+      // The handler must funnel into the same handleBlobDownload entry
       // point the iOS/macOS onDownloadStartRequest path uses — otherwise
       // the captured-Blob fast path and DownloadsService task lifecycle
       // drift between platforms.
       final handlerStart =
           webviewSrc.indexOf("handlerName: '_webspaceBlobDownloadStart'");
       expect(handlerStart, greaterThan(0));
-      final handlerEnd = webviewSrc.indexOf('),', handlerStart);
-      expect(handlerEnd, greaterThan(handlerStart));
-      final handler = webviewSrc.substring(handlerStart, handlerEnd);
-      expect(handler, contains('_handleBlobDownload('));
+      final next = webviewSrc.indexOf('addJavaScriptHandler', handlerStart);
+      final handler = webviewSrc.substring(
+          handlerStart, next < 0 ? webviewSrc.length : next);
+      expect(handler, contains('WebViewDownloads.handleBlobDownload('));
     });
   });
 }

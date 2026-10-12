@@ -1,5 +1,6 @@
 import 'package:webspace/services/domain_claim.dart';
-import 'package:webspace/web_view_model.dart' show extractDomain, getBaseDomain;
+import 'package:webspace/services/outbound_preference.dart';
+import 'package:webspace/services/url_host.dart';
 
 export 'package:webspace/services/domain_claim.dart' show DomainClaim, DomainClaimKind;
 
@@ -25,6 +26,34 @@ class RoutingAmbiguous extends RoutingMatch {
 
 class RoutingNone extends RoutingMatch {
   const RoutingNone();
+}
+
+/// Where an outbound link resolves (LIR-014).
+sealed class OutboundResolution {
+  const OutboundResolution();
+
+  const factory OutboundResolution.preference(RoutableSite site) =
+      OutboundByPreference;
+  const factory OutboundResolution.global(RoutingMatch match) =
+      OutboundByClaims;
+  const factory OutboundResolution.selfMatch() = OutboundSelfMatch;
+}
+
+/// One of the source's own preferences named [site].
+class OutboundByPreference extends OutboundResolution {
+  final RoutableSite site;
+  const OutboundByPreference(this.site);
+}
+
+/// No preference matched; [match] is the global claim resolution.
+class OutboundByClaims extends OutboundResolution {
+  final RoutingMatch match;
+  const OutboundByClaims(this.match);
+}
+
+/// The resolution named the source itself, so the link keeps today's path.
+class OutboundSelfMatch extends OutboundResolution {
+  const OutboundSelfMatch();
 }
 
 enum ClaimConflictKind { hijack, overlap }
@@ -64,12 +93,12 @@ class LinkRoutingService {
   }
 
   static int _score(
-    DomainClaim claim,
-    String hostKey,
-    String host,
-    String base,
-    bool defaultPort,
-  ) {
+    DomainClaim claim, {
+    required String hostKey,
+    required String host,
+    required String base,
+    required bool defaultPort,
+  }) {
     switch (claim.kind) {
       case DomainClaimKind.exactHost:
         return claim.value == hostKey ? _scoreExactHost : 0;
@@ -85,10 +114,10 @@ class LinkRoutingService {
   /// Whether [url] is covered by any of [claims]. Same scoring as
   /// [resolve], collapsed to a boolean: used by the outbound navigation
   /// path to decide whether a cross-domain link still belongs to the
-  /// site (a claimed domain stays in-app) or should leave for the system
-  /// browser when `externalLinksInBrowser` is on. Non-http(s) or
+  /// site (a claimed domain stays in-app) or goes where the site's external
+  /// link mode sends it (the system browser, or nowhere). Non-http(s) or
   /// hostless URLs never match.
-  static bool urlMatchesAnyClaim(Uri url, List<DomainClaim> claims) {
+  static bool urlMatchesAnyClaim(Uri url, {required List<DomainClaim> claims}) {
     if (url.scheme != 'http' && url.scheme != 'https') return false;
     if (url.host.isEmpty) return false;
     final host = url.host.toLowerCase();
@@ -96,12 +125,19 @@ class LinkRoutingService {
     final hostKey = hostAuthority(url);
     final defaultPort = !url.hasPort;
     for (final claim in claims) {
-      if (_score(claim, hostKey, host, base, defaultPort) > 0) return true;
+      if (_score(claim,
+              hostKey: hostKey,
+              host: host,
+              base: base,
+              defaultPort: defaultPort) >
+          0) {
+        return true;
+      }
     }
     return false;
   }
 
-  static RoutingMatch resolve(Uri url, List<RoutableSite> sites) {
+  static RoutingMatch resolve(Uri url, {required List<RoutableSite> sites}) {
     if (url.scheme != 'http' && url.scheme != 'https') {
       return const RoutingNone();
     }
@@ -115,7 +151,8 @@ class LinkRoutingService {
     for (final site in sites) {
       int siteBest = 0;
       for (final claim in site.domainClaims) {
-        final s = _score(claim, hostKey, host, base, defaultPort);
+        final s = _score(claim,
+            hostKey: hostKey, host: host, base: base, defaultPort: defaultPort);
         if (s > siteBest) siteBest = s;
       }
       if (siteBest == 0) continue;
@@ -133,6 +170,55 @@ class LinkRoutingService {
     return RoutingAmbiguous(List.unmodifiable(winners));
   }
 
+  /// Resolve a link the source site opens against its own preferences first,
+  /// then the claims of [candidates] (LIR-014). A preference whose target is
+  /// not a candidate is ignored, which covers a deleted or cross-boundary
+  /// target before its cleanup runs (LIR-017). Among preferences the highest
+  /// score wins and the earlier entry breaks a tie. Anything naming the
+  /// source collapses to [OutboundResolution.selfMatch].
+  static OutboundResolution resolveOutbound(
+    Uri url, {
+    required String sourceSiteId,
+    required List<OutboundPreference> sourcePrefs,
+    required List<RoutableSite> candidates,
+  }) {
+    if (url.scheme != 'http' && url.scheme != 'https' || url.host.isEmpty) {
+      return const OutboundResolution.global(RoutingNone());
+    }
+    final host = url.host.toLowerCase();
+    final base = getBaseDomain(host);
+    final hostKey = hostAuthority(url);
+    final defaultPort = !url.hasPort;
+    final byId = {for (final c in candidates) c.siteId: c};
+    RoutableSite? preferred;
+    var best = 0;
+    for (final pref in sourcePrefs) {
+      final target = byId[pref.targetSiteId];
+      if (target == null) continue;
+      final score = _score(pref.claim,
+          hostKey: hostKey, host: host, base: base, defaultPort: defaultPort);
+      if (score > best) {
+        best = score;
+        preferred = target;
+      }
+    }
+    if (preferred != null) {
+      return preferred.siteId == sourceSiteId
+          ? const OutboundResolution.selfMatch()
+          : OutboundResolution.preference(preferred);
+    }
+    final match = resolve(url, sites: candidates);
+    final namesSource = switch (match) {
+      RoutingSingle(:final site) => site.siteId == sourceSiteId,
+      RoutingAmbiguous(:final sites) =>
+        sites.any((s) => s.siteId == sourceSiteId),
+      RoutingNone() => false,
+    };
+    return namesSource
+        ? const OutboundResolution.selfMatch()
+        : OutboundResolution.global(match);
+  }
+
   static String? strippedHomeUrl(Uri url) {
     if (url.scheme != 'http' && url.scheme != 'https') return null;
     if (url.host.isEmpty) return null;
@@ -148,7 +234,14 @@ class LinkRoutingService {
     final isOpen = host == 'open' ||
         (host.isEmpty && (path == 'open' || path == '/open'));
     if (!isOpen) return null;
-    final encoded = raw.queryParameters['url'];
+    // `Uri.parse` accepts a malformed percent-escape in the query and only
+    // `queryParameters` rejects it, by throwing.
+    final String? encoded;
+    try {
+      encoded = raw.queryParameters['url'];
+    } on FormatException {
+      return null;
+    }
     if (encoded == null || encoded.isEmpty) return null;
     final inner = Uri.tryParse(encoded);
     if (inner == null) return null;
@@ -189,9 +282,9 @@ class LinkRoutingService {
   }
 
   static List<DomainClaim> mergeClaims(
-    List<DomainClaim> existing,
-    List<DomainClaim> additions,
-  ) {
+    List<DomainClaim> existing, {
+    required List<DomainClaim> additions,
+  }) {
     final seen = <DomainClaim>{...existing};
     final out = <DomainClaim>[...existing];
     for (final c in additions) {
@@ -201,10 +294,10 @@ class LinkRoutingService {
   }
 
   static List<ClaimConflict> validateClaims(
-    String editedSiteId,
-    List<DomainClaim> editedClaims,
-    List<RoutableSite> others,
-  ) {
+    String editedSiteId, {
+    required List<DomainClaim> editedClaims,
+    required List<RoutableSite> others,
+  }) {
     final out = <ClaimConflict>[];
     for (final claim in editedClaims) {
       final claimBase = getBaseDomain(claim.value);
@@ -222,7 +315,7 @@ class LinkRoutingService {
           continue;
         }
         for (final otherClaim in other.domainClaims) {
-          if (_claimsOverlap(claim, otherClaim)) {
+          if (_claimsOverlap(claim, b: otherClaim)) {
             out.add(ClaimConflict(
               claim: claim,
               otherSiteId: other.siteId,
@@ -236,7 +329,7 @@ class LinkRoutingService {
     return out;
   }
 
-  static bool _claimsOverlap(DomainClaim a, DomainClaim b) {
+  static bool _claimsOverlap(DomainClaim a, {required DomainClaim b}) {
     if (a == b) return true;
     final av = a.value;
     final bv = b.value;

@@ -1,8 +1,16 @@
 import 'package:flutter/material.dart';
-import 'package:http/http.dart' as http;
 
 import 'package:webspace/l10n/gen/app_localizations.dart';
+import 'package:webspace/services/user_script_service.dart'
+    show fetchUserScriptSource;
+import 'package:webspace/services/reentry_guard.dart';
+import 'package:webspace/settings/proxy.dart';
+import 'package:webspace/settings/setting_labels.dart';
 import 'package:webspace/settings/user_script.dart';
+import 'package:webspace/widgets/confirm_dialog.dart';
+import 'package:webspace/widgets/dirty_guard.dart';
+import 'package:webspace/widgets/setting_tile.dart';
+import 'package:webspace/widgets/toast.dart';
 
 /// Screen for managing user scripts.
 ///
@@ -24,36 +32,49 @@ class UserScriptsScreen extends StatefulWidget {
   final String title;
   final List<UserScriptConfig> userScripts;
   final void Function(List<UserScriptConfig>) onSave;
+
   /// Execute a script source on the current webview immediately.
   /// Returns console output captured during execution.
   final Future<String> Function(String source)? onRun;
+
   /// Callback to promote a script to global. When set, a long-press
   /// context menu offers "Make Global". The callback receives the script
   /// to add to global scripts; the caller is responsible for persisting it.
   final void Function(UserScriptConfig script)? onMakeGlobal;
+
   /// Global scripts displayed alongside site scripts (per-site mode) or as
   /// the primary list (App Settings mode passes them as [userScripts]).
   final List<UserScriptConfig> globalUserScripts;
+
   /// Callback when global scripts change (edit / add / delete).
   final void Function(List<UserScriptConfig>)? onGlobalUserScriptsChanged;
+
   /// Per-site opt-in set for global scripts. Non-null in per-site mode;
   /// the global tile switch toggles membership in this set. Null in
   /// App Settings (global library) mode.
   final Set<String>? enabledGlobalScriptIds;
+
   /// Callback when the per-site opt-in set changes. Required in per-site
   /// mode.
   final void Function(Set<String>)? onEnabledGlobalScriptIdsChanged;
+
   /// When true, the [userScripts] list IS the global library: tiles are
   /// rendered with the "Global" badge and have no enabled toggle (globals
   /// have no master switch — per-site opt-in is the only enable control).
   /// Add / edit / delete all operate on the global library.
   final bool isGlobalLibrary;
+
   /// Fired whenever the user scripts, globals, or per-site opt-in set
   /// changes. Parents use this to dispose the affected webview(s) so
   /// [initialUserScripts] (baked at creation time) are re-applied on the
   /// next render. Without this, list toggle / opt-in changes silently no-op
   /// until the webview is recreated for some other reason.
   final VoidCallback? onWebViewReset;
+
+  /// Proxy of the site whose scripts are being edited, used when the editor
+  /// downloads a script's URL source. Null (App Settings mode, or a caller
+  /// with no site context) resolves to the app-global outbound proxy.
+  final UserProxySettings? proxy;
 
   const UserScriptsScreen({
     super.key,
@@ -68,6 +89,7 @@ class UserScriptsScreen extends StatefulWidget {
     this.onEnabledGlobalScriptIdsChanged,
     this.isGlobalLibrary = false,
     this.onWebViewReset,
+    this.proxy,
   });
 
   @override
@@ -75,34 +97,21 @@ class UserScriptsScreen extends StatefulWidget {
 }
 
 class _UserScriptsScreenState extends State<UserScriptsScreen> {
-  late List<UserScriptConfig> _scripts;
-  late List<UserScriptConfig> _globalScripts;
-  late Set<String> _enabledGlobalIds;
+  late final List<UserScriptConfig> _scripts = _copy(widget.userScripts);
+  late final List<UserScriptConfig> _globalScripts =
+      _copy(widget.globalUserScripts);
+  late final Set<String> _enabledGlobalIds = {
+    ...?widget.enabledGlobalScriptIds,
+  };
 
   bool get _hasGlobal => _globalScripts.isNotEmpty;
   bool get _isPerSiteMode => widget.enabledGlobalScriptIds != null;
 
-  @override
-  void initState() {
-    super.initState();
-    _scripts = _deepCopy(widget.userScripts);
-    _globalScripts = _deepCopy(widget.globalUserScripts);
-    _enabledGlobalIds = {...?widget.enabledGlobalScriptIds};
-  }
-
-  static List<UserScriptConfig> _deepCopy(List<UserScriptConfig> scripts) {
-    return scripts
-        .map((s) => UserScriptConfig(
-              id: s.id,
-              name: s.name,
-              source: s.source,
-              url: s.url,
-              urlSource: s.urlSource,
-              injectionTime: s.injectionTime,
-              enabled: s.enabled,
-            ))
-        .toList();
-  }
+  /// Through the serializer, so a field added to the script cannot be left
+  /// out of the copy.
+  static List<UserScriptConfig> _copy(List<UserScriptConfig> scripts) => [
+        for (final s in scripts) UserScriptConfig.fromJson(s.toJson()),
+      ];
 
   void _syncSite() {
     widget.onSave(_scripts);
@@ -119,33 +128,26 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
     widget.onWebViewReset?.call();
   }
 
-  void _addScript() async {
-    final result = await Navigator.push<UserScriptConfig>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => UserScriptEditScreen(onRun: widget.onRun),
-      ),
-    );
-    if (result != null) {
-      setState(() => _scripts.add(result));
-      _syncSite();
-    }
-  }
-
-  void _editScript(int index) async {
+  /// Opens [list]'s script at [index] in the editor, or a new script when
+  /// [index] is null, and stores what the editor saved.
+  Future<void> _edit(
+    List<UserScriptConfig> list, {
+    required int? index,
+    required VoidCallback sync,
+  }) async {
     final result = await Navigator.push<UserScriptConfig>(
       context,
       MaterialPageRoute(
         builder: (_) => UserScriptEditScreen(
-          script: _scripts[index],
+          script: index == null ? null : list[index],
           onRun: widget.onRun,
+          proxy: widget.proxy,
         ),
       ),
     );
-    if (result != null) {
-      setState(() => _scripts[index] = result);
-      _syncSite();
-    }
+    if (result == null) return;
+    setState(() => index == null ? list.add(result) : list[index] = result);
+    sync();
   }
 
   void _deleteScript(int index) {
@@ -163,37 +165,29 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
     if (_isPerSiteMode) _syncEnabledGlobalIds();
   }
 
-  Future<bool> _confirmDelete(UserScriptConfig script, {required bool isGlobal}) async {
+  Future<bool> _confirmDelete(
+    UserScriptConfig script, {
+    required bool isGlobal,
+  }) async {
     final loc = AppLocalizations.of(context);
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(loc.userScriptsDeleteDialogTitle),
-        content: Text(
-          isGlobal
-              ? loc.userScriptsDeleteGlobalBody(script.name)
-              : loc.userScriptsDeleteBody(script.name),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(loc.commonCancel),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            child: Text(loc.commonDelete),
-          ),
-        ],
-      ),
+    return confirm(
+      context,
+      title: loc.userScriptsDeleteDialogTitle,
+      body: isGlobal
+          ? loc.userScriptsDeleteGlobalBody(script.name)
+          : loc.userScriptsDeleteBody(script.name),
+      confirmLabel: loc.commonDelete,
+      destructive: true,
     );
-    return confirmed == true;
   }
 
-  Future<void> _showSiteScriptActions(int index) async {
+  /// The long-press sheet: delete, and for a site script, make it global.
+  Future<void> _showActions(int index, {required bool isGlobal}) async {
     final loc = AppLocalizations.of(context);
-    final script = _scripts[index];
-    final canMakeGlobal = widget.onMakeGlobal != null || widget.onGlobalUserScriptsChanged != null;
+    final script = (isGlobal ? _globalScripts : _scripts)[index];
+    final canMakeGlobal = !isGlobal &&
+        (widget.onMakeGlobal != null ||
+            widget.onGlobalUserScriptsChanged != null);
     final action = await showModalBottomSheet<String>(
       context: context,
       builder: (ctx) => SafeArea(
@@ -203,6 +197,8 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
             ListTile(
               leading: const Icon(Icons.delete, color: Colors.red),
               title: Text(loc.commonDelete),
+              subtitle:
+                  isGlobal ? Text(loc.userScriptsRemoveFromAllSites) : null,
               onTap: () => Navigator.pop(ctx, 'delete'),
             ),
             if (canMakeGlobal)
@@ -216,94 +212,65 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
         ),
       ),
     );
-    if (!mounted || action == null) return;
+    if (!mounted) return;
     if (action == 'delete') {
-      if (await _confirmDelete(script, isGlobal: false) && mounted) {
-        _deleteScript(index);
+      if (await _confirmDelete(script, isGlobal: isGlobal) && mounted) {
+        isGlobal ? _deleteGlobalScript(index) : _deleteScript(index);
       }
     } else if (action == 'global') {
       await _makeGlobal(index);
     }
   }
 
-  Future<void> _showGlobalScriptActions(int index) async {
-    final loc = AppLocalizations.of(context);
-    final script = _globalScripts[index];
-    final action = await showModalBottomSheet<String>(
-      context: context,
-      builder: (ctx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              leading: const Icon(Icons.delete, color: Colors.red),
-              title: Text(loc.commonDelete),
-              subtitle: Text(loc.userScriptsRemoveFromAllSites),
-              onTap: () => Navigator.pop(ctx, 'delete'),
-            ),
-          ],
-        ),
-      ),
-    );
-    if (!mounted || action != 'delete') return;
-    if (await _confirmDelete(script, isGlobal: true) && mounted) {
-      _deleteGlobalScript(index);
-    }
-  }
-
   Future<void> _makeGlobal(int index) async {
     final loc = AppLocalizations.of(context);
     final script = _scripts[index];
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: Text(loc.userScriptsMakeGlobal),
-        content: Text(loc.userScriptsMakeGlobalBody(script.name)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: Text(loc.commonCancel),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            child: Text(loc.userScriptsMakeGlobal),
-          ),
-        ],
-      ),
+    final confirmed = await confirm(
+      context,
+      title: loc.userScriptsMakeGlobal,
+      body: loc.userScriptsMakeGlobalBody(script.name),
+      confirmLabel: loc.userScriptsMakeGlobal,
+      destructive: false,
     );
-    if (confirmed == true && mounted) {
-      setState(() {
-        final promoted = _scripts.removeAt(index);
-        _globalScripts.add(promoted);
-        // Keep the script running on this site: opt in to its global id.
-        if (_isPerSiteMode) _enabledGlobalIds.add(promoted.id);
-      });
-      _syncSite();
-      _syncGlobal();
-      if (_isPerSiteMode) _syncEnabledGlobalIds();
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(loc.userScriptsMovedToGlobal(script.name))),
-        );
-      }
-    }
+    if (!confirmed || !mounted) return;
+    setState(() {
+      final promoted = _scripts.removeAt(index);
+      _globalScripts.add(promoted);
+      // Keep the script running on this site: opt in to its global id.
+      if (_isPerSiteMode) _enabledGlobalIds.add(promoted.id);
+    });
+    _syncSite();
+    _syncGlobal();
+    if (_isPerSiteMode) _syncEnabledGlobalIds();
+    ScaffoldMessenger.of(context).toast(loc.userScriptsMovedToGlobal(script.name));
   }
 
-  void _editGlobalScript(int index) async {
-    final result = await Navigator.push<UserScriptConfig>(
-      context,
-      MaterialPageRoute(
-        builder: (_) => UserScriptEditScreen(
-          script: _globalScripts[index],
-          onRun: widget.onRun,
+  /// [name] with the Global badge after it.
+  Widget _globalTitle(AppLocalizations loc, {required String name}) {
+    final scheme = Theme.of(context).colorScheme;
+    return Row(
+      children: [
+        Expanded(child: Text(name)),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          decoration: BoxDecoration(
+            color: scheme.primaryContainer,
+            borderRadius: BorderRadius.circular(4),
+          ),
+          child: Text(
+            loc.userScriptsGlobalBadge,
+            style: TextStyle(fontSize: 10, color: scheme.onPrimaryContainer),
+          ),
         ),
-      ),
+      ],
     );
-    if (result != null) {
-      setState(() => _globalScripts[index] = result);
-      _syncGlobal();
-    }
   }
+
+  static String _runsAt(AppLocalizations loc,
+          {required UserScriptConfig script}) =>
+      script.injectionTime == UserScriptInjectionTime.atDocumentStart
+          ? loc.userScriptsRunsAtDocumentStart
+          : loc.userScriptsRunsAtDocumentEnd;
 
   Widget _buildBody() {
     final loc = AppLocalizations.of(context);
@@ -323,12 +290,8 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
 
     return ListView(
       children: [
-        // Global scripts section
-        for (var i = 0; i < _globalScripts.length; i++)
-          _buildGlobalTile(i),
-        if (_hasGlobal && _scripts.isNotEmpty)
-          const Divider(height: 1),
-        // Site scripts section (reorderable)
+        for (var i = 0; i < _globalScripts.length; i++) _buildGlobalTile(i),
+        if (_hasGlobal && _scripts.isNotEmpty) const Divider(height: 1),
         if (_scripts.isNotEmpty)
           ReorderableListView.builder(
             shrinkWrap: true,
@@ -359,7 +322,8 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
                   padding: const EdgeInsetsDirectional.only(end: 16),
                   child: const Icon(Icons.delete, color: Colors.white),
                 ),
-                confirmDismiss: (_) => _confirmDelete(script, isGlobal: isGlobal),
+                confirmDismiss: (_) =>
+                    _confirmDelete(script, isGlobal: isGlobal),
                 onDismissed: (_) => _deleteScript(index),
                 child: ListTile(
                   leading: ReorderableDragStartListener(
@@ -367,31 +331,9 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
                     child: const Icon(Icons.drag_handle),
                   ),
                   title: isGlobal
-                      ? Row(
-                          children: [
-                            Expanded(child: Text(script.name)),
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                              decoration: BoxDecoration(
-                                color: Theme.of(context).colorScheme.primaryContainer,
-                                borderRadius: BorderRadius.circular(4),
-                              ),
-                              child: Text(
-                                loc.userScriptsGlobalBadge,
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  color: Theme.of(context).colorScheme.onPrimaryContainer,
-                                ),
-                              ),
-                            ),
-                          ],
-                        )
+                      ? _globalTitle(loc, name: script.name)
                       : Text(script.name),
-                  subtitle: Text(
-                    script.injectionTime == UserScriptInjectionTime.atDocumentStart
-                        ? loc.userScriptsRunsAtDocumentStart
-                        : loc.userScriptsRunsAtDocumentEnd,
-                  ),
+                  subtitle: Text(_runsAt(loc, script: script)),
                   trailing: isGlobal
                       ? null
                       : Switch(
@@ -401,8 +343,10 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
                             _syncSite();
                           },
                         ),
-                  onTap: () => _editScript(index),
-                  onLongPress: isGlobal ? null : () => _showSiteScriptActions(index),
+                  onTap: () => _edit(_scripts, index: index, sync: _syncSite),
+                  onLongPress: isGlobal
+                      ? null
+                      : () => _showActions(index, isGlobal: false),
                 ),
               );
             },
@@ -414,68 +358,41 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
   Widget _buildGlobalTile(int index) {
     final loc = AppLocalizations.of(context);
     final script = _globalScripts[index];
-    final injectionLabel = script.injectionTime == UserScriptInjectionTime.atDocumentStart
-        ? loc.userScriptsRunsAtDocumentStart
-        : loc.userScriptsRunsAtDocumentEnd;
-    final isOptedIn = _enabledGlobalIds.contains(script.id);
-
+    final editable = widget.onGlobalUserScriptsChanged != null;
     return ListTile(
-      leading: Icon(Icons.public, size: 20, color: Theme.of(context).colorScheme.primary),
-      title: Row(
-        children: [
-          Expanded(child: Text(script.name)),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-            decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.primaryContainer,
-              borderRadius: BorderRadius.circular(4),
-            ),
-            child: Text(
-              loc.userScriptsGlobalBadge,
-              style: TextStyle(
-                fontSize: 10,
-                color: Theme.of(context).colorScheme.onPrimaryContainer,
-              ),
-            ),
-          ),
-        ],
+      leading: Icon(
+        Icons.public,
+        size: 20,
+        color: Theme.of(context).colorScheme.primary,
       ),
-      subtitle: Text(injectionLabel),
+      title: _globalTitle(loc, name: script.name),
+      subtitle: Text(_runsAt(loc, script: script)),
       // Per-site opt-in is the only enable control for global scripts.
       // In per-site mode the switch toggles membership in this site's
       // [enabledGlobalScriptIds] set. No toggle otherwise.
       trailing: _isPerSiteMode
           ? Switch(
-              value: isOptedIn,
+              value: _enabledGlobalIds.contains(script.id),
               onChanged: (value) {
-                setState(() {
-                  if (value) {
-                    _enabledGlobalIds.add(script.id);
-                  } else {
-                    _enabledGlobalIds.remove(script.id);
-                  }
-                });
+                setState(() => value
+                    ? _enabledGlobalIds.add(script.id)
+                    : _enabledGlobalIds.remove(script.id));
                 _syncEnabledGlobalIds();
               },
             )
           : null,
-      onTap: widget.onGlobalUserScriptsChanged != null
-          ? () => _editGlobalScript(index)
-          : null,
-      onLongPress: widget.onGlobalUserScriptsChanged != null
-          ? () => _showGlobalScriptActions(index)
-          : null,
+      onTap: editable ? () => _edit(_globalScripts, index: index, sync: _syncGlobal) : null,
+      onLongPress:
+          editable ? () => _showActions(index, isGlobal: true) : null,
     );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text(widget.title),
-      ),
+      appBar: AppBar(title: Text(widget.title)),
       floatingActionButton: FloatingActionButton(
-        onPressed: _addScript,
+        onPressed: () => _edit(_scripts, index: null, sync: _syncSite),
         child: const Icon(Icons.add),
       ),
       body: _buildBody(),
@@ -486,40 +403,57 @@ class _UserScriptsScreenState extends State<UserScriptsScreen> {
 /// Screen for creating or editing a single user script.
 class UserScriptEditScreen extends StatefulWidget {
   final UserScriptConfig? script;
+
   /// Execute a script and return console output captured during execution.
   final Future<String> Function(String source)? onRun;
 
-  const UserScriptEditScreen({super.key, this.script, this.onRun});
+  /// Proxy the URL-source download goes through. Null resolves to the
+  /// app-global outbound proxy.
+  final UserProxySettings? proxy;
+
+  const UserScriptEditScreen({super.key, this.script, this.onRun, this.proxy});
 
   @override
   State<UserScriptEditScreen> createState() => _UserScriptEditScreenState();
 }
 
-class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
-  late TextEditingController _nameController;
-  late TextEditingController _sourceController;
-  late TextEditingController _urlController;
-  late UserScriptInjectionTime _injectionTime;
-  // Preserved across edits; the script list has the user-facing enable
-  // toggle, so the editor never exposes it.
-  late bool _enabled;
-  String? _urlSource;
-  String? _originalUrl;
+class _UserScriptEditScreenState extends State<UserScriptEditScreen>
+    with DirtyGuard<UserScriptEditScreen> {
+  late final _nameController =
+      TextEditingController(text: widget.script?.name ?? '');
+  late final _sourceController =
+      TextEditingController(text: widget.script?.source ?? '');
+  late final _urlController =
+      TextEditingController(text: widget.script?.url ?? '');
+  late var _injectionTime =
+      widget.script?.injectionTime ?? UserScriptInjectionTime.atDocumentEnd;
+  late var _bypassSitePolicy = widget.script?.bypassSitePolicy ?? false;
+  late String? _urlSource = widget.script?.urlSource;
   bool _downloading = false;
-  bool _saving = false;
+  final _saveGuard = ReentryGuard();
   String? _runOutput;
 
   @override
   void initState() {
     super.initState();
-    _nameController = TextEditingController(text: widget.script?.name ?? '');
-    _sourceController = TextEditingController(text: widget.script?.source ?? '');
-    _urlController = TextEditingController(text: widget.script?.url ?? '');
-    _injectionTime = widget.script?.injectionTime ?? UserScriptInjectionTime.atDocumentEnd;
-    _enabled = widget.script?.enabled ?? true;
-    _urlSource = widget.script?.urlSource;
-    _originalUrl = widget.script?.url;
+    markClean();
+    for (final c in [_nameController, _sourceController, _urlController]) {
+      c.addListener(_changed);
+    }
   }
+
+  void _changed() {
+    if (mounted) setState(() {});
+  }
+
+  @override
+  Record snapshot() => (
+        name: _nameController.text,
+        source: _sourceController.text,
+        url: _urlController.text,
+        injectionTime: _injectionTime,
+        bypassSitePolicy: _bypassSitePolicy,
+      );
 
   @override
   void dispose() {
@@ -530,53 +464,27 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
   }
 
   Future<void> _save() async {
-    if (_saving) return;
-    _saving = true;
-    try {
-      await _saveInner();
-    } finally {
-      _saving = false;
-    }
-  }
-
-  Future<void> _saveInner() async {
     final loc = AppLocalizations.of(context);
     final name = _nameController.text.trim();
     if (name.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(loc.userScriptsNameRequired)),
-      );
+      ScaffoldMessenger.of(context).toast(loc.userScriptsNameRequired);
       return;
     }
     final url = _urlController.text.trim();
-    // Auto-download URL source if URL is set and either not yet cached or URL changed.
-    if (url.isNotEmpty && (_urlSource == null || url != _originalUrl)) {
-      setState(() { _downloading = true; });
-      try {
-        final response = await http.get(Uri.parse(url));
-        if (!mounted) return;
-        if (response.statusCode == 200) {
-          _urlSource = response.body;
-        } else {
-          setState(() { _downloading = false; });
-          final detail = 'HTTP ${response.statusCode}';
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text(loc.userScriptsUrlDownloadFailed(detail))),
-          );
-          return;
-        }
-      } catch (e) {
-        if (!mounted) return;
-        setState(() { _downloading = false; });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(loc.userScriptsUrlDownloadFailed(e.toString()))),
+    if (url.isNotEmpty && (_urlSource == null || url != widget.script?.url)) {
+      setState(() => _downloading = true);
+      final result = await fetchUserScriptSource(url, proxy: widget.proxy);
+      if (!mounted) return;
+      if (result.source == null) {
+        setState(() => _downloading = false);
+        ScaffoldMessenger.of(context).toast(
+          loc.userScriptsUrlDownloadFailed(result.error ?? ''),
         );
         return;
       }
+      _urlSource = result.source;
     }
-    // Clear urlSource if URL was removed.
     if (url.isEmpty) _urlSource = null;
-    if (!mounted) return;
     Navigator.pop(
       context,
       UserScriptConfig(
@@ -589,7 +497,9 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
         url: url.isEmpty ? null : url,
         urlSource: _urlSource,
         injectionTime: _injectionTime,
-        enabled: _enabled,
+        // The list holds the enable switch; the editor keeps what it had.
+        enabled: widget.script?.enabled ?? true,
+        bypassSitePolicy: _bypassSitePolicy,
       ),
     );
   }
@@ -603,17 +513,14 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
       urlSource: _urlSource,
     ).fullSource;
     if (src.isEmpty) return;
-    setState(() { _runOutput = loc.userScriptsRunning; });
+    setState(() => _runOutput = loc.userScriptsRunning);
+    String output;
     try {
-      final output = await widget.onRun!(src);
-      if (mounted) {
-        setState(() { _runOutput = output; });
-      }
+      output = await widget.onRun!(src);
     } catch (e) {
-      if (mounted) {
-        setState(() { _runOutput = loc.userScriptsRunError(e.toString()); });
-      }
+      output = loc.userScriptsRunError(e.toString());
     }
+    if (mounted) setState(() => _runOutput = output);
   }
 
   @override
@@ -621,9 +528,12 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
     final loc = AppLocalizations.of(context);
     final isEditing = widget.script != null;
     const urlHint = 'https://cdn.jsdelivr.net/npm/package/lib.min.js';
-    return Scaffold(
+    return guardPop(
+        child: Scaffold(
       appBar: AppBar(
-        title: Text(isEditing ? loc.userScriptsEditTitle : loc.userScriptsNewTitle),
+        title: Text(
+          isEditing ? loc.userScriptsEditTitle : loc.userScriptsNewTitle,
+        ),
         actions: [
           if (widget.onRun != null)
             IconButton(
@@ -633,7 +543,7 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
             ),
           IconButton(
             icon: const Icon(Icons.save),
-            onPressed: _save,
+            onPressed: () => _saveGuard.run(_save),
             tooltip: loc.commonSave,
           ),
         ],
@@ -659,7 +569,8 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
                   ? const Padding(
                       padding: EdgeInsets.all(12),
                       child: SizedBox(
-                        width: 20, height: 20,
+                        width: 20,
+                        height: 20,
                         child: CircularProgressIndicator(strokeWidth: 2),
                       ),
                     )
@@ -670,8 +581,10 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
             Padding(
               padding: const EdgeInsets.only(top: 4),
               child: Text(
-                _urlController.text.trim() != _originalUrl
-                    ? loc.userScriptsCachedBytesWillRedownload(_urlSource!.length)
+                _urlController.text.trim() != widget.script?.url
+                    ? loc.userScriptsCachedBytesWillRedownload(
+                        _urlSource!.length,
+                      )
                     : loc.userScriptsCachedBytes(_urlSource!.length),
                 style: TextStyle(fontSize: 12, color: Colors.grey[600]),
               ),
@@ -684,24 +597,28 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
               border: const OutlineInputBorder(),
             ),
             items: [
-              DropdownMenuItem(
-                value: UserScriptInjectionTime.atDocumentStart,
-                child: Text(loc.userScriptsAtDocumentStart),
-              ),
-              DropdownMenuItem(
-                value: UserScriptInjectionTime.atDocumentEnd,
-                child: Text(loc.userScriptsAtDocumentEnd),
-              ),
+              for (final time in UserScriptInjectionTime.values)
+                DropdownMenuItem(value: time, child: Text(time.label(loc))),
             ],
             onChanged: (value) {
               if (value != null) setState(() => _injectionTime = value);
             },
           ),
+          const SizedBox(height: 8),
+          SettingTile(
+            contentPadding: EdgeInsets.zero,
+            title: loc.userScriptsBypassSitePolicyLabel,
+            hint: loc.userScriptsBypassSitePolicyHint,
+            control: Toggle(_bypassSitePolicy,
+                onChanged: (v) => setState(() => _bypassSitePolicy = v)),
+          ),
           const SizedBox(height: 16),
           TextField(
             controller: _sourceController,
             decoration: InputDecoration(
-              labelText: _urlSource != null ? loc.userScriptsSourceLabelAfterUrl : loc.userScriptsSourceLabel,
+              labelText: _urlSource != null
+                  ? loc.userScriptsSourceLabelAfterUrl
+                  : loc.userScriptsSourceLabel,
               border: const OutlineInputBorder(),
               alignLabelWithHint: true,
             ),
@@ -726,6 +643,6 @@ class _UserScriptEditScreenState extends State<UserScriptEditScreen> {
           ],
         ],
       ),
-    );
+    ));
   }
 }

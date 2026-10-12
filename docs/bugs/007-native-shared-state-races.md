@@ -16,8 +16,15 @@ projection ([formal/README.md](../../formal/README.md)); this class is guarded i
 **Tests:** [android/app/src/test/kotlin/.../AdblockEngineNativeTest.kt](../../android/app/src/test/kotlin/org/codeberg/theoden8/webspace/AdblockEngineNativeTest.kt)
 (concurrent readers/writers don't deadlock or throw) and
 [test/js/native_bgtask_completion_funnel.test.js](../../test/js/native_bgtask_completion_funnel.test.js)
-(structural gate: completion only through the funnel). The intercept cache (attempt 3) has
-no dedicated guard yet — see open gaps.
+(structural gate: completion only through the funnel) and
+[test/js/tor_bootstrap_observability.test.js](../../test/js/tor_bootstrap_observability.test.js)
+(structural gate: one `TorThread` per process, reached only through the exit wait) and
+[test/js/native_shared_state.test.js](../../test/js/native_shared_state.test.js)
+(structural gate: Android Kotlin state shared across threads only through `Guarded`,
+`SiteEventInbox` or a `@Volatile` immutable snapshot) and
+[SiteEventInboxTest.kt](../../android/app/src/test/kotlin/org/codeberg/theoden8/webspace/SiteEventInboxTest.kt) /
+[HostDecisionCacheConcurrencyTest.kt](../../android/app/src/test/kotlin/org/codeberg/theoden8/webspace/HostDecisionCacheConcurrencyTest.kt)
+(the IO-thread inbox and the intercept cache under concurrent load).
 
 ## Symptom
 
@@ -158,22 +165,159 @@ about whether the runtime actually routes to the right jar (that still needs a d
 `MyCookieManager`: gap 2 below, the same class in the same fork's Swift tree, remains
 unguarded and is the obvious next file to point this technique at.
 
+### Attempt 6 — Tor: a process-singleton restarted from a slot that was already cleared
+**Date:** 2026-09-15 · **Files:** `ios/Runner/TorControllerPlugin.swift` (the macOS Runner
+compiles the same file, so the tier that guards this runs the code iOS ships),
+`test/js/tor_bootstrap_observability.test.js`
+**What it did:** `stop()` set `self.thread = nil` and called `thread.cancel()`, then the next
+`start()` read `thread == nil` as "no tor is running" and constructed a second `TorThread`.
+Neither half holds: `cancel()` only sets `NSThread.isCancelled`, which tor's main loop never
+reads, and the running tor is a **process singleton** — `TORThread.init` asserts
+`There can only be one TORThread per process` against a `__weak` static (a debug build traps),
+and two `tor_run_main`s in one address space contend for the data-directory lock, which tor
+resolves by exiting the process it is linked into. The fix makes the resource identity-guarded
+rather than slot-guarded: `stop()` hands the thread to `exitingThread` and asks tor to exit
+over the control port (`disconnect()` sends `SIGNAL SHUTDOWN`, which a client tor obeys
+immediately), `start()` waits on `exitingThread.isFinished` before launching and fails with a
+named error rather than launching beside it, and a `generation` counter bumped by every start
+and stop makes an earlier run's handshake, catch-up read or failure a no-op instead of
+resurrecting or overwriting the current one.
+**Why:** every user-reachable path that stops Tor is followed by a start within seconds — the
+Retry button on the bootstrap interstitial (`TorEngine.restart`), the 60-second idle stop
+followed by reopening a Tor site, and the 90-second bootstrap timeout, which stops the runtime
+and leaves Retry as the only thing to do. Retry on a feature that was not connecting was
+therefore the most likely thing a user would tap, and the most likely thing to take the app
+down with it.
+**Why it was partial:** it covers the one native singleton this app owns and only the path
+where tor's control port answered — when the handshake never completes there is nothing left
+that can ask that tor to exit, so the process keeps it until it is killed, and every later
+start reports the named failure instead of connecting. The class-level gate is structural
+(a single `TorThread(` construction, reached only through the exit wait), not a concurrency
+test: no CI tier in this repo builds or runs Swift.
+
+
+### Attempt 7 — Tor: the stop could only reach a tor it had already adopted
+**Date:** 2026-09-15 · **Files:** `ios/Runner/TorControllerPlugin.swift`,
+`integration_test/tor_test.dart`, `test/js/tor_bootstrap_observability.test.js`
+**What it did:** attempt 6 made a start wait for the previous tor's thread and asked that
+tor to exit with `controller?.disconnect()`, which sends `SIGNAL SHUTDOWN`. That reaches
+nothing when `controller` is nil, and it is nil for exactly the runs that most need
+stopping: one stopped before the control-port handshake landed, and one whose handshake
+failed. The orphan then held the process's only tor slot until the app was killed, so the
+wait always expired and every later start reported "The previous Tor is still running".
+Now every retirement (stop *and* failure) hands the run to an exit watch that keeps a
+fresh control connection of its own — port file plus cookie from the retired
+configuration, `SIGNAL HALT`, retried while the thread is alive — and `failLocked` releases
+the slot rather than leaving an unusable tor in it. The give-up message names the one
+remedy left and is worded so `classifyTorFailure` reads it as a control-channel failure
+instead of "Tor stopped unexpectedly", which was the opposite of what had happened.
+**Why:** a user on TestFlight whose first bootstrap failed found Retry permanently dead:
+the failure path left a tor running, and the fix from attempt 6 then correctly refused to
+start a second one. Turning a crash into a refusal was progress; the refusal still had to
+stop being reachable.
+**Why it was partial:** it still assumes the orphan has a control port to answer on. A tor
+that died before opening one cannot be signalled, though it has also already exited, and a
+tor wedged before its control port opens stays wedged. The guard is structural plus one
+integration leg on macOS that restarts inside the handshake window; iOS, where this was
+observed, still has no tier that runs the plugin at all, so the first evidence remains a
+device.
+
+### Attempt 8 — One guard type for Android native state, gated for the whole class
+**Date:** 2026-10-07 · **PR:** #680 · **Files:**
+`android/app/src/main/kotlin/.../Guarded.kt`, `SiteEventInbox.kt`, `WebInterceptPlugin.kt`,
+`test/js/native_shared_state.test.js`, `SiteEventInboxTest.kt`,
+`HostDecisionCacheConcurrencyTest.kt`
+**What it did:** `WebInterceptPlugin.kt` held state shared with chromium's IO threads five
+ways at once (`synchronized` blocks on the collections themselves, `ConcurrentHashMap`s of
+`Collections.synchronized*` collections, `AtomicBoolean` signal flags, a lock object beside
+the cache, `@Volatile` scalars), and carried two near-copies of a per-site inbox with its
+signal flag, `mainHandler.post` and anonymous `MethodChannel.Result`. Every mutable
+collection now lives in one of two shapes. `Guarded<T>` keeps its state reachable only
+inside `with { }`, under one monitor, so no access can skip the lock: the host-decision
+cache is one (evicting through `removeEldestEntry`), and `SiteEventInbox<E>` (both inboxes,
+one implementation) is built on it. What Dart replaces whole, the LocalCDN patterns and
+index, is an immutable snapshot behind a `@Volatile` reference (`LocalCdnTables`), so the
+size checks of gap 3 read a table that cannot change under them. The class-level guard is
+structural: `native_shared_state.test.js` fails CI on a `Collections.synchronized*` or
+concurrent collection, on any Kotlin property holding a bare mutable collection that is not
+`Guarded` and not named in its `CONFINED` list with the one thread that touches it, on a
+swapped collection `var` without `@Volatile`, and on a raw lock outside four named files
+(`Guarded`, `DnsHostBlocklist`'s wait/notify, `AdblockEngineNative`'s RW-lock,
+`ProxyRelay`'s serialised writers). Verified by mutation: a synchronized wrapper, a
+concurrent map, an unguarded cache, a non-volatile snapshot, a mutable constructor
+parameter, a stray `synchronized(this)` and a stale exemption each turn it red; so does the
+pre-change file. Behind it, JVM tests drive the inbox protocol, including 8 recorder
+threads against a draining main thread that must see every event in exactly one drain
+(it fails with `Guarded`'s monitor removed), and 8 `checkUrl` threads against the
+1,024-entry cache with 4,000 hosts and a concurrent clear. The cache test is the first the
+attempt-3 cache has had, but it is a smoke test like attempt 1's: it passes against an
+unlocked map too, because HotSpot rarely corrupts a `LinkedHashMap` visibly under that
+load, so what holds the cache to the lock is the gate.
+
+Three defects of the same file came out on the way. Attempt 3 says it made `checkCount` an
+`AtomicInteger`; only the import landed, and the counter stayed a plain `var` incremented
+from concurrent IO threads. The signal flag was cleared only when Dart's reply to
+`blockEventsReady` arrived, which is after Dart's fetch had drained, so an event recorded in
+between found the flag still set, sent nothing, and waited for the next event on that site;
+on a page that had gone quiet, that was never (DNS-017). A drain now retires the outstanding
+wake, and a reply retires it only when no drain has. And block events were keyed by host
+alone, so the first verdict in a drain window absorbed every later request to that host: a
+host whose page assets were allowed and whose ad paths the engine blocked reported all of
+them allowed, which undercounts exactly as BUG-004 describes. They are keyed by host,
+verdict and source now. The never-written LocalCDN kill switch, an `AtomicBoolean` threaded
+into every interceptor, is gone: Dart pushing an empty pattern list already makes LocalCDN
+inert app-wide.
+**Why:** gap 1. Each earlier attempt guarded its own instance, and the intercept cache not
+even that, so the next Kotlin plugin to share a collection with an IO thread would have
+recurred silently.
+**Why it was partial:** the gate reads shapes, not threads. It trusts `CONFINED`'s claim
+that a field stays on one thread, it cannot follow a mutable collection that escapes through
+a local captured by a `Thread {}` or through a class that extends a collection, and it
+covers this repo's Kotlin only: the Swift plugins still rest on their per-file gates
+(attempts 2, 6, 7), the fork (gap 2) is untouched, and gap 5's unbounded write-lock latency
+is unchanged.
+
 ## Known open gaps
 
-1. **No universal structural guard.** Each instance got its own guard (or none, for the
-   intercept cache). A new native plugin that shares mutable state across a callback/IO
-   thread and another path can reintroduce the class silently. Mitigation is process: the
-   CLAUDE.md "Adding native code that mutates shared state" checklist points here; hold every
-   new native component to the invariant above.
+1. **No universal structural guard for Swift.** Android Kotlin has one since attempt 8
+   (`native_shared_state.test.js`). The Swift plugins still have one gate each, written for
+   the instance it fixed, so a new Swift plugin that shares state across a callback queue
+   and the main thread can reintroduce the class silently. Mitigation there is still
+   process: the CLAUDE.md "Adding native code that mutates shared state" checklist points
+   here.
 2. **Fork `ContainerManager.swift` registry lost-update.** The `id → uuid` map's
    read-modify-write (`loadIdMap` → mutate → `saveIdMap`) is guarded by `sharedStoresLock`
    only inside `getOrCreateDataStore`; the same sequence in `deleteContainer`'s completion
    handler and `registerContainerBinding` runs without the lock. Same class, lives in the
    flutter_inappwebview fork (out of this repo's tree), not yet fixed. Consequence is a
    stale/missing registry entry, not a crash. Fix before the next fork tag.
-3. **`WebInterceptPlugin` unsynchronized size checks.** The `cdnPatterns.isNotEmpty()` /
-   `cdnCacheIndex.isNotEmpty()` reads sit outside the `synchronized` blocks that guard their
-   real reads/writes. Benign (`isEmpty` can't throw), same class — fold into the lock.
+3. ~~**`WebInterceptPlugin` unsynchronized size checks.**~~ Closed by attempt 8: the
+   LocalCDN tables are immutable snapshots, so a size check reads the same table the lookup
+   does.
 4. **CONT-005 silent degrade-to-shared.** If the native `containerId` bind ever fails, the
    site falls back to the default store; the engine tolerates a zero-bind result but can't
    detect the degraded (isolation-lost) state. Wants a native post-bind assertion.
+5. **Adblock engine: correct locking, unbounded latency.** Found 2026-09-06 while triaging
+   upstream [#2888](https://github.com/pichillilorenzo/flutter_inappwebview/issues/2888)
+   (a fork latch with no timeout) and [#2718](https://github.com/pichillilorenzo/flutter_inappwebview/issues/2718)
+   (an ANR in `MyCookieManager.deleteAllCookies`); see
+   [docs/upstream/flutter-inappwebview-audit.md](../upstream/flutter-inappwebview-audit.md).
+   Neither upstream issue reaches us, but reading them exposed the same geometry in our own
+   code. `AdblockEngineNative.setRules` (`AdblockEngineNative.kt:90-111`) holds the **write**
+   lock across `nativeEngineFree` plus `nativeEngineNew(rulesText)`, a full adblock-rust parse
+   of the concatenated filter lists, and it runs synchronously on the Android platform thread
+   from the method-channel handler (`WebInterceptPlugin.kt:105-115`). `checkUrl`
+   (`AdblockEngineNative.kt:118-128`) takes an **unbounded** `readLock.lock()` on chromium's
+   concurrent sub-resource IO threads. So flipping the content-blocker toggle blocks the main
+   thread in a JNI parse and every IO thread queued behind it, with no timeout on either side.
+   Separately `DNS_READY_TIMEOUT_MS` is `15_000L` (`WebInterceptPlugin.kt:846`), three times
+   the ANR window, deliberately fail-closed but reachable from those same IO threads.
+   This is attempt 1's RW-lock doing exactly what it was asked to do: it closed the UAF and
+   was never asked to bound latency. It is a **gap, not a regression** (no crash, no
+   incorrect block decision), and it is recorded here rather than as a fix attempt because
+   nothing has been attempted yet. The shape of the fix is the one #2888 proposes for the
+   fork: move `setRules` onto the build-worker pattern `setDnsBlockedDomains` already uses
+   (`WebInterceptPlugin.kt:88-95`), and give `checkUrl` a `tryLock(timeout)` that falls
+   through to allow. `AdblockEngineNativeTest.kt` asserts readers and writers don't deadlock
+   or throw; it does not assert either of them finishes in bounded time, which is why this
+   sat unnoticed.

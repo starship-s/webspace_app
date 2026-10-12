@@ -1,6 +1,10 @@
 import 'dart:convert';
-import 'package:webspace/platform/host_platform.dart';
 import 'dart:typed_data';
+
+import 'package:webspace/platform/host_platform.dart';
+import 'package:webspace/settings/capture.dart';
+import 'package:webspace/settings/proxy.dart';
+import 'package:webspace/services/proxy_library.dart';
 
 /// Encode/decode the QR-shareable subset of a [WebViewModel] JSON dict.
 ///
@@ -9,7 +13,8 @@ import 'dart:typed_data';
 /// `userScripts`, `enabledGlobalScriptIds`, `blockedCookies`, `siteId`
 /// (receiver mints fresh), `currentUrl`/`pageTitle` (runtime state).
 /// Proxy passwords never leave the device — `UserProxySettings.toJson`
-/// strips them per `proxy-password-secure-storage` (PWD-005).
+/// strips them per `proxy-password-secure-storage` (PWD-005), and [decode]
+/// strips any a hand-crafted payload smuggled in.
 ///
 /// Wire format: `webspace://qr/site/v1/<base64url>` where the payload is
 /// gzip-compressed UTF-8 JSON. base64url padding is stripped on encode and
@@ -34,18 +39,22 @@ class SiteSettingsQrCodec {
     'javascriptEnabled',
     'userAgent',
     'thirdPartyCookiesEnabled',
+    'httpsUpgradeEnabled',
     'incognito',
     'alwaysOpenHome',
     'kioskMode',
+    'tabsEnabled',
     'language',
     'zoomPercent',
     'clearUrlEnabled',
     'dnsBlockEnabled',
+    'dnsBlockLevel',
     'contentBlockEnabled',
+    'disabledFilterLists',
     'trackingProtectionEnabled',
     'localCdnEnabled',
-    'blockAutoRedirects',
     'fullscreenMode',
+    'blockScreenshots',
     'htmlCachingEnabled',
     'notificationsEnabled',
     'backgroundAudioEnabled',
@@ -57,36 +66,83 @@ class SiteSettingsQrCodec {
     'spoofTimezoneFromLocation',
     'liveLocationGranularity',
     'webRtcPolicy',
+    'routeOutboundLinks',
+    // How to search the site: configuration, no site ids (LIR-031).
+    'searchAddress',
+    'searchesWeb',
   };
 
   /// Per-site keys deliberately stripped on share. Listed so the drift
   /// test can detect a brand-new key that the dev forgot to classify.
-  static const Set<String> excludedKeys = {
+  static final Set<String> excludedKeys = {
     'siteId',
     'currentUrl',
     'pageTitle',
+    // Session, not configuration (TAB-009).
+    'tabs',
     'cookies',
     'userScripts',
     'enabledGlobalScriptIds',
     'blockedCookies',
     // Remembered permission decisions are trust the user gave one device's
-    // popup, not shareable configuration; the virtual camera/microphone
-    // sources are user-picked local media that would also blow QR capacity.
+    // popup, not shareable configuration; the virtual capture sources are
+    // user-picked local media that would also blow QR capacity.
     'protectedContentAllowed',
-    'cameraMode',
-    'virtualCameraSource',
-    'microphoneMode',
-    'virtualMicrophoneSource',
+    for (final kind in CaptureKind.values) ...kind.jsonKeys,
     // Base64 PNG bytes: would blow QR capacity, and an icon is
     // device-local cosmetics, not shareable configuration.
     'customIconPng',
+    // Each entry names a device-local siteId, which the receiver's sites
+    // do not have (QR-003).
+    'outboundPreferences',
+    'searchSites',
+    'searchDefault',
+    // Learned from the site's own pages; the receiver's copy learns it the
+    // same way (LIR-035).
+    'discoveredSearchAddress',
+    'discoveredSearchesWeb',
+    // A scanned site is a new container, which gets its own colour (TAB-018).
+    'containerColor',
+    // A scanned code must not make a site claim domains: claims decide
+    // where other sites' links and shared URLs go.
+    'domainClaims',
+    // The seed that makes this site's fingerprint differ from every other
+    // device's.
+    'fingerprintResetNonce',
+    // Never shared so far. Sharing one of these is its own decision, not a
+    // side effect of the drift check reaching them.
+    'externalLinkMode',
+    'tabBarButtonCorner',
+    'letterboxEnabled',
+    'spoofWindowWidth',
+    'spoofWindowHeight',
   };
 
   /// Strip a full `WebViewModel.toJson()` to the QR-shareable subset.
+  ///
+  /// A site that uses the proxy library (a saved proxy, gateway or
+  /// credentials) carries the resolved route instead of the references: ids
+  /// are local to this device, so the receiver could only fail closed on one.
+  /// A reference that no longer resolves carries no proxy at all.
   static Map<String, dynamic> shareableSubset(Map<String, dynamic> fullJson) {
     final out = <String, dynamic>{};
     for (final k in includedKeys) {
       if (fullJson.containsKey(k)) out[k] = fullJson[k];
+    }
+    final proxy = out['proxySettings'];
+    if (proxy is Map) {
+      final settings =
+          UserProxySettings.fromJson(Map<String, dynamic>.from(proxy));
+      if (settings.type == ProxyType.SAVED ||
+          settings.type == ProxyType.GATEWAY ||
+          settings.credentialsId != null) {
+        final resolved = resolveLibraryProxy(settings);
+        if (resolved.type == ProxyType.SAVED) {
+          out.remove('proxySettings');
+        } else {
+          out['proxySettings'] = resolved.toJson();
+        }
+      }
     }
     return out;
   }
@@ -110,12 +166,6 @@ class SiteSettingsQrCodec {
     return '$_scheme://$_path/v$currentVersion/$payload';
   }
 
-  /// Decode a `webspace://qr/site/vN/<payload>` URI back to a shareable
-  /// subset. Returns null if the input is malformed, the version is newer
-  /// than [currentVersion], the payload fails gunzip, or `initUrl` is
-  /// missing. Any keys outside [includedKeys] in a successfully decoded
-  /// payload are dropped — a hostile sender cannot smuggle, e.g.,
-  /// `cookies` past the receiver's strip filter.
   // A per-site settings payload is a few hundred bytes; these ceilings leave
   // generous headroom while bounding a decompression bomb.
   static const int _kMaxCompressedBytes = 64 * 1024;
@@ -124,7 +174,8 @@ class SiteSettingsQrCodec {
   /// Gzip-inflate [compressed], feeding it in small chunks and aborting the
   /// moment the running output exceeds [maxOut]. Returns null on overflow or
   /// malformed input, so a bomb never fully materializes in memory.
-  static List<int>? _gunzipBounded(List<int> compressed, int maxOut) {
+  static List<int>? _gunzipBounded(List<int> compressed,
+      {required int maxOut}) {
     final out = BytesBuilder(copy: false);
     var total = 0;
     var overflow = false;
@@ -144,12 +195,18 @@ class SiteSettingsQrCodec {
         conv.add(compressed.sublist(i, end));
       }
       conv.close();
-    } catch (_) {
+    } on FormatException {
       return null;
     }
     return overflow ? null : out.takeBytes();
   }
 
+  /// Decode a `webspace://qr/site/vN/<payload>` URI back to a shareable
+  /// subset. Returns null if the input is malformed, the version is newer
+  /// than [currentVersion], the payload fails gunzip, or `initUrl` is
+  /// missing. Any keys outside [includedKeys] in a successfully decoded
+  /// payload are dropped — a hostile sender cannot smuggle, e.g.,
+  /// `cookies` past the receiver's strip filter.
   static Map<String, dynamic>? decode(String input) {
     final parsed = _parse(input.trim());
     if (parsed == null) return null;
@@ -161,7 +218,7 @@ class SiteSettingsQrCodec {
       // QR capacity bound does not apply), so cap both the compressed input
       // and the decompressed output to defeat a gzip decompression bomb.
       if (compressed.length > _kMaxCompressedBytes) return null;
-      final bytes = _gunzipBounded(compressed, _kMaxDecodedBytes);
+      final bytes = _gunzipBounded(compressed, maxOut: _kMaxDecodedBytes);
       if (bytes == null) return null;
       final decoded = jsonDecode(utf8.decode(bytes));
       if (decoded is! Map) return null;
@@ -171,6 +228,39 @@ class SiteSettingsQrCodec {
         if (key is String && includedKeys.contains(key)) {
           out[key] = entry.value;
         }
+      }
+      // `includedKeys` whitelists top-level keys only, so the nested
+      // `proxySettings` object arrives unexamined. `UserProxySettings.toJson`
+      // never emits a password, but a hostile sender is not bound by our
+      // encoder — and `fromJson` would happily read one straight into the
+      // receiver's live proxy credentials.
+      final proxy = out['proxySettings'];
+      if (proxy is Map) {
+        final stripped = <String, dynamic>{
+          for (final e in proxy.entries)
+            if (e.key is String &&
+                !const {'password', 'savedProxyId', 'gatewayId', 'credentialsId'}
+                    .contains(e.key))
+              e.key as String: e.value,
+        };
+        // `UserProxySettings.fromJson` coerces a numeric-string `type`, so
+        // a value the review dialog could not classify would still apply.
+        // Hold the payload to exactly what our own encoder emits.
+        // Library routes are never emitted: [shareableSubset] resolves them.
+        final type = stripped['type'];
+        if (type != null &&
+            (type is! int ||
+                type < 0 ||
+                type >= ProxyType.values.length ||
+                type == ProxyType.SAVED.index ||
+                type == ProxyType.GATEWAY.index)) {
+          return null;
+        }
+        for (final key in const ['address', 'username', 'torExitCountry']) {
+          final value = stripped[key];
+          if (value != null && value is! String) return null;
+        }
+        out['proxySettings'] = stripped;
       }
       if (out['initUrl'] is! String ||
           (out['initUrl'] as String).isEmpty) {
@@ -186,14 +276,22 @@ class SiteSettingsQrCodec {
         return null;
       }
       return out;
-    } catch (_) {
+    } on FormatException {
       return null;
     }
   }
 
-  /// True if [input] looks like a webspace QR URI (any version).
-  static bool looksLikeQrPayload(String input) {
-    return _parse(input.trim()) != null;
+  /// The proxy the apply path installs for a decoded payload, read through
+  /// the same `UserProxySettings.fromJson` so the review dialog cannot
+  /// disagree with it. Null when the payload sets no proxy.
+  static UserProxySettings? reviewProxy(Map<String, dynamic> qr) {
+    final json = qr['proxySettings'];
+    if (json is! Map) return null;
+    final proxy = UserProxySettings.fromJson(<String, dynamic>{
+      for (final e in json.entries)
+        if (e.key is String) e.key as String: e.value,
+    });
+    return proxy.type == ProxyType.DEFAULT ? null : proxy;
   }
 
   static _ParsedQr? _parse(String input) {

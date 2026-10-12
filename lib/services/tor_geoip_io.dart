@@ -1,0 +1,139 @@
+import 'dart:convert';
+import 'dart:io';
+import 'dart:isolate';
+import 'dart:typed_data';
+
+import 'package:path_provider/path_provider.dart';
+
+import 'package:webspace/services/log_service.dart';
+import 'package:http/http.dart' as http;
+import 'package:webspace/services/outbound_http.dart';
+import 'package:webspace/services/tor_geoip.dart';
+import 'package:webspace/settings/proxy.dart';
+import 'package:webspace/utils/concurrency.dart';
+
+TorGeoIpStore? createTorGeoIpStore() => IoTorGeoIpStore();
+
+/// [TorGeoIpStore] over `<app cache>/tor_geoip/`.
+///
+/// The cache directory rather than documents: the table is re-downloadable,
+/// so it stays out of device backups, and the OS reclaiming it under storage
+/// pressure costs one download on the next pin.
+class IoTorGeoIpStore implements TorGeoIpStore {
+  IoTorGeoIpStore({Directory? overrideRoot, DateTime Function()? clock})
+      : _overrideRoot = overrideRoot,
+        _clock = clock ?? DateTime.now;
+
+  final Directory? _overrideRoot;
+  final DateTime Function() _clock;
+  final SingleFlight<(), TorGeoIpTable?> _downloads = SingleFlight();
+  var _circuits = 0;
+
+  Future<Directory> _directory() async {
+    final root = _overrideRoot ?? await getApplicationCacheDirectory();
+    return Directory('${root.path}/tor_geoip');
+  }
+
+  @override
+  Future<TorGeoIpTable?> newest() async {
+    final dir = await _directory();
+    if (!await dir.exists()) return null;
+    TorGeoIpTable? best;
+    await for (final entry in dir.list()) {
+      if (entry is! File) continue;
+      final at = torGeoIpFetchedAt(entry.uri.pathSegments.last);
+      if (at == null) continue;
+      if (best == null || at.isAfter(best.fetchedAt)) {
+        best = TorGeoIpTable(entry.path, fetchedAt: at);
+      }
+    }
+    return best;
+  }
+
+  @override
+  Future<TorGeoIpTable?> download(UserProxySettings via) =>
+      _downloads.run((), call: () => _download(via));
+
+  Future<TorGeoIpTable?> _download(UserProxySettings via) async {
+    for (var pass = 0; pass < kTorGeoIpPasses; pass++) {
+      for (final url in kTorGeoIpUrls) {
+        final http.Client client;
+        switch (outboundHttp.clientFor(_freshCircuit(via))) {
+          case OutboundClientBlocked(:final reason):
+            LogTag.torGeoIp.warning('Download blocked: $reason');
+            return null;
+          case OutboundClientReady(client: final ready):
+            client = ready;
+        }
+        final uri = Uri.parse(url);
+        final host = uri.host;
+        try {
+          final response = await client.get(uri).timeout(kTorGeoIpTimeout);
+          if (response.statusCode != 200) {
+            LogTag.torGeoIp.warning(
+                '$host answered HTTP ${response.statusCode}');
+            continue;
+          }
+          final bytes = response.bodyBytes;
+          if (!await Isolate.run(() => _isTable(bytes))) {
+            LogTag.torGeoIp.warning(
+                '$host answered ${bytes.length} bytes that are not a GeoIP '
+                'table under $kTorGeoIpLicence');
+            continue;
+          }
+          final table = await _keep(bytes);
+          LogTag.torGeoIp.info('Fetched ${bytes.length} bytes from $host');
+          return table;
+        } on Exception catch (e) {
+          LogTag.torGeoIp.warning('$host failed: $e');
+        } finally {
+          client.close();
+        }
+      }
+    }
+    return null;
+  }
+
+  /// [via] under a SOCKS username no earlier request from this store used.
+  /// tor keys circuits on it (IsolateSOCKSAuth) and keeps reusing one for
+  /// ten minutes, so without this the next source, the next pass and the
+  /// user's Retry would all go back to the circuit that just failed.
+  UserProxySettings _freshCircuit(UserProxySettings via) => UserProxySettings(
+        type: via.type,
+        address: via.address,
+        username: '${via.username}/${++_circuits}',
+        password: via.password,
+      );
+
+  static bool _isTable(Uint8List bytes) {
+    try {
+      return isTorGeoIpTable(utf8.decode(bytes));
+    } on FormatException {
+      return false;
+    }
+  }
+
+  /// Write under a fresh name, then drop every other file. Written to a
+  /// `.part` first so a crash mid-write never leaves a half table that
+  /// [newest] would hand to tor.
+  Future<TorGeoIpTable> _keep(Uint8List bytes) async {
+    final dir = await _directory();
+    await dir.create(recursive: true);
+    final at = _clock();
+    final name = torGeoIpFileName(at);
+    final part = File('${dir.path}/$name.part');
+    await part.writeAsBytes(bytes, flush: true);
+    final file = await part.rename('${dir.path}/$name');
+    await for (final entry in dir.list()) {
+      if (entry.path == file.path) continue;
+      try {
+        await entry.delete();
+      } on FileSystemException catch (e) {
+        LogTag.torGeoIp.warning('Could not drop an old table: $e');
+      }
+    }
+    return TorGeoIpTable(
+        file.path, fetchedAt: DateTime.fromMillisecondsSinceEpoch(
+            at.toUtc().millisecondsSinceEpoch, isUtc: true));
+  }
+}

@@ -18,7 +18,16 @@ cd "$(dirname "$0")"
 JAR="${TLA2TOOLS_JAR:-tla2tools.jar}"
 if [ ! -f "$JAR" ]; then
   echo "Fetching tla2tools.jar…"
-  curl -fsSL -o "$JAR" \
+  # Retried, like the TLAPS fetch in the workflow: a single 504 from
+  # GitHub's release-asset CDN otherwise takes the whole validate job down
+  # before a single model runs. Observed four times across three PRs in one
+  # afternoon (tla2tools twice, the Gradle distribution, fvm).
+  #
+  # `latest` rather than a pinned tag, which is a reproducibility hole this
+  # repo would not otherwise accept. Pinning needs the current tag; resolve
+  # it and switch this to
+  # `https://github.com/tlaplus/tlaplus/releases/download/<tag>/tla2tools.jar`.
+  curl -fsSL --retry 4 --retry-delay 2 -o "$JAR" \
     https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
 fi
 
@@ -83,6 +92,16 @@ expect warmstart_bug.cfg warmstart.tla "Temporal propert(y|ies).*violated" \
   "a reattach after the resume one-shot nudge drains is left blank (reproduced + caught)"
 expect warmstart_reach.cfg warmstart.tla "Reach_LateReattach is violated" \
   "the late-reattach ordering is reachable (RepaintLiveness not vacuous)"
+expect warmstart_proxy.cfg warmstart.tla "Temporal propert(y|ies).*violated" \
+  "a proxy that may not fire leaves the reattach blank (gap #5: what a native attach callback removes)"
+
+echo "── RELOADLATCH: BUG-001 rapid-refresh white screen (PAUSE-027, Attempt 11) ──"
+expect reloadlatch.cfg reloadlatch.tla "No error has been found" \
+  "a bounded commit window repaints every commit that settles inside it"
+expect reloadlatch_bug.cfg reloadlatch.tla "Temporal propert(y|ies).*violated" \
+  "a one-shot latch spent by the aborted load leaves the replacement blank (reproduced + caught)"
+expect reloadlatch_reach.cfg reloadlatch.tla "Reach_SpentLatch is violated" \
+  "the spent-latch ordering is reachable (RepaintLiveness not vacuous)"
 
 echo "── PROXY: mutual exclusion (Android serialises mismatched-proxy sites) ──"
 expect proxy.cfg proxy.tla "No error has been found" \
@@ -91,6 +110,24 @@ expect proxy_mismatch.cfg proxy.tla "Inv_ProxyCoherent is violated" \
   "co-loading a mismatched-proxy site is caught"
 expect proxy_reach.cfg proxy.tla "Reach_TwoLoaded is violated" \
   "two compatible sites can co-load (coherence not vacuous)"
+
+echo "── PROXY: per-site router (PROXY-013) ──"
+expect proxy_router.cfg proxy.tla "No error has been found" \
+  "every loaded site egresses through its own proxy, mismatched or not"
+expect proxy_router_misattribute.cfg proxy.tla "Inv_EgressMatchesConfig is violated" \
+  "routing one site through another's upstream is caught (shared auth cache)"
+expect proxy_router_reach.cfg proxy.tla "Reach_MismatchedCoLoaded is violated" \
+  "mismatched-proxy sites CAN co-load under the router (not vacuous)"
+expect proxy_serialised_noconcurrency.cfg proxy.tla "No error has been found" \
+  "and CANNOT co-load under PROXY-008 serialisation (same formula, both sides)"
+
+echo "── PROXY: hosted tabs follow the slot's identity (LIR-024) ──"
+expect proxy_staleident.cfg proxy.tla "Inv_EgressMatchesConfig is violated" \
+  "a background slot kept loaded under a mismatched identity is caught"
+expect proxy_sitenotslot.cfg proxy.tla "Inv_EgressMatchesConfig is violated" \
+  "serialising by the sites instead of their slot identities is caught"
+expect proxy_hosted_reach.cfg proxy.tla "Reach_HostedCoLoaded is violated" \
+  "a hosted slot co-loads with its host's own slot (not vacuous)"
 
 echo "── RETENTION: memory-pressure cascade + notification retention (PAUSE-006) ──"
 expect retention.cfg retention.tla "No error has been found" \
@@ -107,6 +144,10 @@ expect containers_alias.cfg containers.tla "Inv_Disjoint is violated" \
   "binding two sites to one container is caught"
 expect containers_reach.cfg containers.tla "Reach_TwoCreated is violated" \
   "two sites are actually created (disjointness not vacuous)"
+expect containers_ownermirror.cfg containers.tla "Inv_PostureMatchesContainer is violated" \
+  "a hosted slot mirroring cookies to its owner is caught (LIR-018)"
+expect containers_hosted_reach.cfg containers.tla "Reach_Hosted is violated" \
+  "a slot actually runs as another site (posture check not vacuous)"
 
 echo "── KIOSK: locked shortcut session seals the shell (KIOSK-001/002/003) ──"
 expect kiosk.cfg kiosk.tla "No error has been found" \

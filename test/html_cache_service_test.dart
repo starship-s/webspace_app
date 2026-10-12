@@ -2,26 +2,16 @@ import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:package_info_plus/package_info_plus.dart';
-import 'package:path_provider_platform_interface/path_provider_platform_interface.dart';
-import 'package:plugin_platform_interface/plugin_platform_interface.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webspace/services/file_store_io.dart';
 import 'package:webspace/services/html_cache_service.dart';
 
 import 'helpers/mock_secure_storage.dart' show MockFlutterSecureStorage;
-
-class _FakePathProvider extends PathProviderPlatform with MockPlatformInterfaceMixin {
-  final Directory _dir;
-  _FakePathProvider(this._dir);
-  @override
-  Future<String?> getApplicationDocumentsPath() async => _dir.path;
-  @override
-  Future<String?> getTemporaryPath() async => _dir.path;
-}
+import 'helpers/fake_path_provider.dart';
 
 /// Tests for the eviction race-condition fix.
 ///
-/// The race: `_goHome` (and similar) used to schedule a fire-and-forget
+/// The race: `goHome` (and similar) used to schedule a fire-and-forget
 /// `deleteCache` after a connectivity probe. By the time the probe
 /// resolved, the rebuilt webview had often already saved a fresh
 /// snapshot — and the deletion wiped that fresh entry. Closer races
@@ -40,7 +30,7 @@ void main() {
 
   setUp(() async {
     tempDir = await Directory.systemTemp.createTemp('webspace_html_cache_test_');
-    PathProviderPlatform.instance = _FakePathProvider(tempDir);
+    useFakePathProvider(tempDir);
     SharedPreferences.setMockInitialValues({});
     PackageInfo.setMockInitialValues(
       appName: 'webspace',
@@ -67,12 +57,13 @@ void main() {
   group('evictInMemory', () {
     test('drops in-memory snapshot synchronously', () async {
       final svc = HtmlCacheService.instance;
-      await svc.saveHtml('site-1', '<p>cached</p>', 'https://example.com/');
+      await svc.saveHtml('site-1',
+          html: '<p>cached</p>', url: 'https://example.com/');
       expect(svc.getHtmlSync('site-1'), '<p>cached</p>');
 
       svc.evictInMemory('site-1');
 
-      // No await between evict and read - this is the contract `_goHome`
+      // No await between evict and read - this is the contract `goHome`
       // depends on. A rebuilt webview's `getHtmlSync` runs in the same
       // event-loop turn; it must see the eviction.
       expect(svc.getHtmlSync('site-1'), isNull);
@@ -80,7 +71,8 @@ void main() {
 
     test('resets the debounce window so the next save is allowed', () async {
       final svc = HtmlCacheService.instance;
-      await svc.saveHtml('site-1', '<p>cached</p>', 'https://example.com/');
+      await svc.saveHtml('site-1',
+          html: '<p>cached</p>', url: 'https://example.com/');
       // Just-saved: shouldSave is false within the 10s debounce.
       expect(svc.shouldSave('site-1'), isFalse);
 
@@ -96,7 +88,8 @@ void main() {
       final svc = HtmlCacheService.instance;
       // Two evictions in a row both bump the gen, so any save that
       // captured a gen between them is also rejected.
-      await svc.saveHtml('site-1', '<p>v1</p>', 'https://example.com/');
+      await svc.saveHtml('site-1',
+          html: '<p>v1</p>', url: 'https://example.com/');
       svc.evictInMemory('site-1');
       svc.evictInMemory('site-1');
       // The visible effect: getHtmlSync still returns null, and a
@@ -109,17 +102,18 @@ void main() {
   group('saveHtml gen check', () {
     test('rejects a save whose gen was invalidated mid-flight', () async {
       final svc = HtmlCacheService.instance;
-      await svc.saveHtml('site-1', '<p>baseline</p>', 'https://example.com/');
+      await svc.saveHtml('site-1',
+          html: '<p>baseline</p>', url: 'https://example.com/');
       expect(svc.getHtmlSync('site-1'), '<p>baseline</p>');
 
       // Race: schedule a save. Synchronously evict before the save's
-      // first await resumes - simulating `_goHome` running between when
+      // first await resumes - simulating `goHome` running between when
       // the disposed webview's onLoadStop fired its `getHtml()` IPC and
       // when saveHtml lands.
       final saving = svc.saveHtml(
         'site-1',
-        '<p>stale-from-pre-home</p>',
-        'https://example.com/deep',
+        html: '<p>stale-from-pre-home</p>',
+        url: 'https://example.com/deep',
       );
       svc.evictInMemory('site-1');
       await saving;
@@ -135,7 +129,8 @@ void main() {
     test('a save started after eviction is allowed', () async {
       final svc = HtmlCacheService.instance;
       svc.evictInMemory('site-1');
-      await svc.saveHtml('site-1', '<p>fresh</p>', 'https://example.com/');
+      await svc.saveHtml('site-1',
+          html: '<p>fresh</p>', url: 'https://example.com/');
       expect(svc.getHtmlSync('site-1'), '<p>fresh</p>');
     });
   });
@@ -143,7 +138,8 @@ void main() {
   group('deleteCache', () {
     test('drops in-memory entry synchronously even before disk delete completes', () async {
       final svc = HtmlCacheService.instance;
-      await svc.saveHtml('site-1', '<p>cached</p>', 'https://example.com/');
+      await svc.saveHtml('site-1',
+          html: '<p>cached</p>', url: 'https://example.com/');
       expect(svc.getHtmlSync('site-1'), '<p>cached</p>');
 
       // Don't await - check the in-memory state in the same turn.
@@ -157,7 +153,8 @@ void main() {
       final svc = HtmlCacheService.instance;
       // Stale save in flight when delete fires - same shape as a
       // disposed-webview onLoadStop racing an explicit deletion.
-      final saving = svc.saveHtml('site-1', '<p>stale</p>', 'https://example.com/');
+      final saving = svc.saveHtml('site-1',
+          html: '<p>stale</p>', url: 'https://example.com/');
       final deleting = svc.deleteCache('site-1');
       await Future.wait([saving, deleting]);
       expect(svc.getHtmlSync('site-1'), isNull);

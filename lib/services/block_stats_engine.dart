@@ -30,7 +30,11 @@ const Map<BlockCategory, String> _categoryKeys = {
   BlockCategory.localCdn: 'cdn',
 };
 
-BlockCategory? _categoryFromKey(String key) {
+/// Wire name for [category]. Shared by the persisted counter blob and the
+/// encrypted detail blob, so one category never has two spellings on disk.
+String blockCategoryKey(BlockCategory category) => _categoryKeys[category]!;
+
+BlockCategory? blockCategoryFromKey(String key) {
   for (final entry in _categoryKeys.entries) {
     if (entry.value == key) return entry.key;
   }
@@ -52,6 +56,7 @@ class BlockStatsEngine {
 
   DateTime _since;
   bool _dirty = false;
+  int _revision = 0;
 
   BlockStatsEngine({
     DateTime? since,
@@ -67,7 +72,18 @@ class BlockStatsEngine {
   /// True when a mutation has not been persisted yet.
   bool get isDirty => _dirty;
 
+  /// Bumped by every mutation. Read it before encoding a payload and hand it
+  /// back to [markCleanAt] once that payload is on disk.
+  int get revision => _revision;
+
   void markClean() => _dirty = false;
+
+  /// Clear the dirty flag only if nothing has been recorded since [revision]
+  /// was read. A write that lands after a concurrent [record] must not mark
+  /// those newer counts persisted, or they are dropped on the next kill.
+  void markCleanAt(int revision) {
+    if (revision == _revision) _dirty = false;
+  }
 
   static int dayKey(DateTime d) => d.year * 10000 + d.month * 100 + d.day;
 
@@ -77,7 +93,7 @@ class BlockStatsEngine {
     final bucket = _days.putIfAbsent(dayKey(at), () => <BlockCategory, int>{});
     bucket[category] = (bucket[category] ?? 0) + count;
     _allTime[category] = (_allTime[category] ?? 0) + count;
-    _dirty = true;
+    _markDirty();
   }
 
   /// Per-category totals over the [days] calendar days ending today
@@ -100,20 +116,22 @@ class BlockStatsEngine {
       totalsForLastDays(days, now: now).values.fold(0, (a, b) => a + b);
 
   /// Daily totals oldest-first over the [days] window, for the bar chart.
-  List<int> dailyTotals(int days, {DateTime? now}) {
+  /// With [category] given, only that category's events count, so a category
+  /// drill-down charts the same window on the same scale.
+  List<int> dailyTotals(int days, {DateTime? now, BlockCategory? category}) {
     final at = now ?? DateTime.now();
     return List<int>.generate(days, (i) {
       final key = dayKey(DateTime(at.year, at.month, at.day - (days - 1 - i)));
       final bucket = _days[key];
       if (bucket == null) return 0;
+      if (category != null) return bucket[category] ?? 0;
       return bucket.values.fold(0, (a, b) => a + b);
     });
   }
 
-  Map<BlockCategory, int> get allTimeTotals =>
-      Map<BlockCategory, int>.unmodifiable(_allTime);
-
   int get allTimeTotal => _allTime.values.fold(0, (a, b) => a + b);
+
+  int allTimeFor(BlockCategory category) => _allTime[category] ?? 0;
 
   /// Drop buckets older than [retentionDays]. Returns the number dropped.
   int prune({DateTime? now}) {
@@ -123,7 +141,7 @@ class BlockStatsEngine {
     for (final k in stale) {
       _days.remove(k);
     }
-    if (stale.isNotEmpty) _dirty = true;
+    if (stale.isNotEmpty) _markDirty();
     return stale.length;
   }
 
@@ -132,7 +150,12 @@ class BlockStatsEngine {
     _days.clear();
     _allTime.clear();
     _since = now ?? DateTime.now();
+    _markDirty();
+  }
+
+  void _markDirty() {
     _dirty = true;
+    _revision++;
   }
 
   Map<String, dynamic> toJson() => {
@@ -140,13 +163,13 @@ class BlockStatsEngine {
         'since': _since.toIso8601String(),
         'allTime': {
           for (final entry in _allTime.entries)
-            _categoryKeys[entry.key]!: entry.value,
+            blockCategoryKey(entry.key): entry.value,
         },
         'days': {
           for (final day in _days.entries)
             day.key.toString(): {
               for (final entry in day.value.entries)
-                _categoryKeys[entry.key]!: entry.value,
+                blockCategoryKey(entry.key): entry.value,
             },
         },
       };
@@ -176,7 +199,7 @@ class BlockStatsEngine {
   static Map<BlockCategory, int> _countsFromJson(Map<dynamic, dynamic> raw) {
     final out = <BlockCategory, int>{};
     for (final entry in raw.entries) {
-      final category = _categoryFromKey(entry.key.toString());
+      final category = blockCategoryFromKey(entry.key.toString());
       final count = entry.value;
       if (category == null || count is! int || count <= 0) continue;
       out[category] = count;

@@ -38,7 +38,7 @@ void main() {
   // string context — a real break-out.
   const marker = '__ws_pwned';
 
-  void expectNoBreakout(String shim, String label) {
+  void expectNoBreakout(String shim, {required String label}) {
     expect(shim.contains(encoded), isTrue,
         reason: '$label must embed the value as a jsonEncode()d literal');
     // Remove the (safe) encoded literal; the marker must not survive.
@@ -48,24 +48,25 @@ void main() {
   }
 
   test('language shim json-encodes the language tag', () {
-    expectNoBreakout(buildLanguageShim(payload), 'buildLanguageShim');
+    expectNoBreakout(buildLanguageShim(payload), label: 'buildLanguageShim');
   });
 
   test('location shim json-encodes the spoofed timezone', () {
-    final shim = LocationSpoofService.buildScript(
-      locationMode: LocationMode.spoof,
-      spoofLatitude: 40.0,
-      spoofLongitude: -74.0,
-      spoofAccuracy: 25.0,
-      spoofTimezone: payload,
-      webRtcPolicy: WebRtcPolicy.defaultPolicy,
-    );
-    expectNoBreakout(shim, 'LocationSpoofService.buildScript');
+    final shim = LocationSpoofService.buildScript((
+      mode: LocationMode.spoof,
+      latitude: 40.0,
+      longitude: -74.0,
+      accuracy: 25.0,
+      timezone: payload,
+      granularity: LocationGranularity.gps,
+      webRtc: WebRtcPolicy.defaultPolicy,
+    ));
+    expectNoBreakout(shim, label: 'LocationSpoofService.buildScript');
   });
 
   test('anti-fingerprinting shim json-encodes the seed', () {
-    expectNoBreakout(
-        buildAntiFingerprintingShim(payload), 'buildAntiFingerprintingShim');
+    expectNoBreakout(buildAntiFingerprintingShim(payload),
+        label: 'buildAntiFingerprintingShim');
   });
 
   test('desktop-mode shim never emits the raw user-agent string', () {

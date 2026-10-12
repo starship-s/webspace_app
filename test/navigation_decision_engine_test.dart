@@ -1,83 +1,89 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/services/navigation_decision_engine.dart';
+import 'package:webspace/settings/external_links.dart';
 
 bool _neverCaptcha(String _) => false;
 bool _alwaysCaptcha(String _) => true;
+bool _claimsOther(String url) => Uri.parse(url).host == 'other.com';
 
 void main() {
   final t0 = DateTime.parse('2026-04-21T12:00:00Z');
 
   NavigationDecisionResult decideShould({
     required String targetUrl,
-    required String initUrl,
+    String initUrl = 'https://example.com',
     bool hasGesture = false,
-    bool blockAutoRedirects = true,
     bool isSiteActive = true,
     DateTime? lastSameDomainGestureTime,
     DateTime? now,
+    ExternalLinkMode mode = ExternalLinkMode.inApp,
+    bool Function(String)? claims,
   }) =>
       NavigationDecisionEngine.decideShouldOverrideUrlLoading(
         targetUrl: targetUrl,
         initUrl: initUrl,
         hasGesture: hasGesture,
-        blockAutoRedirects: blockAutoRedirects,
         isSiteActive: isSiteActive,
         lastSameDomainGestureTime: lastSameDomainGestureTime,
         now: now ?? t0,
+        externalLinkMode: mode,
+        matchesSiteClaim: claims,
       );
 
   NavigationDecisionResult decideChanged({
     required String newUrl,
-    required String initUrl,
-    bool blockAutoRedirects = true,
+    String initUrl = 'https://example.com',
     bool isSiteActive = true,
     DateTime? lastSameDomainGestureTime,
     DateTime? now,
     bool Function(String)? isCaptcha,
+    ExternalLinkMode mode = ExternalLinkMode.inApp,
+    bool Function(String)? claims,
   }) =>
       NavigationDecisionEngine.decideOnUrlChanged(
         newUrl: newUrl,
         initUrl: initUrl,
-        blockAutoRedirects: blockAutoRedirects,
         isSiteActive: isSiteActive,
         lastSameDomainGestureTime: lastSameDomainGestureTime,
         now: now ?? t0,
         isCaptchaChallenge: isCaptcha ?? _neverCaptcha,
+        externalLinkMode: mode,
+        matchesSiteClaim: claims,
+      );
+
+  /// A server redirect off DuckDuckGo two seconds after a same-site tap.
+  OnUrlChangedHandled redirectAfterTap(ExternalLinkMode mode) =>
+      NavigationDecisionEngine.handleOnUrlChanged(
+        newUrl: 'https://unclaimed.com',
+        initUrl: 'https://duckduckgo.com',
+        isSiteActive: true,
+        lastSameDomainGestureTime: t0.subtract(const Duration(seconds: 2)),
+        now: t0,
+        isCaptchaChallenge: _neverCaptcha,
+        state: OnUrlChangedState.initial('https://duckduckgo.com'),
+        externalLinkMode: mode,
+        matchesSiteClaim: _claimsOther,
       );
 
   group('decideShouldOverrideUrlLoading', () {
     test('allows about:blank for captcha iframes', () {
-      final r = decideShould(targetUrl: 'about:blank', initUrl: 'https://example.com');
+      final r = decideShould(targetUrl: 'about:blank');
       expect(r.decision, NavigationDecision.allow);
       expect(r.gestureUpdate, isNull);
     });
 
-    test('allows about:srcdoc for captcha iframes', () {
-      final r = decideShould(targetUrl: 'about:srcdoc', initUrl: 'https://example.com');
-      expect(r.decision, NavigationDecision.allow);
-    });
-
-    test('allows data: URIs', () {
-      final r = decideShould(
-        targetUrl: 'data:text/html,<p>hi</p>',
-        initUrl: 'https://example.com',
-      );
-      expect(r.decision, NavigationDecision.allow);
-    });
-
-    test('allows blob: URIs', () {
-      final r = decideShould(
-        targetUrl: 'blob:https://example.com/uuid',
-        initUrl: 'https://example.com',
-      );
-      expect(r.decision, NavigationDecision.allow);
-    });
+    for (final (name, url) in [
+      ('allows about:srcdoc for captcha iframes', 'about:srcdoc'),
+      ('allows data: URIs', 'data:text/html,<p>hi</p>'),
+      ('allows blob: URIs', 'blob:https://example.com/uuid'),
+    ]) {
+      test(name, () {
+        expect(decideShould(targetUrl: url).decision, NavigationDecision.allow);
+      });
+    }
 
     test('allows same normalized domain without gesture (no record)', () {
-      final r = decideShould(
-        targetUrl: 'https://www.example.com/page',
-        initUrl: 'https://example.com',
-      );
+      final r = decideShould(targetUrl: 'https://www.example.com/page');
       expect(r.decision, NavigationDecision.allow);
       expect(r.gestureUpdate, isNull);
     });
@@ -92,21 +98,14 @@ void main() {
       expect(r.gestureUpdate, GestureStateUpdate.record);
     });
 
-    test('blocks script-initiated cross-domain silently when blockAutoRedirects', () {
+    test('blocks script-initiated cross-domain silently', () {
       final r = decideShould(
-        targetUrl: 'https://evil.tracker.com',
-        initUrl: 'https://example.com',
-        hasGesture: false,
-      );
+          targetUrl: 'https://evil.tracker.com', hasGesture: false);
       expect(r.decision, NavigationDecision.blockSilent);
     });
 
     test('opens nested on gesture-driven cross-domain click', () {
-      final r = decideShould(
-        targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
-        hasGesture: true,
-      );
+      final r = decideShould(targetUrl: 'https://other.com', hasGesture: true);
       expect(r.decision, NavigationDecision.blockOpenNested);
       expect(r.gestureUpdate, isNull, reason: 'direct gesture — nothing to consume');
     });
@@ -114,7 +113,6 @@ void main() {
     test('suppresses nested open when background site', () {
       final r = decideShould(
         targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
         hasGesture: true,
         isSiteActive: false,
       );
@@ -138,7 +136,6 @@ void main() {
     test('does not propagate gesture older than 10s', () {
       final r = decideShould(
         targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
         hasGesture: false,
         lastSameDomainGestureTime: t0,
         now: t0.add(const Duration(seconds: 11)),
@@ -148,22 +145,20 @@ void main() {
           reason: 'still consumed even when stale, to prevent a later in-window use');
     });
 
-    test('allows cross-domain when blockAutoRedirects is off', () {
-      final r = decideShould(
-        targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
-        hasGesture: false,
-        blockAutoRedirects: false,
-      );
-      expect(r.decision, NavigationDecision.blockOpenNested);
+    test('a gesture-less cross-domain hop is blocked on every site', () {
+      // There is no per-site switch to let one through (NESTED-004), in any
+      // external-link mode.
+      for (final mode in ExternalLinkMode.values) {
+        final r = decideShould(
+            targetUrl: 'https://other.com', hasGesture: false, mode: mode);
+        expect(r.decision, NavigationDecision.blockSilent, reason: mode.name);
+      }
     });
 
-    test('blockAutoRedirects=false still suppresses nested for background sites', () {
+    test('a background site suppresses the nested screen of a tapped link', () {
       final r = decideShould(
         targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
-        hasGesture: false,
-        blockAutoRedirects: false,
+        hasGesture: true,
         isSiteActive: false,
       );
       expect(r.decision, NavigationDecision.blockSuppressed);
@@ -173,7 +168,7 @@ void main() {
   group('decideOnUrlChanged', () {
     test('allows data/blob/about schemes as no-op', () {
       for (final url in const ['data:text/html,x', 'blob:https://x/uuid', 'about:blank']) {
-        final r = decideChanged(newUrl: url, initUrl: 'https://example.com');
+        final r = decideChanged(newUrl: url);
         expect(r.decision, NavigationDecision.allow, reason: 'url=$url');
       }
     });
@@ -181,27 +176,53 @@ void main() {
     test('allows same-domain URL changes without touching gesture state', () {
       final r = decideChanged(
         newUrl: 'https://example.com/other',
-        initUrl: 'https://example.com',
         lastSameDomainGestureTime: t0.subtract(const Duration(seconds: 2)),
       );
       expect(r.decision, NavigationDecision.allow);
       expect(r.gestureUpdate, isNull, reason: 'same-domain changes do not touch gesture state');
     });
 
-    test('allows captcha challenge URLs even when cross-domain', () {
+    test('a captcha-shaped URL does not buy a gesture-less cross-origin hop',
+        () {
+      // `isCaptchaChallenge` matches a URL *shape*, so a page can send itself
+      // to `https://attacker.example/cdn-cgi/challenge-platform/x` and, when
+      // the allow ran first, render the attacker origin in place inside the
+      // site's own container and commit it as `currentUrl`.
       final r = decideChanged(
+        newUrl: 'https://attacker.example/cdn-cgi/challenge-platform/x',
+        isCaptcha: _alwaysCaptcha,
+      );
+      expect(r.decision, NavigationDecision.blockSilent);
+    });
+
+    test('a captcha the user reached renders in place instead of nesting', () {
+      // With the gesture the navigation is permitted anyway; the captcha
+      // check only keeps it out of a nested webview, where the challenge
+      // would be stranded away from the page that needs its cookie.
+      final withGesture = decideChanged(
         newUrl: 'https://challenges.cloudflare.com/foo',
-        initUrl: 'https://example.com',
+        isCaptcha: _alwaysCaptcha,
+        lastSameDomainGestureTime: t0.subtract(const Duration(seconds: 2)),
+      );
+      expect(withGesture.decision, NavigationDecision.allow);
+      expect(withGesture.gestureUpdate, GestureStateUpdate.consume);
+    });
+
+    test('a same-origin Cloudflare interstitial is still allowed unguarded',
+        () {
+      // The real interstitial is served by the site itself, so it never
+      // needed the captcha branch — the same-domain check clears it first.
+      final r = decideChanged(
+        newUrl: 'https://example.com/cdn-cgi/challenge-platform/h/b/orchestrate',
+        initUrl: 'https://example.com/',
         isCaptcha: _alwaysCaptcha,
       );
       expect(r.decision, NavigationDecision.allow);
+      expect(r.gestureUpdate, isNull);
     });
 
     test('silently blocks server-side redirect when no recent gesture', () {
-      final r = decideChanged(
-        newUrl: 'https://tracker.com',
-        initUrl: 'https://example.com',
-      );
+      final r = decideChanged(newUrl: 'https://tracker.com');
       expect(r.decision, NavigationDecision.blockSilent);
     });
 
@@ -219,191 +240,199 @@ void main() {
     test('suppresses redirect handling for background site', () {
       final r = decideChanged(
         newUrl: 'https://other.com',
-        initUrl: 'https://example.com',
         isSiteActive: false,
         lastSameDomainGestureTime: t0.subtract(const Duration(seconds: 2)),
       );
       expect(r.decision, NavigationDecision.blockSuppressed);
-    });
-
-    test('allows cross-domain redirect when blockAutoRedirects=false and no gesture', () {
-      final r = decideChanged(
-        newUrl: 'https://other.com',
-        initUrl: 'https://example.com',
-        blockAutoRedirects: false,
-      );
-      expect(r.decision, NavigationDecision.blockOpenNested);
     });
   });
 
   group('gesture window boundary behaviour', () {
-    test('exactly at 9s still propagates', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
-        hasGesture: false,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: t0,
-        now: t0.add(const Duration(seconds: 9)),
-      );
-      expect(r.decision, NavigationDecision.blockOpenNested);
-    });
-
-    test('exactly at 10s does not propagate', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
-        hasGesture: false,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: t0,
-        now: t0.add(const Duration(seconds: 10)),
-      );
-      expect(r.decision, NavigationDecision.blockSilent);
-    });
+    for (final (name, seconds, decision) in [
+      ('exactly at 9s still propagates', 9, NavigationDecision.blockOpenNested),
+      ('exactly at 10s does not propagate', 10, NavigationDecision.blockSilent),
+    ]) {
+      test(name, () {
+        final r = decideShould(
+          targetUrl: 'https://other.com',
+          hasGesture: false,
+          lastSameDomainGestureTime: t0,
+          now: t0.add(Duration(seconds: seconds)),
+        );
+        expect(r.decision, decision);
+      });
+    }
   });
 
-  group('externalLinksInBrowser (discussion #438)', () {
-    bool claimsOther(String url) => Uri.parse(url).host == 'other.com';
+  group('external link mode: browser (discussion #438)', () {
+    NavigationDecisionResult tap(
+      String url, {
+      bool gesture = true,
+      bool active = true,
+      ExternalLinkMode mode = ExternalLinkMode.browser,
+      bool Function(String)? claims = _claimsOther,
+    }) =>
+        decideShould(
+          targetUrl: url,
+          hasGesture: gesture,
+          isSiteActive: active,
+          mode: mode,
+          claims: claims,
+        );
 
     test('unclaimed cross-domain link opens externally on gesture', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://unclaimed.com',
-        initUrl: 'https://example.com',
-        hasGesture: true,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: null,
-        now: t0,
-        externalLinksInBrowser: true,
-        matchesSiteClaim: claimsOther,
-      );
-      expect(r.decision, NavigationDecision.blockOpenExternal);
+      expect(tap('https://unclaimed.com').decision,
+          NavigationDecision.blockOpenExternal);
     });
 
     test('claimed cross-domain link stays in a nested webview', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://other.com/path',
-        initUrl: 'https://example.com',
-        hasGesture: true,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: null,
-        now: t0,
-        externalLinksInBrowser: true,
-        matchesSiteClaim: claimsOther,
-      );
-      expect(r.decision, NavigationDecision.blockOpenNested);
+      expect(tap('https://other.com/path').decision,
+          NavigationDecision.blockOpenNested);
     });
 
-    test('setting off keeps the legacy nested routing', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://unclaimed.com',
-        initUrl: 'https://example.com',
-        hasGesture: true,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: null,
-        now: t0,
-        externalLinksInBrowser: false,
-        matchesSiteClaim: claimsOther,
-      );
-      expect(r.decision, NavigationDecision.blockOpenNested);
+    test('in-app mode keeps the legacy nested routing', () {
+      expect(tap('https://unclaimed.com', mode: ExternalLinkMode.inApp).decision,
+          NavigationDecision.blockOpenNested);
     });
 
     test('same-domain navigation is unaffected', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://example.com/page2',
-        initUrl: 'https://example.com',
-        hasGesture: true,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: null,
-        now: t0,
-        externalLinksInBrowser: true,
-        matchesSiteClaim: claimsOther,
-      );
-      expect(r.decision, NavigationDecision.allow);
+      expect(tap('https://example.com/page2').decision,
+          NavigationDecision.allow);
     });
 
     test('null matchesSiteClaim treats every cross-domain link as unclaimed', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://other.com',
-        initUrl: 'https://example.com',
-        hasGesture: true,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: null,
-        now: t0,
-        externalLinksInBrowser: true,
-      );
-      expect(r.decision, NavigationDecision.blockOpenExternal);
+      expect(tap('https://other.com', claims: null).decision,
+          NavigationDecision.blockOpenExternal);
     });
 
     test('silent auto-redirect block still wins over external launch', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://unclaimed.com',
-        initUrl: 'https://example.com',
-        hasGesture: false,
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: null,
-        now: t0,
-        externalLinksInBrowser: true,
-        matchesSiteClaim: claimsOther,
-      );
-      expect(r.decision, NavigationDecision.blockSilent,
+      expect(tap('https://unclaimed.com', gesture: false).decision,
+          NavigationDecision.blockSilent,
           reason: 'a script redirect with no gesture must not pop the system browser');
     });
 
     test('background site suppresses external launch', () {
-      final r = NavigationDecisionEngine.decideShouldOverrideUrlLoading(
-        targetUrl: 'https://unclaimed.com',
-        initUrl: 'https://example.com',
-        hasGesture: true,
-        blockAutoRedirects: true,
-        isSiteActive: false,
-        lastSameDomainGestureTime: null,
-        now: t0,
-        externalLinksInBrowser: true,
-        matchesSiteClaim: claimsOther,
-      );
-      expect(r.decision, NavigationDecision.blockSuppressed);
+      expect(tap('https://unclaimed.com', active: false).decision,
+          NavigationDecision.blockSuppressed);
     });
 
     test('onUrlChanged routes an unclaimed redirect externally with a recent gesture', () {
-      final r = NavigationDecisionEngine.decideOnUrlChanged(
+      final r = decideChanged(
         newUrl: 'https://unclaimed.com',
         initUrl: 'https://duckduckgo.com',
-        blockAutoRedirects: true,
-        isSiteActive: true,
         lastSameDomainGestureTime: t0.subtract(const Duration(seconds: 2)),
         now: t0,
-        isCaptchaChallenge: _neverCaptcha,
-        externalLinksInBrowser: true,
-        matchesSiteClaim: claimsOther,
+        mode: ExternalLinkMode.browser,
+        claims: _claimsOther,
       );
       expect(r.decision, NavigationDecision.blockOpenExternal);
     });
 
     test('handleOnUrlChanged surfaces launchExternalUrl, not launchNestedUrl', () {
-      final handled = NavigationDecisionEngine.handleOnUrlChanged(
-        newUrl: 'https://unclaimed.com',
-        initUrl: 'https://duckduckgo.com',
-        blockAutoRedirects: true,
-        isSiteActive: true,
-        lastSameDomainGestureTime: t0.subtract(const Duration(seconds: 2)),
-        now: t0,
-        isCaptchaChallenge: _neverCaptcha,
-        state: OnUrlChangedState.initial('https://duckduckgo.com'),
-        externalLinksInBrowser: true,
-        matchesSiteClaim: claimsOther,
-      );
+      final handled = redirectAfterTap(ExternalLinkMode.browser);
       expect(handled.decision, NavigationDecision.blockOpenExternal);
       expect(handled.launchExternalUrl, 'https://unclaimed.com');
       expect(handled.launchNestedUrl, isNull);
       expect(handled.navigateBackTo, isNotNull);
     });
+  });
+
+  group('external link mode: block (issue #629)', () {
+    NavigationDecisionResult tap(String url, {bool gesture = true}) =>
+        decideShould(
+          targetUrl: url,
+          hasGesture: gesture,
+          mode: ExternalLinkMode.block,
+          claims: _claimsOther,
+        );
+
+    test('an unclaimed cross-domain link opens nothing', () {
+      final r = tap('https://unclaimed.com');
+      expect(r.decision, NavigationDecision.blockOutbound);
+      expect(r.hadGesture, isTrue,
+          reason: 'the host tells the user only about a link they tapped');
+    });
+
+    test('a script navigation is dropped silently, before the mode', () {
+      final r = tap('https://unclaimed.com', gesture: false);
+      expect(r.decision, NavigationDecision.blockSilent);
+      expect(r.hadGesture, isFalse);
+    });
+
+    test('a claimed domain still opens in the app', () {
+      expect(tap('https://other.com/x').decision,
+          NavigationDecision.blockOpenNested);
+    });
+
+    test('same-domain navigation is unaffected', () {
+      expect(tap('https://example.com/page2').decision,
+          NavigationDecision.allow);
+    });
+
+    test('a server redirect is blocked without a nested or external launch', () {
+      final handled = redirectAfterTap(ExternalLinkMode.block);
+      expect(handled.decision, NavigationDecision.blockOutbound);
+      expect(handled.launchNestedUrl, isNull);
+      expect(handled.launchExternalUrl, isNull);
+      expect(handled.state.redirectHandled, isTrue);
+    });
+  });
+
+  group('private suffixes are cross-domain', () {
+    test('a hop between two github.io sites is not same-site', () {
+      // The same-domain branch returns `allow` before the gesture check
+      // ever runs, so a shared base domain here
+      // renders the attacker's page inside the victim's webview.
+      final r = decideShould(
+        targetUrl: 'https://attacker.github.io/steal',
+        initUrl: 'https://victim.github.io/',
+        hasGesture: false,
+      );
+      expect(r.decision, NavigationDecision.blockSilent);
+    });
+
+    test('a site still navigates within its own github.io subdomain', () {
+      final r = decideShould(
+        targetUrl: 'https://victim.github.io/page',
+        initUrl: 'https://victim.github.io/',
+        hasGesture: false,
+      );
+      expect(r.decision, NavigationDecision.allow);
+    });
+  });
+
+  group('stepFor: what every way of opening a URL does next', () {
+    test('a decision to stay loads here, and a dropped one does nothing', () {
+      for (final back in [false, true]) {
+        expect(NavigationDecisionEngine.stepFor(NavigationDecision.allow,
+            returnsToOwner: back), NavigationStep.loadHere);
+        expect(NavigationDecisionEngine.stepFor(NavigationDecision.blockSilent,
+            returnsToOwner: back), NavigationStep.drop);
+        expect(NavigationDecisionEngine.stepFor(
+            NavigationDecision.blockSuppressed,
+            returnsToOwner: back), NavigationStep.drop);
+      }
+    });
+
+    test('anything leaving goes back to the owner first, then to routing', () {
+      for (final d in [
+        NavigationDecision.blockOpenNested,
+        NavigationDecision.blockOpenExternal,
+        NavigationDecision.blockOutbound,
+      ]) {
+        expect(NavigationDecisionEngine.stepFor(d, returnsToOwner: true),
+            NavigationStep.returnToOwner, reason: '$d');
+        expect(NavigationDecisionEngine.stepFor(d, returnsToOwner: false),
+            NavigationStep.route, reason: '$d');
+      }
+    });
+  });
+
+  test('a gesture update applies to the stored time', () {
+    final last = DateTime(2026, 1, 1);
+    final now = DateTime(2026, 1, 2);
+    expect(GestureStateUpdate.record.applyTo(last, now: now), now);
+    expect(GestureStateUpdate.consume.applyTo(last, now: now), isNull);
+    expect((null as GestureStateUpdate?).applyTo(last, now: now), last);
   });
 }

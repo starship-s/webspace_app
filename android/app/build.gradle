@@ -39,6 +39,7 @@ android {
 
     sourceSets {
         main.java.srcDirs += 'src/main/kotlin'
+        debug.java.srcDirs += 'src/debug/kotlin'
         test.java.srcDirs += 'src/test/kotlin'
     }
 
@@ -64,6 +65,7 @@ android {
         targetSdkVersion 36
         versionCode flutterVersionCode.toInteger()
         versionName flutterVersionName
+        resValue "string", "app_name", "Webspace"
     }
 
     signingConfigs {
@@ -102,6 +104,18 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Distinct applicationId so a debug build installs alongside a
+            // release/store install instead of colliding with it (a collision
+            // also fails outright, since the signing keys differ). The
+            // namespace is untouched, so every class name, MethodChannel and
+            // JNI symbol stays as-is; only the package identity moves.
+            // adb-driven scripts under scripts/ must follow this suffix.
+            applicationIdSuffix ".debug"
+            versionNameSuffix "-debug"
+            resValue "string", "app_name", "Webspace Debug"
+        }
+
         release {
             // Only use release signing if keystore exists
             def keystorePropertiesFile = rootProject.file('key.properties')
@@ -265,8 +279,11 @@ dependencies {
     // openspec/specs/per-site-containers/spec.md. The MULTI_PROFILE
     // feature is gated at runtime via WebViewFeature.isFeatureSupported;
     // devices whose System WebView does not advertise it fall through
-    // to the legacy capture-nuke-restore engine.
-    implementation "androidx.webkit:webkit:1.12.1"
+    // to the legacy capture-nuke-restore engine. Also backs WebAuthn
+    // (setWebAuthenticationSupport) for passkey-support.
+    implementation "androidx.webkit:webkit:1.14.0"
+    // WebAuthn/Passkey support via Android Credential Manager
+    implementation "androidx.credentials:credentials:1.5.0"
     // WorkManager backs NOTIF-005-A: PeriodicWorkRequest schedules
     // ~15-min refreshes that wake the app to reload notification sites,
     // mirroring iOS BGAppRefreshTask without a foreground service.

@@ -2,26 +2,37 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webspace/l10n/gen/app_localizations.dart';
 import 'package:webspace/screens/site_privacy.dart';
+import 'package:webspace/services/dns_block_service.dart';
+import 'package:webspace/services/screen_capture_guard.dart';
+import 'package:webspace/settings/app_prefs.dart';
+import 'package:webspace/settings/scoped.dart';
+import 'package:webspace/widgets/level_slider.dart';
 
 SitePrivacyValues _values({
+  bool archived = false,
   bool trackingProtection = false,
   bool clearUrl = false,
   bool dnsBlock = false,
+  int? dnsBlockLevel,
   bool contentBlock = false,
   bool localCdn = false,
   bool thirdPartyCookies = false,
   bool letterbox = false,
   bool incognito = false,
+  bool blockScreenshots = false,
 }) =>
     SitePrivacyValues(
+      archived: archived,
       trackingProtectionEnabled: trackingProtection,
       clearUrlEnabled: clearUrl,
       dnsBlockEnabled: dnsBlock,
+      dnsBlockLevel: Scoped.fromStored(dnsBlockLevel),
       contentBlockEnabled: contentBlock,
       localCdnEnabled: localCdn,
       thirdPartyCookiesEnabled: thirdPartyCookies,
       letterboxEnabled: letterbox,
       incognito: incognito,
+      blockScreenshots: blockScreenshots,
     );
 
 Future<void> _pump(
@@ -48,7 +59,7 @@ Future<void> _pump(
   await tester.pumpAndSettle();
 }
 
-SwitchListTile _switchTitled(WidgetTester tester, String title) {
+SwitchListTile _switchTitled(WidgetTester tester, {required String title}) {
   final tile = find.ancestor(
     of: find.text(title),
     matching: find.byType(SwitchListTile),
@@ -61,6 +72,7 @@ void main() {
   group('SitePrivacyValues', () {
     test('the umbrella forces the four list-based subordinates on', () {
       const v = SitePrivacyValues(
+        archived: false,
         trackingProtectionEnabled: true,
         clearUrlEnabled: false,
         dnsBlockEnabled: false,
@@ -78,6 +90,7 @@ void main() {
 
     test('the umbrella forces third-party cookies off (ETP-024)', () {
       const stored = SitePrivacyValues(
+        archived: false,
         trackingProtectionEnabled: false,
         clearUrlEnabled: false,
         dnsBlockEnabled: false,
@@ -105,13 +118,49 @@ void main() {
     });
   });
 
+  group('Block screenshots (SCREENBLOCK-003)', () {
+    tearDown(() {
+      ScreenCaptureGuard.debugSupportedOverride = null;
+      AppPref.blockScreenshots.debugValue = false;
+    });
+
+    testWidgets('absent where the platform cannot block capture',
+        (tester) async {
+      ScreenCaptureGuard.debugSupportedOverride = false;
+      await _pump(tester, values: _values(blockScreenshots: true));
+      expect(find.text('Block screenshots'), findsNothing);
+    });
+
+    testWidgets('switching it on reports the site value', (tester) async {
+      ScreenCaptureGuard.debugSupportedOverride = true;
+      SitePrivacyValues? reported;
+      await _pump(tester,
+          values: _values(), onChanged: (v) => reported = v);
+      final tile = _switchTitled(tester, title: 'Block screenshots');
+      expect(tile.value, isFalse);
+      tile.onChanged!(true);
+      expect(reported?.blockScreenshots, isTrue);
+    });
+
+    testWidgets('locked on while the app-wide switch covers every site',
+        (tester) async {
+      ScreenCaptureGuard.debugSupportedOverride = true;
+      AppPref.blockScreenshots.debugValue = true;
+      await _pump(tester, values: _values());
+      final tile = _switchTitled(tester, title: 'Block screenshots');
+      expect(tile.value, isTrue);
+      expect(tile.onChanged, isNull);
+      expect(find.text('On for the whole app in App Settings'), findsOneWidget);
+    });
+  });
+
   testWidgets('third-party cookies read as forced off under the umbrella',
       (tester) async {
     await _pump(
       tester,
       values: _values(trackingProtection: true, thirdPartyCookies: true),
     );
-    final tile = _switchTitled(tester, 'Third-party cookies');
+    final tile = _switchTitled(tester, title: 'Third-party cookies');
     expect(tile.value, isFalse);
     expect(tile.onChanged, isNull);
     expect(find.text('Forced off by Tracking Protection'), findsOneWidget);
@@ -121,7 +170,7 @@ void main() {
       (tester) async {
     await _pump(tester, values: _values(trackingProtection: true));
     for (final title in const ['ClearURLs', 'DNS Blocklist']) {
-      final tile = _switchTitled(tester, title);
+      final tile = _switchTitled(tester, title: title);
       expect(tile.value, isTrue, reason: title);
       expect(tile.onChanged, isNull, reason: title);
     }
@@ -135,7 +184,8 @@ void main() {
       'DNS Blocklist',
       'Third-party cookies',
     ]) {
-      expect(_switchTitled(tester, title).onChanged, isNotNull, reason: title);
+      expect(_switchTitled(tester, title: title).onChanged, isNotNull,
+          reason: title);
     }
   });
 
@@ -144,10 +194,10 @@ void main() {
     // Incognito destroys the user's own session on every restart, so unlike
     // the blockers it leads the screen without being forced.
     await _pump(tester, values: _values(incognito: true));
-    expect(_switchTitled(tester, 'Letterbox window').onChanged, isNull);
+    expect(_switchTitled(tester, title: 'Letterbox window').onChanged, isNull);
     expect(find.text('Requires Tracking Protection'), findsOneWidget);
 
-    final incognito = _switchTitled(tester, 'Incognito mode');
+    final incognito = _switchTitled(tester, title: 'Incognito mode');
     expect(incognito.value, isTrue);
     expect(incognito.onChanged, isNotNull);
   });
@@ -165,6 +215,103 @@ void main() {
     expect(find.textContaining('Forced on by'), findsNothing);
     expect(find.text('Forced off by Tracking Protection'), findsOneWidget);
     expect(find.text('Strip tracking parameters from URLs'), findsOneWidget);
+  });
+
+  group('the per-site level uses the same slider as App Settings', () {
+    // The level row only renders with a blocklist in memory, and the slider's
+    // stops are the levels the app knows about, so the service has to be
+    // seeded rather than stubbed at the call site.
+    setUp(() {
+      DnsBlockService.instance.loadLevelsFromStrings(
+        {2: 'normal.example', 3: 'pro.example'},
+        globalLevel: 3,
+      );
+    });
+    tearDown(DnsBlockService.instance.resetForTest);
+
+    LevelSlider slider(WidgetTester tester) {
+      final found = find.byType(LevelSlider);
+      expect(found, findsOneWidget);
+      return tester.widget<LevelSlider>(found);
+    }
+
+    testWidgets('the leftmost stop is the app-wide setting', (tester) async {
+      await _pump(tester, values: _values(dnsBlock: true));
+      final s = slider(tester);
+      expect(s.value, 0);
+      expect(s.labels, ['App', 'Light', 'Normal', 'Pro', 'Pro++', 'Ultimate']);
+      expect(find.text('Same as app settings (Pro)'), findsOneWidget);
+    });
+
+    testWidgets('a site level puts the thumb on that level', (tester) async {
+      await _pump(tester, values: _values(dnsBlock: true, dnsBlockLevel: 2));
+      expect(slider(tester).value, 2);
+    });
+
+    testWidgets('moving the thumb reports the level, stop 0 reports null',
+        (tester) async {
+      SitePrivacyValues? seen;
+      await _pump(
+        tester,
+        values: _values(dnsBlock: true, dnsBlockLevel: 2),
+        onChanged: (v) => seen = v,
+      );
+      slider(tester).onChanged!(3);
+      expect(seen!.dnsBlockLevel, const Own(3));
+      await tester.pumpAndSettle();
+      slider(tester).onChanged!(0);
+      expect(seen!.dnsBlockLevel, const FollowApp<int>());
+      expect(seen!.dnsBlockLevel.stored, isNull);
+    });
+  });
+
+  group('HTTPS upgrade follows App Settings until overridden (HTTPS-005)', () {
+    tearDown(() => AppPref.httpsUpgradeEnabled.debugValue = true);
+
+    DropdownButton<Scoped<bool>> dropdown(WidgetTester tester) =>
+        tester.widget(find.byType(DropdownButton<Scoped<bool>>));
+
+    testWidgets('a site override can go back to following the app',
+        (tester) async {
+      AppPref.httpsUpgradeEnabled.debugValue = false;
+      SitePrivacyValues? seen;
+      await _pump(
+        tester,
+        values: _values().copyWith(httpsUpgrade: const Own(true)),
+        onChanged: (v) => seen = v,
+      );
+      expect(dropdown(tester).value, const Own(true));
+      expect(dropdown(tester).items!.map((i) => i.value),
+          [const FollowApp<bool>(), const Own(true), const Own(false)]);
+
+      await tester.tap(find.byType(DropdownButton<Scoped<bool>>));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('App default (Off)').last);
+      await tester.pumpAndSettle();
+
+      expect(seen!.httpsUpgrade, const FollowApp<bool>());
+      expect(seen!.httpsUpgrade.stored, isNull, reason: 'stored as null');
+    });
+
+    testWidgets('Tracking Protection shows it forced on and locks it',
+        (tester) async {
+      await _pump(tester,
+          values: _values(trackingProtection: true)
+              .copyWith(httpsUpgrade: const Own(false)));
+      expect(dropdown(tester).value, const Own(true));
+      final row = find.ancestor(
+          of: find.text('HTTPS upgrade'), matching: find.byType(ListTile));
+      expect(tester.widget<ListTile>(row).enabled, isFalse);
+    });
+  });
+
+  testWidgets('an archived site shows the posture the archive holds it to',
+      (tester) async {
+    await _pump(tester, values: _values(archived: true));
+    final incognito = _switchTitled(tester, title: 'Incognito mode');
+    expect(incognito.value, isTrue, reason: 'ARCH-006: always incognito');
+    expect(incognito.onChanged, isNull);
+    expect(find.text('Fixed for sites in an archive'), findsOneWidget);
   });
 
   testWidgets('toggling a row reports the whole value back', (tester) async {

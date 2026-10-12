@@ -1,5 +1,5 @@
 // Behavioural tests for Worker/SharedWorker shim propagation
-// (lib/services/worker_shim.dart, dumped to test/js_fixtures/worker_shim/*.js).
+// (lib/js/worker_shim.js).
 //
 // Two tiers, because the feature has two halves:
 //
@@ -14,16 +14,21 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const WORKER = require('./helpers/worker_shims');
 const vm = require('node:vm');
 const { JSDOM } = require('jsdom');
-const { readFixture } = require('./helpers/load_shim');
+const { pageJs } = require('./helpers/load_shim');
+const { scriptOf } = require('./helpers/script_of');
 
-const COMBINED = 'worker_shim/installer_combined.js';
-const LANGUAGE_ONLY = 'worker_shim/installer_language_only.js';
+const COMBINED = WORKER.INSTALLER_COMBINED;
+const LANGUAGE_ONLY = WORKER.INSTALLER_LANGUAGE_ONLY;
 
 // A jsdom page whose Blob/URL/Worker are recording stubs. Returns handles to
 // everything the installer touches so tests can inspect the generated wrapper.
-function pageWithStubs(fixture) {
+// `refuseBlobWorkers` models chromium under a CSP whose worker-src omits
+// blob:: the constructor returns a Worker and the refusal arrives later as an
+// error event on it.
+function pageWithStubs(fixture, { refuseBlobWorkers = false } = {}) {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
     url: 'https://example.com/app/',
     runScripts: 'outside-only',
@@ -39,20 +44,58 @@ function pageWithStubs(fixture) {
     return url;
   };
 
+  // Real EventTargets, because the installer's rescue path listens for the
+  // `error` a refused wrapper fires and re-dispatches the rebuilt worker's
+  // events on the object the page holds. `onerror` and friends register their
+  // listener when the attribute is set, as they do on a real Worker — the
+  // rescue's own listener is registered first and stops theirs, and that
+  // ordering is the whole mechanism.
   const created = [];
   function recorder(name) {
-    const Ctor = function (script, options) {
-      created.push({ name, script: String(script), options });
-      this.__script = String(script);
+    const Ctor = class extends w.EventTarget {
+      constructor(script, options) {
+        super();
+        this.__script = String(script);
+        this.__posted = [];
+        created.push({ name, script: this.__script, options, worker: this });
+        if (refuseBlobWorkers && this.__script.startsWith('blob:')) {
+          // chromium reports a CSP refusal as a plain `error` Event with no
+          // message, asynchronously, on the object the constructor returned.
+          w.setTimeout(() => {
+            this.dispatchEvent(new w.Event('error', { cancelable: true }));
+          }, 0);
+        }
+      }
+      postMessage() { this.__posted.push(Array.prototype.slice.call(arguments)); }
+      terminate() { this.__terminated = true; }
     };
     Ctor.prototype.__brand = name;
+    for (const attr of ['onmessage', 'onerror', 'onmessageerror']) {
+      const type = attr.slice(2);
+      Object.defineProperty(Ctor.prototype, attr, {
+        configurable: true,
+        get() { return this['__' + attr] || null; },
+        set(fn) {
+          const prev = this['__' + attr];
+          if (prev) this.removeEventListener(type, prev);
+          this['__' + attr] = fn;
+          if (fn) this.addEventListener(type, fn);
+        },
+      });
+    }
     return Ctor;
   }
   w.Worker = recorder('Worker');
   w.SharedWorker = recorder('SharedWorker');
 
-  w.eval(readFixture(fixture));
+  w.eval(fixture);
   return { dom, window: w, blobs, created };
+}
+
+// One macrotask in the jsdom window, which is when a refused blob: worker
+// reports its error.
+function tick(ctx) {
+  return new Promise((resolve) => ctx.window.setTimeout(resolve, 0));
 }
 
 // Content of the wrapper blob handed to the real constructor for call `i`.
@@ -157,9 +200,166 @@ test('fails open: a worker is still created when wrapping throws', () => {
   assert.equal(ctx.created[ctx.created.length - 1].script, '/app/w.js');
 });
 
+test('the installer asks the CSP nothing until the page wants a worker', () => {
+  // A document that never builds a worker never touches the policy. Asking up
+  // front cost one refusal on every load of every site whose worker-src omits
+  // blob:, which any first party can see and a report-uri mails home.
+  const ctx = pageWithStubs(COMBINED);
+  assert.deepEqual(ctx.created, [], 'nothing may be constructed at install');
+});
+
+test('a refused blob: worker stops the wrapping (site workers survive)', async () => {
+  // The messenger.com case: worker-src without blob: kills every wrapper, and
+  // the refusal never reaches the constructor. The first worker is what finds
+  // that out; every one after it is handed the page's own script.
+  const ctx = pageWithStubs(COMBINED, { refuseBlobWorkers: true });
+  new ctx.window.Worker('/app/w.js');
+  await tick(ctx);
+  await tick(ctx);
+
+  new ctx.window.Worker('/app/w2.js');
+  const scripts = ctx.created.map((c) => c.script);
+  assert.match(scripts[0], /^blob:/, 'the first one pays for the answer');
+  assert.equal(scripts[1], '/app/w.js', 'and is rebuilt on the page\'s script');
+  assert.equal(scripts[2], '/app/w2.js', 'the next is never wrapped at all');
+});
+
+test('a policy read off an unrelated violation answers without a worker', () => {
+  // The one time the platform hands a page its own policy is inside a
+  // violation report, whatever the violation was about. A site that refuses
+  // its own blob: image tells us everything we need about its workers.
+  const ctx = pageWithStubs(COMBINED);
+  const ev = new ctx.window.Event('securitypolicyviolation');
+  ev.blockedURI = 'blob:https://example.com/img';
+  ev.effectiveDirective = 'img-src';
+  ev.disposition = 'enforce';
+  ev.originalPolicy = "default-src 'self'; worker-src 'self'";
+  ctx.window.document.dispatchEvent(ev);
+
+  new ctx.window.Worker('/app/w.js');
+  assert.equal(ctx.created[0].script, '/app/w.js',
+    'no wrapper may be built once the policy has been read');
+});
+
+test('a policy that admits blob: workers keeps the wrapping', () => {
+  const ctx = pageWithStubs(COMBINED);
+  const ev = new ctx.window.Event('securitypolicyviolation');
+  ev.blockedURI = 'blob:https://example.com/img';
+  ev.effectiveDirective = 'img-src';
+  ev.disposition = 'enforce';
+  ev.originalPolicy = "default-src 'self'; worker-src 'self' blob:";
+  ctx.window.document.dispatchEvent(ev);
+
+  new ctx.window.Worker('/app/w.js');
+  assert.match(ctx.created[0].script, /^blob:/);
+});
+
+test('a report-only policy blocks nothing and is not read as a refusal', () => {
+  const ctx = pageWithStubs(COMBINED);
+  const ev = new ctx.window.Event('securitypolicyviolation');
+  ev.blockedURI = 'blob';
+  ev.effectiveDirective = 'worker-src';
+  ev.disposition = 'report';
+  ev.originalPolicy = "worker-src 'self'";
+  ctx.window.document.dispatchEvent(ev);
+
+  new ctx.window.Worker('/app/w.js');
+  assert.match(ctx.created[0].script, /^blob:/);
+});
+
+test('the worker that finds the refusal is rebuilt on the site\'s own script', async () => {
+  // The refusal lands with the wrapper already in the page's hands, and there
+  // is no constructor left to fall open on: the worker is simply dead unless
+  // the one the page holds is made to work.
+  const ctx = pageWithStubs(COMBINED, { refuseBlobWorkers: true });
+  const worker = new ctx.window.Worker('/app/w.js');
+  const errors = [];
+  worker.onerror = (e) => errors.push(e);
+  worker.postMessage('go');
+  assert.match(ctx.created[0].script, /^blob:/, 'this one must get a wrapper');
+
+  await tick(ctx);
+  await tick(ctx);
+
+  assert.equal(ctx.created.length, 2, 'the refused wrapper must be rebuilt');
+  assert.equal(ctx.created[1].script, '/app/w.js', 'on what the page asked for');
+  assert.deepEqual(ctx.created[1].worker.__posted, [['go']],
+    'the message posted to the wrapper must reach the worker that replaced it');
+  assert.deepEqual(errors, [],
+    "the refused wrapper's error belongs to a worker the page never had");
+  assert.equal(ctx.created[0].worker.__terminated, true);
+});
+
+test('an error thrown by the site\'s own worker is not read as a refusal', () => {
+  // Same event type, opposite meaning: a refusal never reaches any script and
+  // so carries no message, while this one is the page's to handle. Rebuilding
+  // here would run the site's worker twice.
+  const ctx = pageWithStubs(COMBINED);
+  const worker = new ctx.window.Worker('/app/w.js');
+  const errors = [];
+  worker.onerror = (e) => errors.push(e.message);
+  worker.dispatchEvent(new ctx.window.ErrorEvent('error', { message: 'boom' }));
+
+  assert.deepEqual(errors, ['boom']);
+  assert.equal(ctx.created.length, 1, 'nothing may be rebuilt');
+});
+
+test('once blob: workers are known to run, a load failure reaches the page', () => {
+  // The mirror of the case above. Anything a wrapped worker says is proof that
+  // its wrapper ran, and after that a message-less error is the site's own
+  // script failing to load: swallowing it would hide a real breakage.
+  const ctx = pageWithStubs(COMBINED);
+  const worker = new ctx.window.Worker('/app/w.js');
+  const errors = [];
+  worker.onerror = () => errors.push('error');
+  worker.dispatchEvent(new ctx.window.MessageEvent('message', { data: 'up' }));
+
+  worker.dispatchEvent(new ctx.window.Event('error', { cancelable: true }));
+  assert.deepEqual(errors, ['error']);
+  assert.equal(ctx.created.length, 1, 'nothing may be rebuilt');
+});
+
+test('a blob: worker-src violation stops the wrapping too', () => {
+  // Covers the window before the probe answers, for a page that builds a
+  // worker from an inline script at the top of the document.
+  const ctx = pageWithStubs(COMBINED);
+  const ev = new ctx.window.Event('securitypolicyviolation');
+  ev.blockedURI = 'blob';
+  ev.effectiveDirective = 'worker-src';
+  ctx.window.document.dispatchEvent(ev);
+  new ctx.window.Worker('/app/w.js');
+  assert.equal(ctx.created[0].script, '/app/w.js');
+});
+
+test('an unrelated blob: violation leaves the wrapping alone', () => {
+  // img-src says nothing about worker scripts; treating it as a refusal would
+  // drop the spoof on any site that blocks blob: images.
+  const ctx = pageWithStubs(COMBINED);
+  const ev = new ctx.window.Event('securitypolicyviolation');
+  ev.blockedURI = 'blob';
+  ev.effectiveDirective = 'img-src';
+  ctx.window.document.dispatchEvent(ev);
+  new ctx.window.Worker('/app/w.js');
+  assert.match(ctx.created[0].script, /^blob:/);
+});
+
+test('a refused shim import still leaves the original script loading', () => {
+  // worker-src admitting blob: while script-src does not: the wrapper worker
+  // starts and the shim import is what CSP kills. That must cost the spoof,
+  // not the site's worker.
+  const ctx = pageWithStubs(COMBINED);
+  new ctx.window.Worker('/app/w.js');
+  const wrapper = wrapperFor(ctx);
+  assert.match(wrapper, /try \{ importScripts\("blob:[^"]+"\); \}/);
+  assert.match(wrapper, /catch \(e\) \{ try \{ delete self\.__wsShimUrl; \}/);
+  const guarded = wrapper.indexOf('catch (e)');
+  const original = wrapper.indexOf('importScripts("https://example.com/app/w.js")');
+  assert.ok(original > guarded, `original import must follow the catch:\n${wrapper}`);
+});
+
 test('re-running the installer does not double-wrap', () => {
   const ctx = pageWithStubs(COMBINED);
-  ctx.window.eval(readFixture(COMBINED));
+  ctx.window.eval(COMBINED);
   new ctx.window.Worker('/app/w.js');
   const wrapper = wrapperFor(ctx);
   // A double patch would produce a wrapper that imports another wrapper.
@@ -169,11 +369,48 @@ test('re-running the installer does not double-wrap', () => {
 test('installer is absent when there are no shims to propagate', () => {
   // buildWorkerShimScript returns null for an empty shim list, so no fixture
   // exists for that case; assert the builder contract via the two that do.
-  assert.ok(readFixture(LANGUAGE_ONLY).includes('__wsInstallWorkerWrap'));
-  assert.ok(readFixture(COMBINED).includes('__wsInstallWorkerWrap'));
+  assert.ok(LANGUAGE_ONLY.includes('__wsInstallWorkerWrap'));
+  assert.ok(COMBINED.includes('__wsInstallWorkerWrap'));
 });
 
 // --- Worker-scope payload, executed in a simulated WorkerGlobalScope ---
+
+// What a WorkerGlobalScope has and a window lacks, on a bare vm context.
+function simulateWorkerScope() {
+  globalThis.WorkerGlobalScope = function WorkerGlobalScope() {};
+  // The shims test scope with `globalThis instanceof WorkerGlobalScope`;
+  // the context global cannot literally be one, so answer the brand check.
+  Object.defineProperty(WorkerGlobalScope, Symbol.hasInstance, {
+    value: function() { return true; },
+  });
+  globalThis.WorkerNavigator = function WorkerNavigator() {};
+  Object.defineProperties(WorkerNavigator.prototype, {
+    appCodeName: { value: 'Mozilla', configurable: true },
+    appName: { value: 'Netscape', configurable: true },
+    appVersion: { value: '5.0 (Macintosh)', configurable: true },
+    product: { value: 'Gecko', configurable: true },
+    productSub: { value: '20030107', configurable: true },
+    vendor: { value: 'Apple Computer, Inc.', configurable: true },
+    vendorSub: { value: '', configurable: true },
+    platform: { value: 'iPhone', configurable: true },
+    userAgent: { value: 'stub', configurable: true },
+    language: { get() { return 'es-ES'; }, configurable: true },
+    languages: { get() { return ['es-ES', 'en']; }, configurable: true },
+    hardwareConcurrency: { value: 10, configurable: true },
+    deviceMemory: { value: 2, configurable: true },
+    onLine: { value: true, configurable: true },
+  });
+  globalThis.navigator = new WorkerNavigator();
+  globalThis.self = globalThis;
+  globalThis.location = { href: 'https://example.com/app/w.js' };
+  globalThis.performance = { now: function() { return 1234.5678; } };
+}
+
+// A Blink host's worker navigator.
+function addUserAgentData() {
+  Object.defineProperty(WorkerNavigator.prototype, 'userAgentData',
+    { value: { brands: [] }, configurable: true });
+}
 
 // Build a context that looks like a real worker global: no window, no
 // Navigator/Screen/document/Element, navigator is a WorkerNavigator carrying
@@ -184,39 +421,8 @@ function workerContext({ userAgentData = false } = {}) {
   const ctx = vm.createContext({ URL: URL });
   const run = (src) => vm.runInContext(src, ctx);
 
-  run(`
-    globalThis.WorkerGlobalScope = function WorkerGlobalScope() {};
-    // The shims test scope with \`globalThis instanceof WorkerGlobalScope\`;
-    // the context global cannot literally be one, so answer the brand check.
-    Object.defineProperty(WorkerGlobalScope, Symbol.hasInstance, {
-      value: function() { return true; },
-    });
-    globalThis.WorkerNavigator = function WorkerNavigator() {};
-    Object.defineProperties(WorkerNavigator.prototype, {
-      appCodeName: { value: 'Mozilla', configurable: true },
-      appName: { value: 'Netscape', configurable: true },
-      appVersion: { value: '5.0 (Macintosh)', configurable: true },
-      product: { value: 'Gecko', configurable: true },
-      productSub: { value: '20030107', configurable: true },
-      vendor: { value: 'Apple Computer, Inc.', configurable: true },
-      vendorSub: { value: '', configurable: true },
-      platform: { value: 'iPhone', configurable: true },
-      userAgent: { value: 'stub', configurable: true },
-      language: { get() { return 'es-ES'; }, configurable: true },
-      languages: { get() { return ['es-ES', 'en']; }, configurable: true },
-      hardwareConcurrency: { value: 10, configurable: true },
-      deviceMemory: { value: 2, configurable: true },
-      onLine: { value: true, configurable: true },
-    });
-    globalThis.navigator = new WorkerNavigator();
-    globalThis.self = globalThis;
-    globalThis.location = { href: 'https://example.com/app/w.js' };
-    globalThis.performance = { now: function() { return 1234.5678; } };
-  `);
-  if (userAgentData) {
-    run(`Object.defineProperty(WorkerNavigator.prototype, 'userAgentData',
-      { value: { brands: [] }, configurable: true });`);
-  }
+  run(scriptOf(simulateWorkerScope));
+  if (userAgentData) run(scriptOf(addUserAgentData));
   return { run };
 }
 
@@ -227,7 +433,7 @@ function loadPayloadInWorker(opts = {}) {
   new page.window.Worker('/app/w.js');
   const { shimUrl, payload } = shimFor(page);
   const worker = workerContext(opts);
-  if (opts.prelude) worker.run(opts.prelude);
+  if (opts.prelude) worker.run(scriptOf(opts.prelude));
   worker.run(`self.__wsShimUrl = ${JSON.stringify(shimUrl)};`);
   worker.run(payload);
   return { worker, page, shimUrl };
@@ -250,8 +456,8 @@ test('worker Intl FORMATS in the spoofed locale (the CreepJS worker leak)', () =
   const { worker } = loadPayloadInWorker();
   assert.equal(worker.run('new Intl.NumberFormat().format(0.5)'), '0.5');
   assert.equal(
-    worker.run(`new Intl.DateTimeFormat(undefined, {timeZone:'UTC', month:'long'})
-      .format(new Date(Date.UTC(2020, 6, 1)))`),
+    worker.run(scriptOf(() => new Intl.DateTimeFormat(undefined, { timeZone: 'UTC', month: 'long' })
+      .format(new Date(Date.UTC(2020, 6, 1))))),
     'July');
 });
 
@@ -275,13 +481,20 @@ test('worker hardware values are the spoofed ones, matching the page', () => {
   // source runs in both. Compare against the page's own values.
   const { worker, page } = loadPayloadInWorker();
   const pageDom = new JSDOM('<!doctype html>', { runScripts: 'outside-only' });
-  pageDom.window.eval(readFixture('anti_fingerprinting/shim_seed_alpha.js'));
+  // The shim corrects deviceMemory only where the engine has it, and the
+  // worker stub above has it. jsdom's page navigator does not, so without
+  // this the two scopes are modelling two different engines and the
+  // agreement the test is about cannot be read off them.
+  Object.defineProperty(Object.getPrototypeOf(pageDom.window.navigator),
+    'deviceMemory', { value: 2, configurable: true });
+  pageDom.window.eval(pageJs('anti_fingerprinting', { seed: 'alpha-fixture-seed', letterbox: false }));
   assert.equal(worker.run('navigator.hardwareConcurrency'),
     pageDom.window.navigator.hardwareConcurrency);
   assert.equal(worker.run('navigator.deviceMemory'),
     pageDom.window.navigator.deviceMemory);
   // And not the host's real values from the stub.
   assert.notEqual(worker.run('navigator.hardwareConcurrency'), 10);
+  assert.notEqual(worker.run('navigator.deviceMemory'), 2);
   assert.ok(page);
 });
 
@@ -315,20 +528,23 @@ test('a Blink-host worker gets userAgentData removed under a Gecko UA', () => {
   assert.equal(worker.run("'userAgentData' in navigator"), false);
 });
 
+// Records the nested worker the payload builds and the wrapper it hands it.
+function stubNestedWorker() {
+  globalThis.__nested = [];
+  globalThis.Worker = function Worker(s) { globalThis.__nested.push(String(s)); };
+  globalThis.Blob = function Blob(parts) { this.__text = parts.join(''); };
+  // Augment the real URL rather than replacing it — wrap() needs the
+  // constructor to absolutize the script specifier.
+  globalThis.URL.createObjectURL = function(b) {
+    globalThis.__nestedWrapper = b.__text;
+    return 'blob:nested-1';
+  };
+}
+
 test('payload re-installs the patch for nested workers', () => {
   // A worker spawning a worker must stay covered, else it is a trivial bypass.
   const { worker, shimUrl } = loadPayloadInWorker({
-    prelude: `
-      globalThis.__nested = [];
-      globalThis.Worker = function Worker(s) { globalThis.__nested.push(String(s)); };
-      globalThis.Blob = function Blob(parts) { this.__text = parts.join(''); };
-      // Augment the real URL rather than replacing it — wrap() needs the
-      // constructor to absolutize the script specifier.
-      globalThis.URL.createObjectURL = function(b) {
-        globalThis.__nestedWrapper = b.__text;
-        return 'blob:nested-1';
-      };
-    `,
+    prelude: stubNestedWorker,
   });
   worker.run("new Worker('/app/inner.js')");
   assert.equal(worker.run("globalThis.__nested.join(',')"), 'blob:nested-1');

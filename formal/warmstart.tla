@@ -13,7 +13,7 @@
 (*      background and RE-CREATED on foreground. That re-attach is a         *)
 (*      SEPARATE, asynchronous event -- it does not coincide with the       *)
 (*      `resumed` lifecycle callback and can land a frame or more LATER.     *)
-(*   2. `_nudgeSurfaceRepaint` is not a magic always-available repaint. It   *)
+(*   2. `SurfaceRepaintController.nudge` is not a magic always-available repaint. It   *)
 (*      is a ONE-SHOT tick loop fired by a specific trigger and then         *)
 (*      drains. Once it drains it is gone.                                   *)
 (*                                                                         *)
@@ -27,9 +27,23 @@
 (*   "none"   = pre-fix. Only Resume schedules a nudge. A reattach after the *)
 (*              resume nudge drains is never repainted -> RepaintLiveness     *)
 (*              is VIOLATED (this is the reproduction).                       *)
-(*   "attach" = Attempt 8. The reattach itself schedules a nudge (the        *)
-(*              didChangeMetrics re-nudge within the post-resume window is a  *)
-(*              proxy for the attach signal) -> RepaintLiveness HOLDS.        *)
+(*   "attach" = the reattach ITSELF schedules a nudge, unconditionally. This  *)
+(*              is what a native surface/view attach callback gives you       *)
+(*              -> RepaintLiveness HOLDS.                                     *)
+(*   "proxy"  = what Attempt 8 actually shipped. The nudge is scheduled by a  *)
+(*              Dart-side signal that CORRELATES with the reattach            *)
+(*              (didChangeMetrics) but is not the reattach: Flutter can dedupe*)
+(*              identical window metrics, and the callback tracks the main    *)
+(*              FlutterView rather than the webview's platform view. Modeled  *)
+(*              as a nondeterministic choice — the proxy may or may not fire  *)
+(*              on any given attach -> RepaintLiveness is VIOLATED on the      *)
+(*              branch where it does not.                                     *)
+(*                                                                           *)
+(* "attach" and "proxy" are the two readings of Attempt 8 that the model      *)
+(* previously conflated, and that conflation is bug doc gap #5: the code      *)
+(* claims "attach" and can only deliver "proxy". Separating them is what      *)
+(* makes the difference a native callback would buy checkable rather than     *)
+(* arguable.                                                                  *)
 (*                                                                         *)
 (* This is the model counterpart of the durable fix in gap #3: nudge on the  *)
 (* ATTACH, not on a lifecycle event that only approximates its timing.       *)
@@ -38,7 +52,7 @@ EXTENDS Naturals
 
 CONSTANTS
     K,     \* nudge ticks per one-shot loop (bounds the state space; K >= 1)
-    Fix    \* "none" | "attach" -- see header
+    Fix    \* "none" | "proxy" | "attach" -- see header
 
 VARIABLES
     surface,     \* visible site's Android surface: "painted" | "blank"
@@ -63,7 +77,7 @@ Init ==
     /\ resumed = FALSE
     /\ reattached = FALSE
 
-\* App returns to foreground. `_onResumed` fires its single tail nudge
+\* App returns to foreground. `AppLifecycleController._onResumed` fires its single tail nudge
 \* (PAUSE-015): schedule a one-shot loop. The surface has NOT necessarily
 \* re-attached yet -- that is the separate SurfaceReattach below.
 Resume ==
@@ -72,7 +86,7 @@ Resume ==
     /\ nudging' = K
     /\ UNCHANGED << surface, owed, reattached >>
 
-\* One nudge tick (`_nudgeSurfaceRepaint` toggling the 1px inset). A relayout
+\* One nudge tick (`SurfaceRepaintController.nudge` toggling the 1px inset). A relayout
 \* repaints whatever surface is currently attached, so it clears any owed
 \* repaint. When owed is already false this is a harmless no-op tick.
 Tick ==
@@ -92,7 +106,17 @@ SurfaceReattach ==
     /\ reattached' = TRUE
     /\ surface' = "blank"
     /\ owed' = TRUE
-    /\ nudging' = IF Fix = "attach" THEN K ELSE nudging
+    \* "attach": the attach itself schedules the nudge, always.
+    \* "proxy":  a correlated signal schedules it — or does not. Both branches
+    \*           are legal behaviours of the real system, so TLC explores the
+    \*           one where the proxy misses, which is the device gap #5 names.
+    \* "none":   nothing schedules it.
+    /\ \/ /\ Fix = "attach"
+          /\ nudging' = K
+       \/ /\ Fix = "proxy"
+          /\ nudging' \in {K, nudging}
+       \/ /\ Fix = "none"
+          /\ nudging' = nudging
     /\ UNCHANGED << resumed >>
 
 Next == Resume \/ Tick \/ SurfaceReattach

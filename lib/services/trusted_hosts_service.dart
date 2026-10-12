@@ -8,7 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:webspace/services/log_service.dart';
 
 /// SharedPreferences key holding the encoded trusted-cert pin list.
-/// Round-tripped through settings export/import via [kExportedAppPrefs].
+/// Never rides a settings backup (BACKUP-010, TLS-007).
 const String kTrustedHostsKey = 'trustedHosts';
 
 /// One pinned (host, port, sha256) triple. Pinning the cert fingerprint
@@ -103,10 +103,10 @@ class TrustedHostsService {
           port: 443,
           sha256Hex: entry.sha256Hex,
         );
-        _byHostPort[_key(fixed.host, fixed.port)] = fixed.sha256Hex;
+        _byHostPort[_key(fixed.host, port: fixed.port)] = fixed.sha256Hex;
         migrated.add(fixed);
       } else {
-        _byHostPort[_key(entry.host, entry.port)] = entry.sha256Hex;
+        _byHostPort[_key(entry.host, port: entry.port)] = entry.sha256Hex;
       }
     }
     if (migrated.isNotEmpty) {
@@ -135,7 +135,7 @@ class TrustedHostsService {
     required String? fingerprint,
   }) {
     if (fingerprint == null) return false;
-    final pinned = _byHostPort[_key(host, port)];
+    final pinned = _byHostPort[_key(host, port: port)];
     return pinned != null && pinned.toLowerCase() == fingerprint.toLowerCase();
   }
 
@@ -145,7 +145,7 @@ class TrustedHostsService {
     required String fingerprint,
   }) async {
     final normalized = fingerprint.toLowerCase();
-    _byHostPort[_key(host, port)] = normalized;
+    _byHostPort[_key(host, port: port)] = normalized;
     await _persist();
     _trustController.add(TrustedHostEntry(
       host: host,
@@ -155,26 +155,20 @@ class TrustedHostsService {
   }
 
   Future<void> untrust({required String host, required int port}) async {
-    final removed = _byHostPort.remove(_key(host, port));
+    final removed = _byHostPort.remove(_key(host, port: port));
     if (removed != null) {
       await _persist();
-      LogService.instance.log(
-        'TLS',
-        'untrust($host:$port) removed pin; emitting on untrustChanges',
-        sensitivity: LogSensitivity.sensitive,
-      );
+      LogTag.tls.debug(
+          'untrust($host:$port) removed pin; emitting on untrustChanges',
+          sensitive: true);
       _untrustController.add(TrustedHostEntry(
         host: host,
         port: port,
         sha256Hex: removed,
       ));
     } else {
-      LogService.instance.log(
-        'TLS',
-        'untrust($host:$port) no-op (no matching pin); '
-            'in-memory keys: ${_byHostPort.keys.toList()}',
-        sensitivity: LogSensitivity.sensitive,
-      );
+      LogTag.tls.debug('untrust($host:$port) no-op (no matching pin); '
+          'in-memory keys: ${_byHostPort.keys.toList()}', sensitive: true);
     }
   }
 
@@ -212,7 +206,8 @@ class TrustedHostsService {
     return sha256.convert(der).toString();
   }
 
-  String _key(String host, int port) => '${host.toLowerCase()}:$port';
+  String _key(String host, {required int port}) =>
+      '${host.toLowerCase()}:$port';
 
   Future<void> _persist() async {
     final prefs = await SharedPreferences.getInstance();

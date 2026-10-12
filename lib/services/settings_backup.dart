@@ -9,7 +9,6 @@ import 'package:webspace/services/log_service.dart';
 import 'package:webspace/web_view_model.dart';
 import 'package:webspace/webspace_model.dart';
 
-/// Backup version for compatibility checking
 const int kBackupVersion = 1;
 
 /// Data class representing a backup of app settings.
@@ -94,6 +93,10 @@ class SettingsBackup {
           'extraSections': extraSections,
       };
 
+  /// `sites` and `webspaces` are the backup; a malformed entry in either
+  /// throws and the file is rejected whole. Everything else is optional and
+  /// read defensively: a value of the wrong type (a hand-edited file, a
+  /// newer build's shape) reads as absent rather than sinking the import.
   factory SettingsBackup.fromJson(Map<String, dynamic> json) {
     final rawPrefs = json['globalPrefs'];
     final prefs = rawPrefs is Map
@@ -105,34 +108,35 @@ class SettingsBackup {
         prefs[key] = json[key];
       }
     }
+    List<Map<String, dynamic>>? optionalMaps(Object? raw) => raw is List
+        ? [for (final e in raw) if (e is Map) Map<String, dynamic>.from(e)]
+        : null;
+    final exportedAt = json['exportedAt'];
     return SettingsBackup(
-      version: json['version'] ?? 1,
+      version: json['version'] is int ? json['version'] as int : 1,
       sites: (json['sites'] as List<dynamic>)
-          .map((e) => e as Map<String, dynamic>)
+          .map((e) => Map<String, dynamic>.from(e as Map))
           .toList(),
       webspaces: (json['webspaces'] as List<dynamic>)
-          .map((e) => e as Map<String, dynamic>)
+          .map((e) => Map<String, dynamic>.from(e as Map))
           .toList(),
-      themeMode: json['themeMode'] ?? 0,
+      themeMode: json['themeMode'] is int ? json['themeMode'] as int : 0,
       globalPrefs: prefs,
-      selectedWebspaceId: json['selectedWebspaceId'],
-      currentIndex: json['currentIndex'],
-      exportedAt: json['exportedAt'] != null
-          ? DateTime.parse(json['exportedAt'])
-          : DateTime.now(),
-      suggestedSites: (json['suggestedSites'] as List<dynamic>?)
-          ?.map((e) => e as Map<String, dynamic>)
-          .toList(),
-      globalUserScripts: (json['globalUserScripts'] as List<dynamic>?)
-          ?.map((e) => e as Map<String, dynamic>)
-          .toList(),
-      dnsBlockLevel: json['dnsBlockLevel'] as int?,
-      contentBlockerLists: (json['contentBlockerLists'] as List<dynamic>?)
-          ?.map((e) => Map<String, dynamic>.from(e as Map))
-          .toList(),
-      extraSections: (json['extraSections'] as List<dynamic>?)
-          ?.map((e) => e as String)
-          .toList(),
+      selectedWebspaceId: json['selectedWebspaceId'] is String
+          ? json['selectedWebspaceId'] as String
+          : null,
+      currentIndex:
+          json['currentIndex'] is int ? json['currentIndex'] as int : null,
+      exportedAt: (exportedAt is String ? DateTime.tryParse(exportedAt) : null) ??
+          DateTime.now(),
+      suggestedSites: optionalMaps(json['suggestedSites']),
+      globalUserScripts: optionalMaps(json['globalUserScripts']),
+      dnsBlockLevel:
+          json['dnsBlockLevel'] is int ? json['dnsBlockLevel'] as int : null,
+      contentBlockerLists: optionalMaps(json['contentBlockerLists']),
+      extraSections: json['extraSections'] is List
+          ? (json['extraSections'] as List).whereType<String>().toList()
+          : null,
     );
   }
 
@@ -152,7 +156,6 @@ class SettingsBackup {
   }
 }
 
-/// Service for exporting and importing app settings
 class SettingsBackupService {
   /// Create a backup from current app state.
   ///
@@ -186,7 +189,6 @@ class SettingsBackupService {
     // password (per PWD-005); we still need to strip secure cookies here.
     final sitesJson = webViewModels.map((model) {
       final json = model.toJson();
-      // Filter to only non-secure cookies (isSecure != true)
       final cookies = json['cookies'] as List<dynamic>;
       json['cookies'] = cookies
           .where((c) => c['isSecure'] != true)
@@ -194,7 +196,6 @@ class SettingsBackupService {
       return json;
     }).toList();
 
-    // Convert webspaces to JSON, excluding the "All" webspace
     final webspacesJson = webspaces
         .where((ws) => ws.id != kAllWebspaceId)
         .map((ws) => ws.toJson())
@@ -222,48 +223,21 @@ class SettingsBackupService {
     );
   }
 
-  /// Export settings to a JSON string
   static String exportToJson(SettingsBackup backup) {
     return const JsonEncoder.withIndent('  ').convert(backup.toJson());
   }
 
-  /// Export settings and save to a file
   static Future<bool> exportAndSave(
     BuildContext context, {
-    required List<WebViewModel> webViewModels,
-    required List<Webspace> webspaces,
-    required int themeMode,
-    Map<String, Object?>? globalPrefs,
-    String? selectedWebspaceId,
-    int? currentIndex,
-    List<Map<String, dynamic>>? suggestedSites,
-    List<Map<String, dynamic>>? globalUserScripts,
-    int? dnsBlockLevel,
-    List<Map<String, dynamic>>? contentBlockerLists,
-    List<String>? extraSections,
+    required SettingsBackup backup,
   }) async {
     try {
-      final backup = createBackup(
-        webViewModels: webViewModels,
-        webspaces: webspaces,
-        themeMode: themeMode,
-        globalPrefs: globalPrefs,
-        selectedWebspaceId: selectedWebspaceId,
-        currentIndex: currentIndex,
-        suggestedSites: suggestedSites,
-        globalUserScripts: globalUserScripts,
-        dnsBlockLevel: dnsBlockLevel,
-        contentBlockerLists: contentBlockerLists,
-        extraSections: extraSections,
-      );
-
       final jsonString = exportToJson(backup);
       final bytes = utf8.encode(jsonString);
 
       final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-').split('.')[0];
       final defaultFileName = 'webspace_backup_$timestamp.json';
 
-      // Use FilePicker save dialog
       // On mobile (iOS/Android): bytes parameter is required
       // On desktop (macOS/Linux/Windows): bytes not supported, write manually
       final bool isMobile = !kIsWeb && (hostIsIOS || hostIsAndroid);
@@ -279,10 +253,9 @@ class SettingsBackupService {
         return false;
       }
 
-      // On desktop, write file manually since bytes param not supported
       if (!isMobile) {
         final filePath = outputPath.endsWith('.json') ? outputPath : '$outputPath.json';
-        await hostWriteFileText(filePath, jsonString);
+        await hostWriteFileText(filePath, contents: jsonString);
       }
 
       if (context.mounted) {
@@ -292,11 +265,7 @@ class SettingsBackupService {
       }
       return true;
     } catch (e, stack) {
-      LogService.instance.log(
-        'SettingsBackup',
-        'Export failed: $e\n$stack',
-        level: LogLevel.error,
-      );
+      LogTag.settingsBackup.error('Export failed: $e\n$stack');
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Export failed: $e')),
@@ -306,17 +275,20 @@ class SettingsBackupService {
     }
   }
 
-  /// Import settings from JSON string
   static SettingsBackup? importFromJson(String jsonString) {
     try {
-      final json = jsonDecode(jsonString) as Map<String, dynamic>;
+      // A file saved back out of a Windows editor starts with a BOM, which
+      // `jsonDecode` rejects.
+      final text = jsonString.startsWith('﻿')
+          ? jsonString.substring(1)
+          : jsonString;
+      final json = jsonDecode(text) as Map<String, dynamic>;
       return SettingsBackup.fromJson(json);
     } catch (e) {
       return null;
     }
   }
 
-  /// Pick a file and import settings
   static Future<SettingsBackup?> pickAndImport(BuildContext context) async {
     try {
       final result = await FilePicker.pickFiles(
@@ -336,7 +308,6 @@ class SettingsBackupService {
         // Web or platforms that provide bytes
         jsonString = utf8.decode(file.bytes!);
       } else if (file.path != null) {
-        // Platforms that provide file path
         jsonString = await hostReadFileText(file.path!);
       } else {
         if (context.mounted) {
@@ -368,20 +339,16 @@ class SettingsBackupService {
     }
   }
 
-  /// Convert backup sites to WebViewModel list
   /// Non-secure cookies from the backup are restored.
   static List<WebViewModel> restoreSites(
-    SettingsBackup backup,
-    Function? stateSetterF,
-  ) {
+    SettingsBackup backup, {
+    required Function? stateSetterF,
+  }) {
     return backup.sites.map((json) {
-      // Non-secure cookies are preserved from the backup
-      // (secure cookies were already filtered out during export)
-      return WebViewModel.fromJson(json, stateSetterF);
+      return WebViewModel.fromJson(json, stateSetterF: stateSetterF);
     }).toList();
   }
 
-  /// Convert backup webspaces to Webspace list
   static List<Webspace> restoreWebspaces(SettingsBackup backup) {
     final webspaces = <Webspace>[Webspace.all()];
     for (final json in backup.webspaces) {

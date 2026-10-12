@@ -118,6 +118,10 @@
   "@commonShare": {
     "description": "Generic button that shares a value."
   },
+  "commonRepaintScreen": "Repaint Screen",
+  "@commonRepaintScreen": {
+    "description": "Overflow-menu item that forces the page surface to redraw when Android leaves it blank."
+  },
   "commonOpen": "Open",
   "@commonOpen": {
     "description": "Generic button that opens a target."
@@ -153,6 +157,56 @@
   "urlBarGoTooltip": "Go",
   "@urlBarGoTooltip": {
     "description": "Tooltip for the button that submits the typed URL and navigates to it."
+  },
+  "urlBarSearchSiteTooltip": "Choose search site",
+  "@urlBarSearchSiteTooltip": {
+    "description": "Tooltip of the small magnifier-and-arrow button at the start of the address bar while it is a search field. Tapping it lists the user's search sites (such as DuckDuckGo or Kagi) to pick which one runs the search."
+  },
+  "siteInfoTitle": "Site info",
+  "@siteInfoTitle": {
+    "description": "Tooltip of the (i) button at the end of the address bar, and title of the sheet it opens, which says which of the user's sites the page on screen belongs to and which storage container holds its cookies and logins."
+  },
+  "siteInfoSite": "Site",
+  "@siteInfoSite": {
+    "description": "Label of a row in the Site info sheet; the value is the name of the user's site (one of the websites saved in the app) that the page on screen runs as."
+  },
+  "siteInfoTabOf": "Tab of",
+  "@siteInfoTabOf": {
+    "description": "Label of a row in the Site info sheet, shown when the page is a tab in one of the user's sites' tab list but runs as another of their sites; the value is the name of the site whose tab list holds it. The Site row above names the site it runs as."
+  },
+  "siteInfoOpenedFrom": "Opened from",
+  "@siteInfoOpenedFrom": {
+    "description": "Label of a row in the Site info sheet of a page opened on top of a site by a link, shown when the page runs as a different site than the one it was opened from; the value is the name of the site that was on screen when the link was tapped."
+  },
+  "siteInfoPage": "Page",
+  "@siteInfoPage": {
+    "description": "Label of a row in the Site info sheet; the value is the web address of the page on screen."
+  },
+  "siteInfoContainer": "Container",
+  "@siteInfoContainer": {
+    "description": "Label of a row in the Site info sheet; the value says which storage container (the isolated store of cookies, logins and site data) the page uses. 'Container' is the same term the app uses for per-site storage isolation."
+  },
+  "siteInfoContainerOf": "{site}'s own container",
+  "@siteInfoContainerOf": {
+    "description": "Value of the Container row: the page uses the storage container that belongs to the named site, one of the user's sites, separate from every other site. {site} is the site's name, the same one as in the Site row, for example 'GitHub's own container'.",
+    "placeholders": {
+      "site": {
+        "type": "String",
+        "example": "GitHub"
+      }
+    }
+  },
+  "siteInfoContainerEphemeral": "Private, discarded when closed",
+  "@siteInfoContainerEphemeral": {
+    "description": "Value of the Container row for a private (incognito) site: the page uses a temporary store that is thrown away when it closes."
+  },
+  "siteInfoContainerShared": "Shared, cookies swapped per site",
+  "@siteInfoContainerShared": {
+    "description": "Value of the Container row on devices whose web engine cannot give each site its own storage: all sites share one store, and the app swaps each site's cookies in and out when switching."
+  },
+  "siteInfoContainerExplanation": "Logins, cookies and site data on this page are kept in this container.",
+  "@siteInfoContainerExplanation": {
+    "description": "Short note at the bottom of the Site info sheet explaining what the Container row means."
   },
   "untrustedCertTitle": "Untrusted certificate",
   "@untrustedCertTitle": {
@@ -546,10 +600,6 @@
       }
     }
   },
-  "inappBrowserVerificationTitle": "Verification",
-  "@inappBrowserVerificationTitle": {
-    "description": "Title of a window.open() popup dialog in the in-app browser."
-  },
   "inappBrowserDefaultTitle": "In-App WebView",
   "@inappBrowserDefaultTitle": {
     "description": "Default app bar title for the nested browser when no page title is available."
@@ -835,9 +885,45 @@
   "@appSettingsAccentColor": {
     "description": "Accent color section header in app settings"
   },
-  "appSettingsInterface": "Interface",
-  "@appSettingsInterface": {
-    "description": "Interface/UI section header in app settings"
+  "appSettingsGroupApp": "App",
+  "@appSettingsGroupApp": {
+    "description": "Heading on the App Settings screen over the categories about the app itself (its appearance and how it behaves), as opposed to the ones that apply to every site."
+  },
+  "appSettingsGroupSites": "Every site",
+  "@appSettingsGroupSites": {
+    "description": "Heading on the App Settings screen over the categories that apply to all of the user's websites at once (network, privacy, user scripts). Each site can adjust these in its own settings."
+  },
+  "appSettingsAppearance": "Appearance",
+  "@appSettingsAppearance": {
+    "description": "Title of the App Settings category, and of the screen it opens, holding the app's language, light/dark theme and accent colour."
+  },
+  "appSettingsBehaviour": "Behaviour",
+  "@appSettingsBehaviour": {
+    "description": "Title of the App Settings category, and of the screen it opens, holding how the app shows and opens sites: the site tab strip, full screen, the back gesture and link handling."
+  },
+  "appSettingsNetwork": "Network",
+  "@appSettingsNetwork": {
+    "description": "Title of the App Settings category, and of the screen it opens, holding the app-wide proxy, the saved proxies, Tor and trusted certificates."
+  },
+  "appSettingsBackupAndArchives": "Backup and archives",
+  "@appSettingsBackupAndArchives": {
+    "description": "Title of the App Settings category, and of the screen it opens, holding settings export and import and the passphrase-protected archived webspaces."
+  },
+  "appSettingsGroupTabStrip": "Tab strip",
+  "@appSettingsGroupTabStrip": {
+    "description": "Heading on the app Behaviour screen over the settings for the strip of site tabs shown above the page: whether it shows, in full screen, and how wide a tab can be."
+  },
+  "appSettingsGroupOpening": "Opening and navigation",
+  "@appSettingsGroupOpening": {
+    "description": "Heading on the app Behaviour screen over full screen on shortcut launch, what the back gesture does, and how shared links are opened."
+  },
+  "appSettingsGroupCertificates": "Certificates",
+  "@appSettingsGroupCertificates": {
+    "description": "Heading on the app Network screen over the list of TLS certificates the user chose to trust."
+  },
+  "appSettingsGroupWhatSitesLearn": "What sites learn",
+  "@appSettingsGroupWhatSitesLearn": {
+    "description": "Heading on the app Privacy screen over the data that decides what websites are told about the user: the browser version in the user agent, the timezone dataset, and the map used to pick a spoofed location."
   },
   "appSettingsSiteTabStrip": "Site Tab Strip",
   "@appSettingsSiteTabStrip": {
@@ -847,9 +933,9 @@
   "@appSettingsSiteTabStripSubtitle": {
     "description": "Subtitle for the site tab strip toggle"
   },
-  "appSettingsFullscreenOnShortcut": "Full screen on shortcuts and notifications",
+  "appSettingsFullscreenOnShortcut": "Full screen on shortcut launch",
   "@appSettingsFullscreenOnShortcut": {
-    "description": "Toggle title for automatically entering full screen when a site is opened from a home-screen shortcut or notification tap"
+    "description": "Toggle title for automatically entering full screen when a site is opened from a home-screen shortcut"
   },
   "appSettingsFullscreenOnShortcutHint": "Open in full screen when launched from a home-screen shortcut",
   "@appSettingsFullscreenOnShortcutHint": {
@@ -859,9 +945,13 @@
   "@appSettingsBackOpensMenu": {
     "description": "Toggle title in app settings: the system back gesture opens the side menu once the site has no page left to go back to"
   },
-  "appSettingsBackOpensMenuHint": "Where a site has nothing left to go back to, the back gesture opens the side menu instead of doing nothing. On Android, pressing back again leaves the app.",
+  "appSettingsBackOpensMenuHint": "Where a site has nothing left to go back to, the back gesture opens the side menu instead of doing nothing.",
   "@appSettingsBackOpensMenuHint": {
-    "description": "Hint dialog body for that toggle: at the start of a site's browsing history the back gesture opens the navigation drawer, and a second back press quits the app on Android"
+    "description": "Hint dialog body for that toggle: at the start of a site's browsing history the back gesture opens the navigation drawer instead of doing nothing"
+  },
+  "appSettingsBackOpensMenuHintExit": "On Android, pressing back again leaves the app.",
+  "@appSettingsBackOpensMenuHintExit": {
+    "description": "Extra sentence appended to the back-gesture hint on Android only: once that gesture has opened the menu, a further back press leaves the app."
   },
   "appSettingsFullscreenTabStrip": "In full screen, tab strip",
   "@appSettingsFullscreenTabStrip": {
@@ -935,18 +1025,6 @@
   "@appSettingsProxyAddressHelper": {
     "description": "Helper text for the proxy address field"
   },
-  "appSettingsProxyRequiresAuth": "Proxy requires authentication",
-  "@appSettingsProxyRequiresAuth": {
-    "description": "Checkbox label to enable proxy credentials"
-  },
-  "appSettingsProxyUsername": "Proxy Username",
-  "@appSettingsProxyUsername": {
-    "description": "Label for the proxy username field"
-  },
-  "appSettingsProxyPassword": "Proxy Password",
-  "@appSettingsProxyPassword": {
-    "description": "Label for the proxy password field"
-  },
   "appSettingsProxyAddressRequired": "Address is required",
   "@appSettingsProxyAddressRequired": {
     "description": "Validation error when the proxy address is empty"
@@ -962,22 +1040,6 @@
   "appSettingsOutboundProxyUpdated": "Outbound proxy updated",
   "@appSettingsOutboundProxyUpdated": {
     "description": "Snackbar shown after the outbound proxy is saved"
-  },
-  "appSettingsDiscardChangesTitle": "Discard changes?",
-  "@appSettingsDiscardChangesTitle": {
-    "description": "Title of the discard-proxy-changes confirmation dialog"
-  },
-  "appSettingsDiscardProxyBody": "You have unsaved proxy changes. Discard them?",
-  "@appSettingsDiscardProxyBody": {
-    "description": "Body of the discard-proxy-changes confirmation dialog"
-  },
-  "appSettingsKeepEditing": "Keep editing",
-  "@appSettingsKeepEditing": {
-    "description": "Button to dismiss the discard dialog and continue editing"
-  },
-  "appSettingsDiscard": "Discard",
-  "@appSettingsDiscard": {
-    "description": "Button to discard unsaved proxy changes"
   },
   "appSettingsLocationPicker": "Location picker",
   "@appSettingsLocationPicker": {
@@ -1015,15 +1077,15 @@
   },
   "appSettingsClearDataset": "Clear dataset",
   "@appSettingsClearDataset": {
-    "description": "Tooltip to delete the downloaded timezone dataset"
+    "description": "Tooltip on the button that deletes a downloaded dataset in App settings (timezone polygons, LocalCDN cache, site search list)"
   },
   "appSettingsRefreshDataset": "Refresh dataset",
   "@appSettingsRefreshDataset": {
-    "description": "Tooltip to re-download the timezone dataset"
+    "description": "Tooltip on the button that downloads a dataset again in App settings (timezone polygons, ClearURLs rules, DNS blocklist, Firefox version, LocalCDN, site search list)"
   },
   "appSettingsDownloadDataset": "Download dataset",
   "@appSettingsDownloadDataset": {
-    "description": "Tooltip to download the timezone dataset"
+    "description": "Tooltip on the button that downloads a dataset for the first time in App settings (timezone polygons, ClearURLs rules, DNS blocklist, LocalCDN, site search list)"
   },
   "appSettingsTimezonesLoaded": "Loaded {count} timezone zones",
   "@appSettingsTimezonesLoaded": {
@@ -1041,10 +1103,6 @@
   "appSettingsUserScripts": "User Scripts",
   "@appSettingsUserScripts": {
     "description": "User scripts section header in app settings"
-  },
-  "appSettingsManageScripts": "Manage Scripts",
-  "@appSettingsManageScripts": {
-    "description": "Title for the global user scripts entry"
   },
   "appSettingsNoGlobalScripts": "No global scripts",
   "@appSettingsNoGlobalScripts": {
@@ -1111,14 +1169,6 @@
   "@appSettingsClearUrlsRules": {
     "description": "Title for the ClearURLs rules entry"
   },
-  "appSettingsUpdateRules": "Update rules",
-  "@appSettingsUpdateRules": {
-    "description": "Tooltip to re-download the ClearURLs rules"
-  },
-  "appSettingsDownloadRules": "Download rules",
-  "@appSettingsDownloadRules": {
-    "description": "Tooltip to download the ClearURLs rules"
-  },
   "appSettingsClearUrlsUpdated": "ClearURLs rules updated",
   "@appSettingsClearUrlsUpdated": {
     "description": "Snackbar after ClearURLs rules download succeeds"
@@ -1151,19 +1201,6 @@
         "type": "int"
       }
     }
-  },
-  "appSettingsFirefoxVersionChecked": "Checked: {date}",
-  "@appSettingsFirefoxVersionChecked": {
-    "description": "Label showing when the Firefox version was last checked against Firefox source",
-    "placeholders": {
-      "date": {
-        "type": "String"
-      }
-    }
-  },
-  "appSettingsUpdateFirefoxVersion": "Update Firefox version",
-  "@appSettingsUpdateFirefoxVersion": {
-    "description": "Tooltip on the button that fetches the latest Firefox version over the network"
   },
   "appSettingsFirefoxVersionUpdated": "Updated to Firefox {version}",
   "@appSettingsFirefoxVersionUpdated": {
@@ -1207,14 +1244,6 @@
       }
     }
   },
-  "appSettingsDownloadBlocklist": "Download blocklist",
-  "@appSettingsDownloadBlocklist": {
-    "description": "Tooltip to download the DNS blocklist"
-  },
-  "appSettingsRefreshBlocklist": "Refresh blocklist",
-  "@appSettingsRefreshBlocklist": {
-    "description": "Tooltip to refresh the DNS blocklist"
-  },
   "appSettingsDnsBlocklistDisabled": "DNS blocklist disabled",
   "@appSettingsDnsBlocklistDisabled": {
     "description": "Snackbar when the DNS blocklist level is set to off"
@@ -1256,18 +1285,6 @@
         "type": "String"
       }
     }
-  },
-  "appSettingsUpdateResources": "Update resources",
-  "@appSettingsUpdateResources": {
-    "description": "Tooltip to update LocalCDN resources"
-  },
-  "appSettingsDownloadResources": "Download resources",
-  "@appSettingsDownloadResources": {
-    "description": "Tooltip to download LocalCDN resources"
-  },
-  "appSettingsClearCache": "Clear cache",
-  "@appSettingsClearCache": {
-    "description": "Tooltip to clear the LocalCDN cache"
   },
   "appSettingsLocalCdnDownloaded": "Downloaded {count} resources",
   "@appSettingsLocalCdnDownloaded": {
@@ -1352,6 +1369,125 @@
   "@appSettingsAddCustomList": {
     "description": "Button label to add a custom filter list"
   },
+  "appSettingsAddLocalList": "Write Local List",
+  "@appSettingsAddLocalList": {
+    "description": "Button label to create a content blocker filter list whose rules the user types in the app, instead of downloading one from a URL"
+  },
+  "appSettingsAddLocalListTitle": "New Local List",
+  "@appSettingsAddLocalListTitle": {
+    "description": "Title of the dialog where the user names and types the rules of a new locally written content blocker filter list"
+  },
+  "appSettingsEditLocalListTitle": "Edit Local List",
+  "@appSettingsEditLocalListTitle": {
+    "description": "Title of the dialog where the user changes the name and rules of an existing locally written content blocker filter list"
+  },
+  "appSettingsLocalListRulesLabel": "Rules",
+  "@appSettingsLocalListRulesLabel": {
+    "description": "Label of the multi-line field holding the ad-blocking rules of a locally written filter list"
+  },
+  "appSettingsLocalListRulesHint": "One Adblock Plus rule per line",
+  "@appSettingsLocalListRulesHint": {
+    "description": "Placeholder in the empty rules field of a locally written filter list, explaining the expected format (Adblock Plus is a product name, keep it)"
+  },
+  "appSettingsImportUboBackup": "Import uBlock Origin",
+  "@appSettingsImportUboBackup": {
+    "description": "Button label in the content blocker settings that reads a backup file saved by the uBlock Origin browser extension and imports its filter lists, the user's own filters and trusted sites. uBlock Origin is a product name, keep it"
+  },
+  "appSettingsUboNotABackup": "That file is not a uBlock Origin backup",
+  "@appSettingsUboNotABackup": {
+    "description": "Snackbar shown when the file the user picked to import is not a backup saved by the uBlock Origin browser extension"
+  },
+  "appSettingsUboImportTitle": "Import uBlock Origin backup",
+  "@appSettingsUboImportTitle": {
+    "description": "Title of the dialog that lists what a uBlock Origin backup file will change before the user confirms the import"
+  },
+  "appSettingsUboImportLists": "Filter lists: {count}",
+  "@appSettingsUboImportLists": {
+    "description": "Line in the uBlock Origin import dialog: how many content blocker filter lists the import will switch on or add",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appSettingsUboImportUserFilters": "Your own filters: {count} rules",
+  "@appSettingsUboImportUserFilters": {
+    "description": "Line in the uBlock Origin import dialog: the rules the user wrote in uBlock Origin, which are imported as one locally written filter list",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appSettingsUboImportTrustedSites": "Content blocker off on: {sites}",
+  "@appSettingsUboImportTrustedSites": {
+    "description": "Line in the uBlock Origin import dialog naming the sites the user trusted in uBlock Origin; the import switches this app's content blocker off on them. {sites} is a comma-separated list of site names",
+    "placeholders": {
+      "sites": {
+        "type": "String"
+      }
+    }
+  },
+  "appSettingsUboImportSkippedHeader": "Not imported",
+  "@appSettingsUboImportSkippedHeader": {
+    "description": "Heading in the uBlock Origin import dialog above the parts of the backup this app has no equivalent for"
+  },
+  "appSettingsUboImportUnresolved": "Filter lists this app could not find: {count}",
+  "@appSettingsUboImportUnresolved": {
+    "description": "Line under 'Not imported' in the uBlock Origin import dialog: lists named in the backup whose download address could not be looked up",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appSettingsUboImportUnsupportedTrusted": "Trusted-site rules narrower than a whole site: {count}",
+  "@appSettingsUboImportUnsupportedTrusted": {
+    "description": "Line under 'Not imported' in the uBlock Origin import dialog: trusted-site rules that name a page or a pattern rather than a whole site, which a per-site switch cannot express",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appSettingsUboImportUnappliedTrusted": "Trusted sites with no matching site here, or kept on by Tracking Protection: {count}",
+  "@appSettingsUboImportUnappliedTrusted": {
+    "description": "Line under 'Not imported' in the uBlock Origin import dialog: sites trusted in uBlock Origin that the user has not added to this app, or whose Tracking Protection setting keeps the content blocker on",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appSettingsUboImportDroppedRules": "Firewall and per-site switch rules, which this app has no equivalent for: {count}",
+  "@appSettingsUboImportDroppedRules": {
+    "description": "Line under 'Not imported' in the uBlock Origin import dialog: uBlock Origin's dynamic filtering (firewall) and per-site switches such as blocking scripts, which this app cannot express",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "appSettingsUboImportNothing": "Nothing in this backup can be imported",
+  "@appSettingsUboImportNothing": {
+    "description": "Snackbar when a uBlock Origin backup carries no filter lists, own filters or trusted sites this app can use"
+  },
+  "appSettingsUboImportDone": "uBlock Origin backup imported. Downloaded {done} of {total} filter lists",
+  "@appSettingsUboImportDone": {
+    "description": "Snackbar after a uBlock Origin import finished; the new filter lists were downloaded, {done} of them successfully",
+    "placeholders": {
+      "done": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "appSettingsUboUserFiltersName": "uBlock Origin: My filters",
+  "@appSettingsUboUserFiltersName": {
+    "description": "Name given to the locally written filter list that holds the rules the user wrote in uBlock Origin ('My filters' is the name of that tab in uBlock Origin)"
+  },
   "appSettingsUboRedirectStubs": "Serve uBO redirect stubs",
   "@appSettingsUboRedirectStubs": {
     "description": "Toggle title for serving uBO redirect stub bodies"
@@ -1379,6 +1515,95 @@
   "appSettingsAbout": "About",
   "@appSettingsAbout": {
     "description": "About section header in app settings"
+  },
+  "appSettingsVersion": "Version",
+  "@appSettingsVersion": {
+    "description": "About-section row showing the installed app version; tapping it seven times unlocks developer mode"
+  },
+  "appSettingsDeveloperMode": "Developer mode",
+  "@appSettingsDeveloperMode": {
+    "description": "Switch in the Developer section that keeps diagnostic-only affordances visible"
+  },
+  "appSettingsDeveloperModeHint": "Shows diagnostic tools meant for reporting bugs, such as the Repaint Screen action in the page menu. They change nothing on their own; turn this off to hide them again.",
+  "@appSettingsDeveloperModeHint": {
+    "description": "Hint dialog for the developer mode switch, explaining what it reveals and that it is safe to leave off"
+  },
+  "appSettingsDeveloperModeEnabled": "Developer mode is on",
+  "@appSettingsDeveloperModeEnabled": {
+    "description": "Confirmation shown after the seventh tap on the version row turns developer mode on"
+  },
+  "appSettingsExperimental": "Experimental",
+  "@appSettingsExperimental": {
+    "description": "Heading of a group inside App settings > Developer, shown only while Developer mode is on. Lists features that ship before they are finished, each with its own on/off switch."
+  },
+  "appSettingsExperimentalHint": "Features that ship before they are finished. Each needs Developer mode and its own switch here. Turning Developer mode off turns them all off; their switches keep their positions for when it comes back on.",
+  "@appSettingsExperimentalHint": {
+    "description": "Explanation behind the hint button of the Experimental heading in App settings > Developer."
+  },
+  "appSettingsExperimentalProxyRouter": "Proxy router",
+  "@appSettingsExperimentalProxyRouter": {
+    "description": "Switch in App settings > Developer > Experimental, shown on Android only, that allows the per-site proxy router: sites set to different proxies can stay open at the same time."
+  },
+  "appSettingsExperimentalProxyRouterHint": "On Android one proxy setting covers the whole app, so opening a site with a different proxy closes the sites that use another one. The router keeps them all open: a relay inside the app sends each site's traffic to that site's own proxy. At every start it checks on this device that each site's traffic is told apart, and closes sites as before if the check fails. Experimental: it has been tried on few devices. Takes effect the next time the app starts.",
+  "@appSettingsExperimentalProxyRouterHint": {
+    "description": "Explanation behind the hint button of the Proxy router switch in App settings > Developer > Experimental. 'Closes the sites' means the app unloads those sites' pages."
+  },
+  "appSettingsExperimentalSiteIconsOnly": "Site icons only",
+  "@appSettingsExperimentalSiteIconsOnly": {
+    "description": "Switch in App settings > Developer > Experimental that makes the app take each site's icon only from the site itself: never from Google's or DuckDuckGo's public icon services, and on Android not from the web view either, only from the icons the site's pages declare. Short label."
+  },
+  "appSettingsExperimentalSiteIconsOnlyHint": "Takes each site's icon only from the site itself. Google's and DuckDuckGo's icon services are never asked, so they do not learn which sites you keep in the app, and icons already found through them are fetched again. The app fetches the icons a site's pages declare, through the site's proxy and blockers and without its cookies; on Android this replaces the icon the web view reports. A site that declares only small icons shows a smaller one, or a placeholder. Applies to sites opened after it is switched on.",
+  "@appSettingsExperimentalSiteIconsOnlyHint": {
+    "description": "Explanation behind the hint button of the Site icons only switch in App settings > Developer > Experimental. 'Blockers' are the site's DNS blocklist and content blocker. The 'web view' is the built-in browser component that shows the site. 'Opened' means loaded into the app's view after the switch changes."
+  },
+  "appSettingsResetIconCache": "Reset icon cache",
+  "@appSettingsResetIconCache": {
+    "description": "Row in App settings, shown only while Developer mode is on, that forgets every site icon the app has kept so they are fetched again. Short label."
+  },
+  "appSettingsResetIconCacheHint": "Forgets every site icon the app has kept, both the ones found online and the ones sites reported, and fetches them again. A site's own icon comes back once the site loads again. Use it to check where icons come from after changing Site icons only.",
+  "@appSettingsResetIconCacheHint": {
+    "description": "Explanation behind the hint button of the Reset icon cache row in App settings (Developer mode only). 'Site icons only' is the name of an experimental switch; keep it consistent with the translation of that switch's label."
+  },
+  "appSettingsIconCacheCleared": "Icon cache cleared",
+  "@appSettingsIconCacheCleared": {
+    "description": "Brief confirmation shown at the bottom of App settings after the Reset icon cache row is tapped and every cached site icon was forgotten."
+  },
+  "appSettingsExperimentalTextureRendering": "Texture page rendering",
+  "@appSettingsExperimentalTextureRendering": {
+    "description": "Title of an Android-only switch in the Experimental group of App Settings, shown only while Developer mode is on. When on, WebSpace draws web pages into a texture instead of the default Android hybrid composition. Short label."
+  },
+  "appSettingsExperimentalTextureRenderingHint": "Draws each page into a texture that WebSpace composites itself, instead of as a separate Android view layered with the app. It may stop pages that stay blank white until you rotate the phone or switch apps. Typing, text selection and screen readers are less tested this way, and fast scrolling can stutter. Takes effect the next time the app starts.",
+  "@appSettingsExperimentalTextureRenderingHint": {
+    "description": "Explanation behind the hint button of the Android-only Texture page rendering switch in the Experimental group of App Settings: what the mode does, what problem it may fix, what is less tested, and that it applies after a restart."
+  },
+  "appSettingsExperimentalExternalTor": "Tor (external)",
+  "@appSettingsExperimentalExternalTor": {
+    "description": "Title of the switch in App settings > Developer > Experimental that sends sites set to Tor through a Tor program already running on the device (for example the Orbot app, or the tor service on Linux) instead of one inside this app. While it is on, also the name of the Tor choice in proxy pickers and in the summaries that name a site's route, to tell it from the Tor built into the app. Tor is a product name; keep it."
+  },
+  "appSettingsExperimentalExternalTorHint": "Sends sites set to Tor through a tor already running on this device, such as Orbot, InviZible, Arti or the tor service; on macOS it replaces the built-in Tor. Each site gives that tor its own SOCKS username and password, so a tor with IsolateSOCKSAuth, which is on unless its SocksPort says NoIsolateSOCKSAuth, keeps each site on circuits of its own. Exit countries, bridges and new circuits are set in that tor.",
+  "@appSettingsExperimentalExternalTorHint": {
+    "description": "Explanation behind the hint button of the Tor (external) switch in App settings > Developer > Experimental. Orbot and InviZible are Android apps and Arti is Tor's Rust implementation; Tor, SOCKS, SocksPort, IsolateSOCKSAuth and NoIsolateSOCKSAuth are names from Tor's configuration and must stay as written. A circuit is Tor's path through the network."
+  },
+  "externalTorAddress": "Tor SOCKS address",
+  "@externalTorAddress": {
+    "description": "Title of the row, shown under the Tor (external) switch while it is on, that holds the host:port where the external Tor program listens for SOCKS connections. Also the title of the dialog that edits it. Tor and SOCKS are names; keep them."
+  },
+  "externalTorAddressHint": "Where that tor's SOCKS port listens, as host:port. Orbot, InviZible and the tor service use 127.0.0.1:9050, Arti and Tor Browser 127.0.0.1:9150. The app checks that tor answers there before any site uses it.",
+  "@externalTorAddressHint": {
+    "description": "Explanation behind the hint button of the Tor SOCKS address row. Keep the addresses 127.0.0.1:9050 and 127.0.0.1:9150 and the product names Orbot, InviZible, Arti and Tor Browser exactly as written."
+  },
+  "appSettingsDeveloperModeAlreadyOn": "Developer mode is already on",
+  "@appSettingsDeveloperModeAlreadyOn": {
+    "description": "Shown when the user taps the version row while developer mode is already enabled"
+  },
+  "appSettingsDeveloperModeStepsAway": "{count} more taps to turn on developer mode",
+  "@appSettingsDeveloperModeStepsAway": {
+    "description": "Countdown shown on each tap of the version row as the user approaches unlocking developer mode",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
   },
   "appSettingsLicenses": "Licenses",
   "@appSettingsLicenses": {
@@ -1701,6 +1926,18 @@
     "description": "Note above the proxy section explaining proxy scope."
   },
   "siteSettingsProxyType": "Proxy Type",
+  "siteSettingsTorExitCountry": "Exit country",
+  "@siteSettingsTorExitCountry": {
+    "description": "Label for the row that pins which country a Tor site exits from."
+  },
+  "siteSettingsTorExitCountryAny": "Any country",
+  "@siteSettingsTorExitCountryAny": {
+    "description": "Value shown on the exit-country row when no country is pinned, and the first option in the picker."
+  },
+  "siteSettingsTorExitCountryHint": "Your traffic leaves the Tor network from this country. The pin is strict: if no exit there works, the request fails instead of leaving from somewhere else. Only one country applies at a time, so opening this site unloads any site pinned to a different country.",
+  "@siteSettingsTorExitCountryHint": {
+    "description": "Hint body explaining that the exit-country pin is strict and that only one country applies at a time."
+  },
   "@siteSettingsProxyType": {
     "description": "Label for the proxy type dropdown."
   },
@@ -1715,18 +1952,6 @@
   "siteSettingsProxyAddressHelper": "Format: host:port",
   "@siteSettingsProxyAddressHelper": {
     "description": "Helper text under the proxy address field."
-  },
-  "siteSettingsProxyRequiresAuth": "Proxy requires authentication",
-  "@siteSettingsProxyRequiresAuth": {
-    "description": "Checkbox label to reveal proxy credential fields."
-  },
-  "siteSettingsProxyUsername": "Proxy Username",
-  "@siteSettingsProxyUsername": {
-    "description": "Label for the proxy username field."
-  },
-  "siteSettingsProxyPassword": "Proxy Password",
-  "@siteSettingsProxyPassword": {
-    "description": "Label for the proxy password field."
   },
   "siteSettingsJavascriptEnabled": "JavaScript Enabled",
   "@siteSettingsJavascriptEnabled": {
@@ -1817,6 +2042,14 @@
   "@siteSettingsZoomIn": {
     "description": "Tooltip for the zoom-in button."
   },
+  "siteSettingsHttpsUpgrade": "HTTPS upgrade",
+  "@siteSettingsHttpsUpgrade": {
+    "description": "Switch label for retrying plain-http page loads over an encrypted https connection."
+  },
+  "siteSettingsHttpsUpgradeHint": "Loads pages over the encrypted https connection even when the address starts with http, so what you read and send cannot be watched or altered on the network. Sites that offer no encrypted connection still load, over plain http, and are not upgraded again. Turn it off only for a site that has none.",
+  "@siteSettingsHttpsUpgradeHint": {
+    "description": "Explanatory popup for the HTTPS upgrade switch: what it does, that a site without encryption still loads, and when to turn it off."
+  },
   "siteSettingsThirdPartyCookies": "Third-party cookies",
   "@siteSettingsThirdPartyCookies": {
     "description": "Switch label toggling third-party cookies."
@@ -1837,9 +2070,9 @@
   "@siteSettingsAlwaysOpenHomeForced": {
     "description": "Subtitle shown when Always open Home is forced on because Incognito is enabled."
   },
-  "siteSettingsAlwaysOpenHomeSubtitle": "Reset URL on app restart and home-screen shortcut (cookies persist)",
-  "@siteSettingsAlwaysOpenHomeSubtitle": {
-    "description": "Subtitle explaining Always open Home behavior."
+  "siteSettingsAlwaysOpenHomeHint": "Reset URL on app restart and home-screen shortcut (cookies persist)",
+  "@siteSettingsAlwaysOpenHomeHint": {
+    "description": "Explanation behind the hint button of the Always open Home row: what returns to the home page and what is kept."
   },
   "siteSettingsKioskMode": "Kiosk mode",
   "@siteSettingsKioskMode": {
@@ -1968,33 +2201,102 @@
       }
     }
   },
-  "siteSettingsBlockAutoRedirects": "Block auto-redirects",
-  "@siteSettingsBlockAutoRedirects": {
-    "description": "Switch label for blocking script-initiated cross-domain redirects."
+  "siteSettingsRouteOutboundLinks": "Route links to my sites",
+  "@siteSettingsRouteOutboundLinks": {
+    "description": "Switch label for a per-site setting: a link tapped in this site that another of the user's sites claims opens as that other site (with its login, cookies and settings) instead of in a window of this site."
   },
-  "siteSettingsBlockAutoRedirectsHintTitle": "Block Auto-Redirects",
-  "@siteSettingsBlockAutoRedirectsHintTitle": {
-    "description": "Hint title for the Block Auto-Redirects feature."
+  "siteSettingsRouteOutboundLinksHint": "When on, a link you tap here that another of your sites claims opens as that site, signed in, with its own cookies and settings. Back returns here. When several sites claim a link you are asked which one, and can have the choice remembered for this site. Links no site claims open as they do now. Needs per-site containers.",
+  "@siteSettingsRouteOutboundLinksHint": {
+    "description": "Explanation behind the hint button of the 'Route links to my sites' switch. 'Claims' refers to the domain claims each site has (the hostnames that belong to it). 'Per-site containers' is the storage isolation that gives each site its own cookies."
   },
-  "siteSettingsBlockAutoRedirectsHint": "Prevents scripts from automatically navigating you to a different domain. This helps avoid being silently redirected to tracking or advertising pages.",
-  "@siteSettingsBlockAutoRedirectsHint": {
-    "description": "Hint body describing Block Auto-Redirects."
+  "siteSettingsRouteOutboundLinksTabsHint": "With tabs, a link into one of your sites opens as a tab. With this switch on, the tab runs as that site, with its sign-in, proxy and other settings; off, it runs as this site, with this one's. Changing the switch reloads the tabs opened from links here as the site it now picks.",
+  "@siteSettingsRouteOutboundLinksTabsHint": {
+    "description": "Second paragraph of the hint behind the 'Route links to my sites' switch, shown only when the site has tabs. Explains that the switch decides which of the user's sites a tab opened from a link runs as: the site the link leads to, or this one. Running as a site means using its sign-in (cookies), its proxy and every other per-site setting. Flipping the switch reloads such tabs as the other site."
   },
-  "siteSettingsBlockAutoRedirectsSubtitle": "Block script-initiated cross-domain navigations",
-  "@siteSettingsBlockAutoRedirectsSubtitle": {
-    "description": "Subtitle for the Block Auto-Redirects switch."
+  "siteSettingsRouteOutboundLinksNeedsContainers": "Needs per-site containers",
+  "@siteSettingsRouteOutboundLinksNeedsContainers": {
+    "description": "Subtitle under the disabled 'Route links to my sites' switch on devices whose web engine cannot give each site its own cookie storage (per-site containers)."
+  },
+  "outboundPreferencesTitle": "Routing preferences",
+  "@outboundPreferencesTitle": {
+    "description": "Title of the per-site row and screen listing which of the user's sites a link from this site opens as, per domain. Takes precedence over the domain claims of the other sites."
+  },
+  "outboundPreferencesCount": "{count, plural, one{{count} preference} other{{count} preferences}}",
+  "@outboundPreferencesCount": {
+    "description": "Subtitle of the 'Routing preferences' row: how many routing preferences this site has.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "outboundPreferencesGlobalOnly": "Global routing only",
+  "@outboundPreferencesGlobalOnly": {
+    "description": "Subtitle of the 'Routing preferences' row, and the empty state of its screen, when the site has no preferences of its own: links follow the domain claims of the user's sites."
+  },
+  "outboundPreferenceOpensAs": "Opens as {site}",
+  "@outboundPreferenceOpensAs": {
+    "description": "Subtitle of one routing preference: links to the domain in the title open as the user's site {site}.",
+    "placeholders": {
+      "site": {
+        "type": "String"
+      }
+    }
+  },
+  "outboundPreferenceAdd": "Add routing preference",
+  "@outboundPreferenceAdd": {
+    "description": "Tooltip of the button that adds a routing preference, and title of the dialog it opens."
+  },
+  "outboundPreferenceTargetLabel": "Open as",
+  "@outboundPreferenceTargetLabel": {
+    "description": "Label of the site picker in the 'Add routing preference' dialog: which of the user's sites a link to the entered domain opens as."
+  },
+  "outboundPreferenceClaimTaken": "Already routes to {site}",
+  "@outboundPreferenceClaimTaken": {
+    "description": "Error under the domain field of the 'Add routing preference' dialog when this site already has a preference for the same domain, naming the site it routes to.",
+    "placeholders": {
+      "site": {
+        "type": "String"
+      }
+    }
   },
   "siteSettingsExternalLinksInBrowser": "Open external links in browser",
   "@siteSettingsExternalLinksInBrowser": {
-    "description": "Switch label for a per-site setting that opens links pointing outside the site in the device's default web browser."
+    "description": "Entry in the one-line summary of a site's Behaviour settings row, shown when links from this site to other websites open in the device's default web browser."
   },
-  "siteSettingsExternalLinksInBrowserHintTitle": "Open External Links in Browser",
-  "@siteSettingsExternalLinksInBrowserHintTitle": {
-    "description": "Hint dialog title for the Open External Links in Browser feature."
+  "siteSettingsExternalLinksBlockedSummary": "Block external links",
+  "@siteSettingsExternalLinksBlockedSummary": {
+    "description": "Entry in the one-line summary of a site's Behaviour settings row, shown when links from this site to other websites are blocked (tapping them does nothing)."
   },
-  "siteSettingsExternalLinksInBrowserHint": "When on, a link that points outside this site's domains opens in your device's default browser instead of inside the app. Links to domains this site claims still open in the app. Add extra domains under Domain claims below to keep them in the app.",
-  "@siteSettingsExternalLinksInBrowserHint": {
-    "description": "Hint body explaining that off-site links open externally while claimed domains stay in the app."
+  "siteSettingsExternalLinks": "External links",
+  "@siteSettingsExternalLinks": {
+    "description": "Title of the per-site choice of what happens when a link in this site leads to another website: open it inside the app, open it in the device's browser, or block it."
+  },
+  "siteSettingsExternalLinksHint": "Where a link to another website goes when you tap it here. Open in the app shows it in a window over this site, with this site's settings and cookies. Open in browser hands it to your device's default browser. Block keeps you on this site: the link does nothing, while images and other content from other websites still load. Links to domains this site claims always open in the app; add domains under Domain claims below.",
+  "@siteSettingsExternalLinksHint": {
+    "description": "Explanation behind the hint button of the 'External links' choice. Names the three options ('Open in the app', 'Open in browser', 'Block') and 'Domain claims', the list of extra domains that belong to the site; keep those names as they are translated elsewhere."
+  },
+  "siteSettingsExternalLinksInApp": "Open in the app",
+  "@siteSettingsExternalLinksInApp": {
+    "description": "Option of the per-site 'External links' choice: a link to another website opens in a window inside this app, over the current site."
+  },
+  "siteSettingsExternalLinksBrowser": "Open in browser",
+  "@siteSettingsExternalLinksBrowser": {
+    "description": "Option of the per-site 'External links' choice: a link to another website opens in the device's default web browser, outside this app."
+  },
+  "siteSettingsExternalLinksBlock": "Block",
+  "@siteSettingsExternalLinksBlock": {
+    "description": "Option of the per-site 'External links' choice: tapping a link to another website does nothing, so the site can never take the user elsewhere. Verb, as in 'block these links'."
+  },
+  "externalLinkBlocked": "Link to {host} blocked",
+  "@externalLinkBlocked": {
+    "description": "Brief message at the bottom of the screen after the user taps a link to another website in a site whose external links are set to Block; nothing opens.",
+    "placeholders": {
+      "host": {
+        "type": "String",
+        "example": "example.com"
+      }
+    }
   },
   "siteSettingsFullscreen": "Full screen mode",
   "@siteSettingsFullscreen": {
@@ -2011,6 +2313,14 @@
   "siteSettingsFullscreenSubtitle": "Auto-enter full screen for this site",
   "@siteSettingsFullscreenSubtitle": {
     "description": "Subtitle for the full screen mode switch."
+  },
+  "siteSettingsTabs": "Tabs",
+  "@siteSettingsTabs": {
+    "description": "Switch label in a site's Behaviour settings: whether this site can keep several pages open at once, like browser tabs."
+  },
+  "siteSettingsTabsHint": "Lets this site keep several pages open at once, like browser tabs. A kiosk site runs as one page, so turning tabs on turns Kiosk mode off, and turning Kiosk mode on turns tabs off. With Always open Home on, the site opens on a tab at its home page and keeps your other tabs. Tabs already open are kept while tabs are off.",
+  "@siteSettingsTabsHint": {
+    "description": "Hint dialog body for the per-site Tabs switch, opened from its info button. Explains that tabs let the site keep several pages open, that tabs and Kiosk mode exclude each other (turning one on turns the other off), that with Always open Home on the site opens on a tab at its home page and keeps the other tabs, and that existing tabs are kept while tabs are off. 'Kiosk mode' and 'Always open Home' are the names of two switches on the same screen."
   },
   "siteSettingsHtmlCaching": "HTML caching",
   "@siteSettingsHtmlCaching": {
@@ -2118,13 +2428,17 @@
   "@siteSettingsMicrophoneAccess": {
     "description": "List tile label and hint title for the per-site web microphone access setting."
   },
-  "siteSettingsMicrophoneAccessHint": "Controls whether this site may capture audio.\n\nWebSpace never opens your real microphone and never asks the system for a recording permission. Instead, the site can be fed an audio file that it hears on repeat.\n\nAsk (default): a popup asks the first time, then remembers your choice.\nAudio file: loop the chosen file to the site.\nAlways block: reject every request.",
+  "siteSettingsMicrophoneAccessHint": "Controls whether this site may capture audio.\n\nOnly the site you are looking at can record. Recording stops when you switch to another site, and a site in the background is never granted the microphone.\n\nAsk (default): a popup asks the first time, then remembers your choice.\nAlways allow: hand this site your real microphone.\nAudio file: loop the chosen file to the site.\nAlways block: reject every request.",
   "@siteSettingsMicrophoneAccessHint": {
-    "description": "Hint body describing the per-site web microphone access setting: no real microphone is ever used; the site can instead be fed a looped audio file."
+    "description": "Hint body describing the per-site web microphone access setting: the four modes, and the rule that only the on-screen site can record."
   },
   "siteSettingsMicrophoneAccessAsk": "Ask",
   "@siteSettingsMicrophoneAccessAsk": {
     "description": "Microphone access dropdown option: ask each time."
+  },
+  "siteSettingsMicrophoneAccessAllow": "Always allow",
+  "@siteSettingsMicrophoneAccessAllow": {
+    "description": "Microphone access dropdown option: hand the device microphone to the site whenever the site is the one on screen."
   },
   "siteSettingsMicrophoneAccessVirtual": "Audio file",
   "@siteSettingsMicrophoneAccessVirtual": {
@@ -2271,17 +2585,9 @@
   "@siteSettingsWebRtcDisabled": {
     "description": "WebRTC policy dropdown option: disabled."
   },
-  "siteSettingsDnsStatTotal": "Total",
-  "@siteSettingsDnsStatTotal": {
-    "description": "Label for the total DNS lookups stat chip."
-  },
-  "siteSettingsDnsStatAllowed": "Allowed",
-  "@siteSettingsDnsStatAllowed": {
-    "description": "Label for the allowed DNS lookups stat chip."
-  },
-  "siteSettingsDnsStatBlocked": "Blocked",
-  "@siteSettingsDnsStatBlocked": {
-    "description": "Label for the blocked DNS lookups stat chip."
+  "siteSettingsWebRtcNoDirect": "Direct connections blocked by Tracking Protection behind a proxy",
+  "@siteSettingsWebRtcNoDirect": {
+    "description": "Subtitle under the WebRTC policy dropdown while the site has Tracking Protection on and its traffic goes through a proxy. In that state the 'Default' option is greyed out and 'Default' behaves as 'Relay only': WebRTC may not connect directly, because a direct connection would reveal the device's real IP address around the proxy. 'Tracking Protection' is the name of a setting; 'proxy' is a network proxy server."
   },
   "siteSettingsClearSiteData": "Clear Site Data",
   "@siteSettingsClearSiteData": {
@@ -2327,11 +2633,11 @@
   "@siteSettingsBgNotifTitleAndroid": {
     "description": "Title of the one-time Android background notification limits dialog."
   },
-  "siteSettingsBgNotifBodyIos": "iOS limits background execution. Notifications arrive while WebSpace is open or in the recent-tasks list. After WebSpace is fully suspended, iOS schedules background refreshes opportunistically — typically every 15-30 minutes — at which point your sites are reloaded and any pending notifications fire.",
+  "siteSettingsBgNotifBodyIos": "iOS suspends WebSpace shortly after you leave it, and a suspended site cannot receive messages. Notifications arrive while WebSpace is open and for about 30 seconds after you leave. iOS also wakes WebSpace from time to time, at intervals it chooses, to reload these sites. If a site shows an unread count in its title and the count went up, WebSpace notifies you.",
   "@siteSettingsBgNotifBodyIos": {
     "description": "Body of the iOS background notification limits dialog."
   },
-  "siteSettingsBgNotifBodyAndroid": "Android limits background execution. Notifications arrive while WebSpace is open or in recent tasks. While backgrounded, the app reloads notification sites every ~15 minutes when the system permits. If Android kills WebSpace under memory pressure, notifications stop until the next launch.",
+  "siteSettingsBgNotifBodyAndroid": "Android can freeze WebSpace soon after you leave it, and a frozen site cannot receive messages. Notifications arrive while WebSpace is open. Android also wakes WebSpace from time to time, no more than once every 15 minutes and less often while the phone is idle, to reload these sites. If a site shows an unread count in its title and the count went up, WebSpace notifies you. If Android closes WebSpace, notifications stop until you open it again.",
   "@siteSettingsBgNotifBodyAndroid": {
     "description": "Body of the Android background notification limits dialog."
   },
@@ -2362,6 +2668,18 @@
   "siteSettingsProxyInvalidPort": "Invalid port number",
   "@siteSettingsProxyInvalidPort": {
     "description": "Validation error for an out-of-range proxy port."
+  },
+  "siteSettingsProxyCoverageAll": "Covers every request this site makes",
+  "@siteSettingsProxyCoverageAll": {
+    "description": "Subtitle under the per-site proxy row, shown when the system applies the proxy as its own rule so all of the site's traffic goes through it."
+  },
+  "siteSettingsProxyCoverageFirstOnly": "Covers the request each page is opened with",
+  "@siteSettingsProxyCoverageFirstOnly": {
+    "description": "Subtitle under the per-site proxy row, shown when the system attaches the proxy to a page as it opens, so only that first request can be shown to go through it. Later requests are blocked rather than sent without the proxy."
+  },
+  "siteSettingsProxyCoverageHint": "Where the system applies the proxy as its own rule, every request this site makes goes through it. Where it instead attaches the proxy to a page as the page opens, only the request the page is opened with can be shown to go through it, and anything the page navigates to afterwards is blocked and offered to you as a fresh page. It is blocked because sending it would show your device's IP address to the other end.",
+  "@siteSettingsProxyCoverageHint": {
+    "description": "Hint dialog text on the per-site proxy row. Explains the two ways a system can apply a proxy, and what the app does when it cannot establish that a request would go through the proxy. Written for a reader who cannot see the screen: this row is where a site is put behind a proxy."
   },
   "siteSettingsProxyError": "Proxy error: {error}",
   "@siteSettingsProxyError": {
@@ -2520,6 +2838,14 @@
   "userScriptsInjectionTimeLabel": "Injection time",
   "@userScriptsInjectionTimeLabel": {
     "description": "Label for the dropdown selecting when a user script is injected"
+  },
+  "userScriptsBypassSitePolicyLabel": "Bypass site CSP and CORS",
+  "@userScriptsBypassSitePolicyLabel": {
+    "description": "Label for a switch in the user-script editor. Turning it on lets this script load libraries and read cross-origin data that the website's Content Security Policy and same-origin policy would otherwise block."
+  },
+  "userScriptsBypassSitePolicyHint": "Some libraries (for example DarkReader) cannot work unless the app runs their code and network requests around the site’s security policy. Turn this on only for a script that needs it. While it is on, the protection is off for the whole page: any other code running there, including the site’s own scripts and any advertisement or injected code, can use the same route.",
+  "@userScriptsBypassSitePolicyHint": {
+    "description": "Hint dialog text explaining the \"Bypass site CSP and CORS\" switch in the user-script editor: what it is for, and that the weakening applies to every script on the page rather than to this one script."
   },
   "userScriptsAtDocumentStart": "Document start",
   "@userScriptsAtDocumentStart": {
@@ -2947,6 +3273,77 @@
   "@homeImportSettingsSessionsNote": {
     "description": "Note in the import dialog explaining how login sessions are handled"
   },
+  "homeImportGlobalProxyWarning": "This backup sets an app-wide outbound proxy: {address}. Every site that has no proxy of its own will route through it.",
+  "@homeImportGlobalProxyWarning": {
+    "description": "Warning line in the settings-import confirmation dialog, shown when the backup file carries an app-wide outbound proxy. {address} is a host:port. Restoring it silently redirects all traffic, so the address is named before the user confirms.",
+    "placeholders": {
+      "address": {
+        "type": "String"
+      }
+    }
+  },
+  "homeImportUserScriptsWarning": "{count, plural, =1{This backup installs 1 user script. It is added switched off — review it before enabling.} other{This backup installs {count} user scripts. They are added switched off — review them before enabling.}}",
+  "@homeImportUserScriptsWarning": {
+    "description": "Warning line in the settings-import confirmation dialog, shown when the backup file carries user scripts. A user script is JavaScript injected into pages, so the count is named before the user confirms and the scripts are restored disabled.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "homeQrReviewTitle": "Review shared site settings",
+  "@homeQrReviewTitle": {
+    "description": "Title of the dialog shown before a site is created from a scanned or linked WebSpace QR code"
+  },
+  "homeQrReviewBody": "This code was written by whoever shared it, and it chooses this site's privacy settings. Check them before adding.",
+  "@homeQrReviewBody": {
+    "description": "Body text of the QR review dialog, explaining that the settings come from the code's author rather than from the app"
+  },
+  "homeQrReviewUrl": "Address: {url}",
+  "@homeQrReviewUrl": {
+    "description": "Line in the QR review dialog showing the web address the shared site would open. {url} is a URL.",
+    "placeholders": {
+      "url": {
+        "type": "String"
+      }
+    }
+  },
+  "homeQrReviewName": "Name: {name}",
+  "@homeQrReviewName": {
+    "description": "Line in the QR review dialog showing the name the shared site would be listed under. {name} is free text chosen by whoever made the code.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "homeQrReviewProxy": "Sends this site's traffic through a proxy: {address}",
+  "@homeQrReviewProxy": {
+    "description": "Line in the QR review dialog shown when the shared settings point the site at a proxy server. {address} is a host:port.",
+    "placeholders": {
+      "address": {
+        "type": "String"
+      }
+    }
+  },
+  "homeQrReviewTurnsOff": "Turns off: {settings}",
+  "@homeQrReviewTurnsOff": {
+    "description": "Line in the QR review dialog listing the protections the shared settings would switch off. {settings} is a comma-separated list of setting names.",
+    "placeholders": {
+      "settings": {
+        "type": "String"
+      }
+    }
+  },
+  "homeQrReviewTurnsOn": "Turns on: {settings}",
+  "@homeQrReviewTurnsOn": {
+    "description": "Line in the QR review dialog listing the permissions or modes the shared settings would switch on. {settings} is a comma-separated list of setting names.",
+    "placeholders": {
+      "settings": {
+        "type": "String"
+      }
+    }
+  },
   "homeImportAction": "Import",
   "@homeImportAction": {
     "description": "Button label confirming a settings import"
@@ -3032,6 +3429,122 @@
   "homeFindMenu": "Find",
   "@homeFindMenu": {
     "description": "Menu item to open the find-in-page toolbar"
+  },
+  "webSearchMenu": "Web search",
+  "@webSearchMenu": {
+    "description": "Button in the header of the Tabs sheet, beside New tab, that opens the web search sheet for searching the web or the site on screen with one of the user's search sites. While the site on screen has no tabs it is instead a row in the page's overflow menu, below Find. Also the tooltip of the magnifier button in the address bar that turns it into a search field, the tooltip of the arrow button that runs the search, and the field's placeholder before a search site is chosen."
+  },
+  "webSearchFieldHint": "Search with {engine}",
+  "@webSearchFieldHint": {
+    "description": "Placeholder of the web search field, and of the address bar while it is a search field; also the tooltip of the button that runs such a search. {engine} is the chosen search engine's name, such as DuckDuckGo, or the web address it searches on.",
+    "placeholders": {
+      "engine": {
+        "type": "String",
+        "example": "DuckDuckGo"
+      }
+    }
+  },
+  "webSearchTemplateLabel": "Search address",
+  "@webSearchTemplateLabel": {
+    "description": "Label of the text field where the user types a custom search engine's web address."
+  },
+  "webSearchTemplateHelper": "Put %s where the search words go, for example https://example.com/search?q=%s",
+  "@webSearchTemplateHelper": {
+    "description": "Help text under the custom search address field. Keep both %s exactly as written: the app replaces %s with what the user searches for. Keep the example address unchanged."
+  },
+  "webSearchTemplateInvalid": "Needs an http or https address with %s in it",
+  "@webSearchTemplateInvalid": {
+    "description": "Error under the custom search address field when the address is not a web address or has no %s. Keep %s exactly as written."
+  },
+  "webSearchScopeWeb": "The web",
+  "@webSearchScopeWeb": {
+    "description": "Choice in the web search sheet: search the whole web. The other choice beside it is the name of the site on screen, for searching only that site."
+  },
+  "webSearchNoSites": "None of your sites can run this search. Add one:",
+  "@webSearchNoSites": {
+    "description": "Shown in the web search sheet when none of the user's sites is a search engine that can run the search. Search engines to add as new sites follow it, such as DuckDuckGo."
+  },
+  "webSearchDefaultTitle": "Default search",
+  "@webSearchDefaultTitle": {
+    "description": "Title of the App Settings row that picks which of the user's sites Web search starts with, and of the dialog listing them. The sites are search engines the user added as sites, such as DuckDuckGo."
+  },
+  "webSearchDefaultHint": "The search site Web search in the page menu starts with when the site on screen names none of its own. A search runs in that site, with its sign-in, proxy and blockers, never in the site you searched from. Search engines you add as sites appear here.",
+  "@webSearchDefaultHint": {
+    "description": "Explanation behind the hint button of the Default search row in App Settings. 'Page menu' is the three-dot menu of a site."
+  },
+  "webSearchSiteListTitle": "Site search list",
+  "@webSearchSiteListTitle": {
+    "description": "Title of the App Settings row that downloads a list of how thousands of websites search themselves, so a site the user adds can search itself without setup."
+  },
+  "webSearchSiteListHint": "Kagi's community list of how thousands of websites search themselves (MIT licence). With it, a site the app does not otherwise know can search itself from Web search without you typing an address. It is fetched only when you tap Download, through the app-wide proxy, and kept on this device until you clear it. A listed address only ever searches its own site, never the rest of the web.",
+  "@webSearchSiteListHint": {
+    "description": "Explanation behind the hint button of the Site search list row in App Settings. Kagi is the name of a search company; keep it as is."
+  },
+  "webSearchSiteListCount": "{count} sites",
+  "@webSearchSiteListCount": {
+    "description": "Subtitle of the Site search list row once downloaded: how many websites the list has a search address for. The number is already formatted.",
+    "placeholders": {
+      "count": {
+        "type": "String"
+      }
+    }
+  },
+  "webSearchSiteListLoaded": "Site search list ready: {count} sites",
+  "@webSearchSiteListLoaded": {
+    "description": "Snackbar after the site search list downloads. The number is already formatted.",
+    "placeholders": {
+      "count": {
+        "type": "String"
+      }
+    }
+  },
+  "webSearchSiteListFailed": "Could not download the site search list",
+  "@webSearchSiteListFailed": {
+    "description": "Snackbar when downloading the site search list fails."
+  },
+  "webSearchNoWebSites": "None of your sites searches the web yet. Add a search engine, such as DuckDuckGo, as a site.",
+  "@webSearchNoWebSites": {
+    "description": "Shown instead of a list when the user has no site that is a web search engine."
+  },
+  "webSearchGroup": "Search",
+  "@webSearchGroup": {
+    "description": "Group heading in a site's Behaviour settings for how the site is searched and what a search from it offers."
+  },
+  "webSearchAddressHint": "How to search this site: an address with %s where the search words go. Known search engines, and sites such as GitHub or Wikipedia, fill it in themselves. A site with a search address is offered by Web search.",
+  "@webSearchAddressHint": {
+    "description": "Explanation behind the hint button of the Search address row in a site's Behaviour settings. Keep %s exactly as written."
+  },
+  "webSearchSearchesWeb": "Searches the whole web",
+  "@webSearchSearchesWeb": {
+    "description": "Switch in the search address dialog: on when the address searches the whole web, like a search engine; off when it searches only this site, like a site's own search box."
+  },
+  "webSearchAddressReset": "Reset",
+  "@webSearchAddressReset": {
+    "description": "Button in the search address dialog that drops the typed address and goes back to the one the site is known for, if any."
+  },
+  "webSearchFromSiteTitle": "Default search from this site",
+  "@webSearchFromSiteTitle": {
+    "description": "Title of the row in a site's Behaviour settings that picks which search site Web search starts with while this site is on screen, and of the dialog listing them."
+  },
+  "webSearchFromSiteHint": "The search site Web search starts with while you are on this site. The others stay one tap away in the search sheet.",
+  "@webSearchFromSiteHint": {
+    "description": "Explanation behind the hint button of the Default search from this site row."
+  },
+  "webSearchUseAppDefault": "App default",
+  "@webSearchUseAppDefault": {
+    "description": "Choice and row value meaning the site follows the Default search set in App Settings."
+  },
+  "webSearchOfferedTitle": "Search sites offered",
+  "@webSearchOfferedTitle": {
+    "description": "Title of the row in a site's Behaviour settings that limits which search sites a search from this site offers, and of the dialog with a checkbox per search site."
+  },
+  "webSearchOfferedHint": "Which of your search sites a search from this site offers. With none picked, every one is offered. This site's own search is always offered.",
+  "@webSearchOfferedHint": {
+    "description": "Explanation behind the hint button of the Search sites offered row."
+  },
+  "webSearchOfferedAll": "All",
+  "@webSearchOfferedAll": {
+    "description": "Row value when a site limits nothing: every search site is offered."
   },
   "homeHideUrlBarMenu": "Hide URL Bar",
   "@homeHideUrlBarMenu": {
@@ -3153,6 +3666,10 @@
   "@homeArchiveClosed": {
     "description": "Snackbar confirming an archive was closed"
   },
+  "homeArchiveFull": "An archive is full and was left open as it was. Close some of its tabs or move sites out of it, then try again.",
+  "@homeArchiveFull": {
+    "description": "Snackbar shown when an open archive has no room for what would be saved into it: on closing it, on moving a site into it, or on importing settings while it is open. Nothing was changed and the archive stays open with its sites. 'Tabs' are the pages kept open inside one site; 'move sites out of it' refers to the Move out of archive action on a site."
+  },
   "homeTitleUpdatedTo": "Title updated to: {title}",
   "@homeTitleUpdatedTo": {
     "description": "Snackbar confirming a site's title was refreshed",
@@ -3225,6 +3742,19 @@
         "type": "String"
       }
     }
+  },
+  "homeDispatchRememberForSource": "Always use this when opening links from {site}",
+  "@homeDispatchRememberForSource": {
+    "description": "Checkbox in the picker shown when a link tapped inside one site is claimed by several other sites. Checked, the chosen site is remembered for this link's domain whenever it is opened from {site}, the site the link was tapped in.",
+    "placeholders": {
+      "site": {
+        "type": "String"
+      }
+    }
+  },
+  "homeDispatchOpenWithoutRouting": "Open without routing",
+  "@homeDispatchOpenWithoutRouting": {
+    "description": "Row in the picker shown when a link tapped inside one site is claimed by several other sites. Opens the link the way it would open if no site claimed it (in an in-app window of the current site, or in the system browser), without sending it to another site."
   },
   "homeDispatchOpenHostInSite": "Open {host} in a site",
   "@homeDispatchOpenHostInSite": {
@@ -3360,6 +3890,24 @@
   "@homeShortcutPickTitle": {
     "description": "Title of the dialog listing existing sites to reassign an orphaned shortcut to."
   },
+  "homeShortcutReenabled": "Re-enabled the existing home screen shortcut for \"{name}\"",
+  "@homeShortcutReenabled": {
+    "description": "Snackbar after the user asks for a home screen shortcut for a site that already had one on the home screen in a disabled (greyed out) state, for example after restoring the phone from a backup. The app made that existing shortcut work again instead of adding a second one.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "homeShortcutPinFailed": "Couldn't add a home screen shortcut for \"{name}\"",
+  "@homeShortcutPinFailed": {
+    "description": "Snackbar shown when Android refused to add a home screen shortcut for a site.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
   "siteSettingsWindowWidth": "Box width",
   "@siteSettingsWindowWidth": {
     "description": "Label for the per-site letterbox content-box width input."
@@ -3484,6 +4032,18 @@
   "@blockStatsResetConfirm": {
     "description": "Body of the confirmation dialog shown before clearing the protection report counters."
   },
+  "blockStatsDetailItems": "Most frequent",
+  "@blockStatsDetailItems": {
+    "description": "Section header on the protection report's per-category screen, above the list of the individual things that were stopped most often (domains, or the tracking parameters that were removed)."
+  },
+  "blockStatsDetailSites": "By site",
+  "@blockStatsDetailSites": {
+    "description": "Section header on the protection report's per-category screen, above the list of the user's sites with how many requests were stopped for each."
+  },
+  "blockStatsDetailEmpty": "Nothing recorded yet.",
+  "@blockStatsDetailEmpty": {
+    "description": "Shown on the protection report's per-category screen when no request of that kind has been stopped yet, so there is nothing to itemise."
+  },
   "appSettingsProtectionReportSubtitle": "What the blockers stopped, over time",
   "@appSettingsProtectionReportSubtitle": {
     "description": "Subtitle of the App Settings row that opens the protection report screen."
@@ -3512,10 +4072,6 @@
   "@permissionsBackgroundAudioNotAGrant": {
     "description": "Subtitle for the background audio switch, clarifying it is a playback exemption rather than a permission."
   },
-  "permissionMicrophoneNeverReal": "Not available. WebSpace never opens a real microphone and never asks the system for a recording permission.",
-  "@permissionMicrophoneNeverReal": {
-    "description": "Shown on the greyed-out Allowed option for microphone, stating that a real microphone is never used."
-  },
   "permissionStateAsk": "Ask",
   "@permissionStateAsk": {
     "description": "One-word permission state: no decision recorded yet, the first request will prompt."
@@ -3538,7 +4094,7 @@
   },
   "permissionsSummaryMore": "{count} more",
   "@permissionsSummaryMore": {
-    "description": "Appended to the permissions or privacy summary in site settings when more entries are on than fit on the row.",
+    "description": "Appended to a summary row in site settings (behaviour, network, privacy or permissions) when more entries are on than fit on the row.",
     "placeholders": {
       "count": {
         "type": "int"
@@ -3573,6 +4129,47 @@
   "@siteSettingsForcedOffByTrackingProtection": {
     "description": "Subtitle on a setting that Tracking Protection turns off and locks while it is on. The inverse of the 'Forced on by Tracking Protection' subtitle."
   },
+  "settingOn": "On",
+  "@settingOn": {
+    "description": "Choice on a per-site row that follows or overrides an app-wide switch: the setting is on for this site. One word."
+  },
+  "settingOff": "Off",
+  "@settingOff": {
+    "description": "Choice on a per-site row that follows or overrides an app-wide switch: the setting is off for this site. One word."
+  },
+  "settingFollowsApp": "App default ({value})",
+  "@settingFollowsApp": {
+    "description": "Choice on a per-site row meaning the site follows the App Settings value instead of its own. {value} is that value, the translation of On or Off.",
+    "placeholders": {
+      "value": {
+        "type": "String"
+      }
+    }
+  },
+  "settingLockedByArchive": "Fixed for sites in an archive",
+  "@settingLockedByArchive": {
+    "description": "Subtitle of a per-site setting that cannot be changed while the site is in an archived webspace, because the archive decides it (for example camera blocked, incognito on)."
+  },
+  "privacyGroupScreenCapture": "Screen capture",
+  "@privacyGroupScreenCapture": {
+    "description": "Heading for the group in a site's privacy settings about screenshots, screen recording and the app's preview in the recent-apps list."
+  },
+  "siteSettingsBlockScreenshots": "Block screenshots",
+  "@siteSettingsBlockScreenshots": {
+    "description": "Title of the switch that makes screenshots and screen recordings of the app come out blank. Shown in a site's privacy settings, where it applies while that site is on screen, and in the app-wide privacy settings, where it applies everywhere."
+  },
+  "siteSettingsBlockScreenshotsHint": "While this site is on screen, screenshots, screen recordings and screen sharing show the app blank, and its preview in recent apps is hidden. Other sites and the rest of the app can still be captured.",
+  "@siteSettingsBlockScreenshotsHint": {
+    "description": "Explanatory popup for a site's Block screenshots switch: what is kept out of captures, and that it covers only this site while it is displayed."
+  },
+  "siteSettingsBlockScreenshotsAppWide": "On for the whole app in App Settings",
+  "@siteSettingsBlockScreenshotsAppWide": {
+    "description": "Subtitle on a site's Block screenshots switch when the app-wide switch in App Settings already covers every site, so the site's own switch is locked on."
+  },
+  "appSettingsBlockScreenshotsHint": "Screenshots, screen recordings and screen sharing show the app blank on every screen, the site list included, and its preview in recent apps is hidden. To cover only some sites, leave this off and turn it on in those sites' privacy settings.",
+  "@appSettingsBlockScreenshotsHint": {
+    "description": "Explanatory popup for the app-wide Block screenshots switch: what is kept out of captures, that it covers the whole app, and that sites can turn it on individually instead."
+  },
   "siteSettingsNeedsTrackingProtection": "Requires Tracking Protection",
   "@siteSettingsNeedsTrackingProtection": {
     "description": "Subtitle on a setting that can only be turned on while Tracking Protection is on."
@@ -3589,16 +4186,920 @@
   "@siteSettingsSectionContent": {
     "description": "Heading in site settings for the group covering what the page is served and how it renders: scripts, user agent, language, zoom."
   },
-  "siteSettingsSectionBehaviour": "Behaviour",
-  "@siteSettingsSectionBehaviour": {
-    "description": "Heading in site settings for the group covering how the app treats the site: where it opens, how links leave it, and how much of the screen it uses."
+  "behaviourTitle": "Behaviour",
+  "@behaviourTitle": {
+    "description": "Title of the per-site behaviour screen, and of the row in site settings that opens it. Covers how the app hosts the site: where it opens, how much of the app shell it gets, and where links leaving it end up."
   },
-  "siteSettingsSectionNetwork": "Network",
-  "@siteSettingsSectionNetwork": {
-    "description": "Heading in site settings for the group covering how the site's traffic reaches the internet: proxy and WebRTC."
+  "behaviourGroupOpening": "Opening and display",
+  "@behaviourGroupOpening": {
+    "description": "Heading for the behaviour group covering what happens when the site is opened: whether it starts at its home page, how much of the app and system UI it hides, and whether it is drawn from a cached copy first."
+  },
+  "behaviourSummaryNothingOn": "Nothing enabled",
+  "@behaviourSummaryNothingOn": {
+    "description": "Summary on the behaviour row in site settings when none of the behaviour switches is on."
+  },
+  "networkTitle": "Network",
+  "@networkTitle": {
+    "description": "Title of the per-site network screen, and of the row in site settings that opens it. Covers how the site's traffic reaches the internet (proxy, WebRTC) and the sign-ins saved for the site's server."
+  },
+  "networkGroupProxy": "Proxy",
+  "@networkGroupProxy": {
+    "description": "Heading for the network group holding the site's proxy: its type, address, credentials and a connection test."
+  },
+  "networkGroupConnection": "Connection",
+  "@networkGroupConnection": {
+    "description": "Heading for the network group holding the WebRTC policy (whether peer-to-peer calls may reveal the device's IP address) and the sign-ins saved for the site's server."
+  },
+  "networkSummaryDefault": "Default connection",
+  "@networkSummaryDefault": {
+    "description": "Summary on the network row in site settings when the site uses no proxy (neither its own nor the app-wide one) and the default WebRTC policy, so its traffic goes out the way the device's other traffic does."
+  },
+  "networkSummaryAppProxy": "App-wide proxy",
+  "@networkSummaryAppProxy": {
+    "description": "Entry in the network row summary in site settings when the site sets no proxy of its own and so goes through the app-wide outbound proxy configured in App Settings."
+  },
+  "networkSummaryWebRtc": "WebRTC: {policy}",
+  "@networkSummaryWebRtc": {
+    "description": "Entry in the network row summary in site settings when the site's WebRTC policy is not the default. {policy} is the chosen policy's name, such as 'Relay only' or 'Disabled'.",
+    "placeholders": {
+      "policy": {
+        "type": "String"
+      }
+    }
   },
   "siteSettingsSectionSite": "Site",
   "@siteSettingsSectionSite": {
-    "description": "Heading in site settings for the group holding the Permissions and Privacy rows, which open screens of their own."
+    "description": "Heading in site settings for the group holding the Behaviour, Network, Privacy and Permissions rows, which open screens of their own."
+  },
+  "homeScreenShareTitle": "Allow screen sharing?",
+  "@homeScreenShareTitle": {
+    "description": "Title of the screen sharing permission dialog"
+  },
+  "homeScreenShareBody": "{origin} wants to share your screen.\n\nWebSpace will not share your real screen: a screen capture covers everything, including your other sites in this app. You can instead pick an image or video that the site sees as the shared screen. Your choice is remembered for this site.",
+  "@homeScreenShareBody": {
+    "description": "Body of the screen sharing permission dialog, explaining that the real screen is never shared and that a picked image or video can be shown instead",
+    "placeholders": {
+      "origin": {
+        "type": "String"
+      }
+    }
+  },
+  "homeScreenShareUseFileAction": "Use a media file",
+  "@homeScreenShareUseFileAction": {
+    "description": "Button in the screen sharing permission dialog to show a picked image or video to the site instead of the real screen"
+  },
+  "homeScreenShareSourceTooLarge": "That file is too large. Choose one under 24 MB.",
+  "@homeScreenShareSourceTooLarge": {
+    "description": "Error shown when the picked simulated-screen file exceeds the size limit (24 MB)"
+  },
+  "homeScreenShareSourceError": "Could not use that file. Choose an image or video.",
+  "@homeScreenShareSourceError": {
+    "description": "Error shown when the picked simulated-screen file can't be used (wrong type or unreadable)"
+  },
+  "siteSettingsScreenShare": "Screen sharing",
+  "@siteSettingsScreenShare": {
+    "description": "List tile label and hint title for the per-site screen sharing setting."
+  },
+  "siteSettingsScreenShareHint": "Controls whether this site may capture your screen.\n\nWebSpace never shares your real screen. A screen capture covers the whole surface, so it would also show your other sites in this app. The site can instead be shown an image or video you pick.\n\nAsk (default): a popup asks the first time, then remembers your choice.\nMedia file: show the chosen file to the site as the shared screen.\nAlways block: reject every request.",
+  "@siteSettingsScreenShareHint": {
+    "description": "Hint body describing the per-site screen sharing setting: the real screen is never shared because a capture would also show the user's other sites; a picked image or video can be shown instead."
+  },
+  "siteSettingsScreenShareAsk": "Ask",
+  "@siteSettingsScreenShareAsk": {
+    "description": "Screen sharing option: ask each time."
+  },
+  "siteSettingsScreenShareVirtual": "Simulated screen",
+  "@siteSettingsScreenShareVirtual": {
+    "description": "Screen sharing option: show a picked image or video to the site as the shared screen instead of the real screen"
+  },
+  "siteSettingsScreenShareBlock": "Always block",
+  "@siteSettingsScreenShareBlock": {
+    "description": "Screen sharing option: always block."
+  },
+  "siteSettingsScreenShareNoSource": "No file chosen",
+  "@siteSettingsScreenShareNoSource": {
+    "description": "Placeholder shown in per-site settings when no simulated-screen file has been chosen yet"
+  },
+  "siteSettingsScreenShareChooseSource": "Choose media file",
+  "@siteSettingsScreenShareChooseSource": {
+    "description": "Button in per-site settings to pick the image or video shown as the simulated screen"
+  },
+  "permissionScreenShareNeverReal": "Not available. A screen capture covers the whole screen, so it would also show your other sites.",
+  "@permissionScreenShareNeverReal": {
+    "description": "Shown on the greyed-out Allowed option for screen sharing, stating that the real screen is never shared because a capture would also show the user's other sites."
+  },
+  "siteSettingsDnsBlocklistLevel": "Blocklist level",
+  "@siteSettingsDnsBlocklistLevel": {
+    "description": "Title of the per-site row that picks how strict the DNS blocklist is for this site."
+  },
+  "siteSettingsDnsBlocklistLevelHint": "Each level blocks more domains than the one below it. Lower it for a site the blocklist breaks, so it keeps some protection instead of none. A level the app has not downloaded yet is fetched when you pick it.",
+  "@siteSettingsDnsBlocklistLevelHint": {
+    "description": "Explanation shown in the hint dialog next to the per-site blocklist level row."
+  },
+  "siteSettingsDnsLevelFollowAppShort": "App",
+  "@siteSettingsDnsLevelFollowAppShort": {
+    "description": "Label under the leftmost stop of the per-site blocklist level slider, meaning the site tracks the app-wide level. It sits in a row of six tick labels, so keep it to one short word; the row's subtitle spells the setting out in full."
+  },
+  "siteSettingsDnsLevelFollowsApp": "Same as app settings ({level})",
+  "@siteSettingsDnsLevelFollowsApp": {
+    "description": "Subtitle of the per-site blocklist level row when the site tracks the app-wide level. {level} is the level name, e.g. Pro.",
+    "placeholders": {
+      "level": {
+        "type": "String"
+      }
+    }
+  },
+  "siteSettingsDnsLevelNeedsDownload": "Not downloaded yet, using {level}",
+  "@siteSettingsDnsLevelNeedsDownload": {
+    "description": "Subtitle of the per-site blocklist level row when the chosen level has no downloaded list, so the site runs at the fallback level instead. {level} is the fallback level name.",
+    "placeholders": {
+      "level": {
+        "type": "String"
+      }
+    }
+  },
+  "siteSettingsDnsLevelDownloading": "Downloading blocklist...",
+  "@siteSettingsDnsLevelDownloading": {
+    "description": "Message shown while the list for a newly picked per-site blocklist level is being fetched."
+  },
+  "siteSettingsDnsLevelDownloadFailed": "Could not download that blocklist level",
+  "@siteSettingsDnsLevelDownloadFailed": {
+    "description": "Message shown when fetching the list for a per-site blocklist level failed."
+  },
+  "siteSettingsContentBlockerLists": "Filter lists",
+  "@siteSettingsContentBlockerLists": {
+    "description": "Title of the per-site row that picks which content blocker filter lists apply to this site."
+  },
+  "siteSettingsContentBlockerListsHint": "Turn off a list here to stop it applying to this site only. Lists stay on everywhere else. Only lists enabled in app settings can be used.",
+  "@siteSettingsContentBlockerListsHint": {
+    "description": "Explanation shown in the hint dialog next to the per-site filter lists row."
+  },
+  "siteSettingsContentBlockerListsSubtitle": "{on} of {total} on",
+  "@siteSettingsContentBlockerListsSubtitle": {
+    "description": "Subtitle of the per-site filter lists row: how many of the app's enabled filter lists apply to this site.",
+    "placeholders": {
+      "on": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "torStatusTitle": "Tor",
+  "@torStatusTitle": {
+    "description": "Title of the Tor status card in App Settings."
+  },
+  "torStatusHint": "Shows whether the embedded Tor client is running and connected. Sites set to the TOR proxy type wait for this to be connected before they load; they never fall back to a direct connection.",
+  "@torStatusHint": {
+    "description": "Hint dialog text for the Tor status card."
+  },
+  "torStatusStopped": "Not running",
+  "@torStatusStopped": {
+    "description": "Tor status: the client is not started because no site needs it."
+  },
+  "torStatusStarting": "Starting",
+  "@torStatusStarting": {
+    "description": "Tor status: the client is launching but has not begun connecting yet."
+  },
+  "torStatusBootstrapping": "Connecting… {percent}%",
+  "@torStatusBootstrapping": {
+    "description": "Tor status while it connects. {percent} is 0-100.",
+    "placeholders": {
+      "percent": {
+        "type": "int"
+      }
+    }
+  },
+  "torStatusConnected": "Connected",
+  "@torStatusConnected": {
+    "description": "Tor status: circuits are built and traffic can flow."
+  },
+  "torStatusEndpoint": "SOCKS5 on {endpoint}",
+  "@torStatusEndpoint": {
+    "description": "Shows the local address Tor is listening on, e.g. 127.0.0.1:41337.",
+    "placeholders": {
+      "endpoint": {
+        "type": "String"
+      }
+    }
+  },
+  "torStatusRebuildCircuits": "Rebuild circuits",
+  "@torStatusRebuildCircuits": {
+    "description": "Button that asks Tor for fresh circuits (a new route and exit)."
+  },
+  "torStatusPhase": "Phase: {phase}",
+  "@torStatusPhase": {
+    "description": "Which stage of connecting Tor is in, e.g. loading relay descriptors.",
+    "placeholders": {
+      "phase": {
+        "type": "String"
+      }
+    }
+  },
+  "torStateUsedBy": "Using Tor",
+  "@torStateUsedBy": {
+    "description": "Section heading on the Tor screen (opened by tapping the Tor card in App settings). Below it is the list of what currently sends traffic through Tor: sites by name, and the app's own traffic."
+  },
+  "torStateNothing": "Nothing is using Tor",
+  "@torStateNothing": {
+    "description": "Shown on the Tor screen in place of the list of sites when no site and not the app-wide proxy is set to use Tor."
+  },
+  "torStateAppWide": "All app traffic",
+  "@torStateAppWide": {
+    "description": "Row on the Tor screen's 'Using Tor' list meaning the app-wide outbound proxy is set to Tor, so the app's own requests and every site left on the default proxy go through Tor."
+  },
+  "torStateAppWideSubtitle": "The outbound proxy in App settings is set to Tor",
+  "@torStateAppWideSubtitle": {
+    "description": "Subtitle under 'All app traffic' on the Tor screen, saying where that choice was made."
+  },
+  "torStateOtherSites": "{count, plural, one{One other site} other{{count} other sites}}",
+  "@torStateOtherSites": {
+    "description": "Row on the Tor screen's 'Using Tor' list counting sites that use Tor but whose names are not shown here (for example sites in an open archive).",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "torStateExitCountryHint": "Tor leaves the network from one country at a time, for every site at once. A site picks the country in its Network settings, and opening a site pinned to a different country closes the sites that disagree.",
+  "@torStateExitCountryHint": {
+    "description": "Explanation behind the hint button on the 'Exit country' row of the Tor screen. The row shows the country Tor's traffic currently exits from, or 'Any country'."
+  },
+  "torStateBridgesOff": "Off",
+  "@torStateBridgesOff": {
+    "description": "Subtitle of the 'Bridges' row on the Tor screen when Tor connects without bridges. When bridges are on, the row shows the transport's name instead."
+  },
+  "torStateCircuits": "Circuits",
+  "@torStateCircuits": {
+    "description": "Row title on the Tor screen. A circuit is the path through the Tor network that traffic takes."
+  },
+  "torStateCircuitsPerSite": "One per site",
+  "@torStateCircuitsPerSite": {
+    "description": "Subtitle of the 'Circuits' row on the Tor screen: each site gets its own Tor circuit."
+  },
+  "torStateCircuitsHint": "Each site, and the app's own traffic, gets its own path through Tor, so a website cannot link two of your sites by the address they arrive from. Rebuild circuits gives every one of them a new path.",
+  "@torStateCircuitsHint": {
+    "description": "Explanation behind the hint button on the 'Circuits' row of the Tor screen. 'Rebuild circuits' is the name of a button on the same screen."
+  },
+  "torUnavailableTitle": "Tor is not available on this device",
+  "@torUnavailableTitle": {
+    "description": "Heading shown in place of a site that is set to use Tor, on a device with no built-in Tor client."
+  },
+  "torUnavailableBody": "The built-in Tor client runs on iOS and macOS only. This site is set to use Tor, so it stays blocked rather than loading over your real IP address. Change its proxy in the site's settings to open it here.",
+  "@torUnavailableBody": {
+    "description": "Explains why a site set to use Tor shows nothing on a platform without a Tor client, and what the user can do about it."
+  },
+  "torFailOfflineTitle": "No network",
+  "@torFailOfflineTitle": {
+    "description": "Tor failure heading: nothing on the network answered."
+  },
+  "torFailOfflineBody": "Tor could not reach anything. Check the device's connection, then try again.",
+  "@torFailOfflineBody": {
+    "description": "Tor failure explanation and remedy for having no network."
+  },
+  "torFailCensoredTitle": "Tor appears to be blocked",
+  "@torFailCensoredTitle": {
+    "description": "Tor failure heading: the network is filtering Tor."
+  },
+  "torFailCensoredBody": "This network answers, but not for Tor: the relays it needs are unreachable. Bridges route around a block like this; a different network also works.",
+  "@torFailCensoredBody": {
+    "description": "Tor failure explanation for a censored or filtered network."
+  },
+  "torFailClockSkewTitle": "The device clock is wrong",
+  "@torFailClockSkewTitle": {
+    "description": "Tor failure heading: the system clock is too far off for Tor."
+  },
+  "torFailClockSkewBody": "Tor refuses to build circuits while the clock is off by too much. Correct the date and time, then try again.",
+  "@torFailClockSkewBody": {
+    "description": "Tor failure explanation and remedy for clock skew."
+  },
+  "torFailExitPolicyTitle": "No usable exit in that country",
+  "@torFailExitPolicyTitle": {
+    "description": "Tor failure heading: the pinned exit country has no working exit."
+  },
+  "torFailExitPolicyBody": "The exit country is pinned strictly, so Tor will not leave from anywhere else. Pick another country, or set it back to any country.",
+  "@torFailExitPolicyBody": {
+    "description": "Tor failure explanation and remedy for a strict exit-country pin."
+  },
+  "torFailExitCountryDataTitle": "Country list unavailable",
+  "@torFailExitCountryDataTitle": {
+    "description": "Tor failure heading: a site pins the country its Tor traffic exits from, and the list mapping Tor relays to countries could not be downloaded, so the pin could not be applied."
+  },
+  "torFailExitCountryDataBody": "Pinning an exit country needs a list of which relays are in which country. It is downloaded through Tor on first use, and that download failed. Try again, or set the exit country back to any country.",
+  "@torFailExitCountryDataBody": {
+    "description": "Tor failure explanation and remedy when the relay-to-country list (downloaded through Tor the first time a site pins an exit country) could not be fetched. Retry is offered on the same screen."
+  },
+  "torFailControlChannelTitle": "Could not talk to Tor",
+  "@torFailControlChannelTitle": {
+    "description": "Tor failure heading: the app failed to reach Tor's control channel."
+  },
+  "torFailControlChannelBody": "The app could not reach Tor's control channel, so it cannot tell whether traffic is protected. This is a defect in the app rather than something to configure; the details are in Developer Tools.",
+  "@torFailControlChannelBody": {
+    "description": "Tor failure explanation for an internal control-channel failure."
+  },
+  "torFailTimeoutTitle": "Tor took too long",
+  "@torFailTimeoutTitle": {
+    "description": "Tor failure heading: bootstrap ran past its deadline."
+  },
+  "torFailTimeoutBody": "Connecting did not finish in time. A slow or busy network can cause this; trying again often works.",
+  "@torFailTimeoutBody": {
+    "description": "Tor failure explanation and remedy for a bootstrap timeout."
+  },
+  "torFailRuntimeTitle": "Tor stopped unexpectedly",
+  "@torFailRuntimeTitle": {
+    "description": "Tor failure heading: an unclassified runtime failure."
+  },
+  "torFailRuntimeBody": "Tor stopped for a reason the app does not recognise. The raw message is below and in Developer Tools.",
+  "@torFailRuntimeBody": {
+    "description": "Tor failure explanation for an unrecognised runtime failure."
+  },
+  "torFailExternalTitle": "External tor not answering",
+  "@torFailExternalTitle": {
+    "description": "Tor failure heading: the Tor program already running on the device, which the Tor (external) setting points at, did not answer at its address, or something other than Tor answered there."
+  },
+  "torFailExternalBody": "Nothing at the Tor SOCKS address answered as tor. Start Orbot, InviZible, Arti or the tor service, or correct the address in Developer settings, then try again.",
+  "@torFailExternalBody": {
+    "description": "Tor failure explanation when the external Tor program did not answer. 'Tor SOCKS address' is the name of the setting row; Orbot and InviZible are Android apps, Arti is Tor's Rust implementation; keep the names."
+  },
+  "torFailExternalPinTitle": "Exit country unavailable",
+  "@torFailExternalPinTitle": {
+    "description": "Tor failure heading: a site has an exit country set, and the Tor in use is one already running on the device, which this app cannot tell which country to leave from."
+  },
+  "torFailExternalPinBody": "A site here has an exit country, and the external tor chooses its own exits. Set the site's exit country back to any country, or set ExitNodes in that tor.",
+  "@torFailExternalPinBody": {
+    "description": "Tor failure explanation for an exit country that cannot be applied to an external Tor program. ExitNodes is a Tor configuration option name; keep it as written."
+  },
+  "torFailTransientNote": "Tor expects to recover from this on its own.",
+  "@torFailTransientNote": {
+    "description": "Shown when Tor marks a failure as one it can recover from unaided."
+  },
+  "torBridgesTitle": "Bridges",
+  "@torBridgesTitle": {
+    "description": "Title of the Tor bridges settings screen."
+  },
+  "torBridgesHint": "A bridge is an unlisted way into the Tor network, for use where Tor itself is blocked. Bridges are slower than the normal route, so leave this off unless Tor cannot connect without it.",
+  "@torBridgesHint": {
+    "description": "Hint dialog explaining what Tor bridges are and when to use them."
+  },
+  "torBridgesEnable": "Use bridges",
+  "@torBridgesEnable": {
+    "description": "Switch that turns bridge use on or off."
+  },
+  "torBridgesTransport": "Transport",
+  "@torBridgesTransport": {
+    "description": "Label for the pluggable-transport picker (obfs4, snowflake, and so on)."
+  },
+  "torBridgesLinesHeading": "Bridge lines",
+  "@torBridgesLinesHeading": {
+    "description": "Heading above the list of configured bridge lines."
+  },
+  "torBridgesNoLines": "No bridge lines added",
+  "@torBridgesNoLines": {
+    "description": "Shown when the user has configured no bridges yet."
+  },
+  "torBridgesBuiltInLine": "This transport uses a built-in bridge, so there is no need to add one.",
+  "@torBridgesBuiltInLine": {
+    "description": "Shown in place of the bridge-line list for a transport the app already carries a published bridge line for (snowflake, meek_lite), so an empty list is correct rather than a missing step."
+  },
+  "torBridgesPasteLabel": "Paste a bridge line",
+  "@torBridgesPasteLabel": {
+    "description": "Label of the text field where a bridge line is entered."
+  },
+  "torBridgesAdd": "Add",
+  "@torBridgesAdd": {
+    "description": "Button that adds the pasted bridge line to the list."
+  },
+  "torBridgesRemove": "Remove this bridge",
+  "@torBridgesRemove": {
+    "description": "Tooltip on the button that deletes one bridge line."
+  },
+  "torBridgesFetch": "Get bridges automatically",
+  "@torBridgesFetch": {
+    "description": "Button that requests bridges from the Tor Project over Moat."
+  },
+  "torBridgesFetchExposure": "Requesting bridges contacts the Tor Project directly, without going through Tor — the network you are on can see that you asked for bridges. Pasting a line you obtained elsewhere does not.",
+  "@torBridgesFetchExposure": {
+    "description": "LEAK-010 disclosure shown next to the automatic bridge fetch."
+  },
+  "torBridgesFetching": "Requesting bridges…",
+  "@torBridgesFetching": {
+    "description": "Progress text while bridges are being fetched."
+  },
+  "torBridgesAdded": "Bridges added: {count}",
+  "@torBridgesAdded": {
+    "description": "Confirmation after fetching. {count} is how many were added.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "torBridgesCaptchaTitle": "Prove you are human",
+  "@torBridgesCaptchaTitle": {
+    "description": "Title of the captcha dialog shown when the bridge service asks for one."
+  },
+  "torBridgesCaptchaHelp": "Type the characters shown in the image.",
+  "@torBridgesCaptchaHelp": {
+    "description": "Instruction above the captcha answer field."
+  },
+  "torBridgesCaptchaAnswer": "Answer",
+  "@torBridgesCaptchaAnswer": {
+    "description": "Label of the captcha answer text field."
+  },
+  "torBridgesRestartNeeded": "Tor is running. Restart it for this change to take effect.",
+  "@torBridgesRestartNeeded": {
+    "description": "Notice shown when bridges are edited while Tor is already connected."
+  },
+  "torBridgesRestartNow": "Restart Tor",
+  "@torBridgesRestartNow": {
+    "description": "Button that restarts Tor so an edited bridge configuration applies."
+  },
+  "torBridgeErrorEmpty": "Enter a bridge line.",
+  "@torBridgeErrorEmpty": {
+    "description": "Validation error when the bridge-line field is empty."
+  },
+  "torBridgeErrorTransport": "That transport is not one this app can run. Bridge lines must start with obfs4, snowflake, meek_lite or webtunnel.",
+  "@torBridgeErrorTransport": {
+    "description": "Validation error for an unknown or unsupported pluggable transport."
+  },
+  "torBridgeErrorAddress": "That line is missing the address, or it is not in host:port form.",
+  "@torBridgeErrorAddress": {
+    "description": "Validation error for a bridge line whose address is missing or malformed."
+  },
+  "torBridgeErrorCert": "That obfs4 line is missing its cert= value, so it cannot connect. Copy the whole line.",
+  "@torBridgeErrorCert": {
+    "description": "Validation error for an obfs4 bridge line with no certificate."
+  },
+  "torMoatErrorUnreachable": "Could not reach the bridge service. On a network that blocks Tor this is expected — paste a bridge line obtained another way instead.",
+  "@torMoatErrorUnreachable": {
+    "description": "Error when the Moat bridge service cannot be contacted."
+  },
+  "torMoatErrorMalformed": "The bridge service replied in a way this app did not understand.",
+  "@torMoatErrorMalformed": {
+    "description": "Error when the Moat response cannot be parsed."
+  },
+  "torMoatErrorNoBridges": "The bridge service returned nothing this app can use.",
+  "@torMoatErrorNoBridges": {
+    "description": "Error when Moat returns only bridges for transports the app cannot run."
+  },
+  "proxyAuthTitle": "Proxy authentication",
+  "@proxyAuthTitle": {
+    "description": "Title of the expandable section holding the username and password sent to the proxy server. Shown in both per-site settings and app settings."
+  },
+  "proxyAuthNone": "Not configured",
+  "@proxyAuthNone": {
+    "description": "Subtitle of the proxy authentication section when neither a username nor a password is stored."
+  },
+  "proxyAuthIncomplete": "Needs both a username and a password",
+  "@proxyAuthIncomplete": {
+    "description": "Warning subtitle shown when only one of the proxy username and password is filled in. The app authenticates to a proxy only when both are present, so a half-filled pair would connect with no credentials at all."
+  },
+  "proxyAuthUsername": "Proxy username",
+  "@proxyAuthUsername": {
+    "description": "Label for the text field holding the username sent to the proxy server."
+  },
+  "proxyAuthPassword": "Proxy password",
+  "@proxyAuthPassword": {
+    "description": "Label for the text field holding the password sent to the proxy server."
+  },
+  "proxyTestRun": "Test connection",
+  "@proxyTestRun": {
+    "description": "Button that sends one request through the proxy being configured, to check that it works."
+  },
+  "proxyTestHint": "Sends one small request through this proxy and reports what comes back, so a wrong address or a rejected password can be told apart from a site that is simply down.",
+  "@proxyTestHint": {
+    "description": "Explanation shown behind the hint button next to the proxy connection test button."
+  },
+  "unproxiedBlockTitle": "Request not sent",
+  "@unproxiedBlockTitle": {
+    "description": "Heading of the screen shown in place of a page after the app cancelled a navigation because it could not establish that the request would go through the site's proxy. It is not an error about the proxy or the network: nothing was sent."
+  },
+  "unproxiedBlockBody": "{site} is set to use a proxy, but the app could not establish that this request would go through it. Making the request anyway would have shown your device IP address to the other end, so it was not made.",
+  "@unproxiedBlockBody": {
+    "description": "Body of the blocked-navigation screen. {site} is the name the user gave the site. Do not render this as the proxy having failed or the site being unreachable: the request was never sent.",
+    "placeholders": {
+      "site": {
+        "type": "String"
+      }
+    }
+  },
+  "unproxiedBlockDestination": "Destination: {host}",
+  "@unproxiedBlockDestination": {
+    "description": "Names the host the cancelled navigation was headed to, on the blocked-navigation screen. {host} is a hostname such as example.org.",
+    "placeholders": {
+      "host": {
+        "type": "String"
+      }
+    }
+  },
+  "unproxiedBlockWhy": "A proxy set for a site covers the request a page is opened with. This one came afterwards, from inside the page, and there is no way here to show that it would be proxied too.",
+  "@unproxiedBlockWhy": {
+    "description": "Second paragraph of the blocked-navigation screen, explaining why only some requests can be shown to go through the proxy. Keep it about what can be established, not about the proxy working or failing."
+  },
+  "unproxiedBlockBack": "Go back",
+  "@unproxiedBlockBack": {
+    "description": "Button on the blocked-navigation screen that returns to the page the user was already on."
+  },
+  "unproxiedBlockProxySettings": "Proxy settings",
+  "@unproxiedBlockProxySettings": {
+    "description": "Button on the blocked-navigation screen that opens this site's own proxy settings."
+  },
+  "proxyTestOk": "The proxy works",
+  "@proxyTestOk": {
+    "description": "Result shown when the test request came back through the proxy successfully."
+  },
+  "proxyTestAuthRejected": "The proxy rejected these credentials",
+  "@proxyTestAuthRejected": {
+    "description": "Result shown when the proxy answered but refused the username and password."
+  },
+  "proxyTestUnreachable": "Could not reach the proxy",
+  "@proxyTestUnreachable": {
+    "description": "Result shown when the proxy could not be contacted at all: wrong address, nothing listening, or no answer before the deadline."
+  },
+  "tabsTooltip": "Tabs",
+  "@tabsTooltip": {
+    "description": "Tooltip on the app-bar button that shows how many tabs the current site has and opens the tab list."
+  },
+  "tabsSheetTitle": "{name} · {count, plural, =1{1 tab} other{{count} tabs}}",
+  "@tabsSheetTitle": {
+    "description": "Heading of the tab list: the site's name and how many tabs it holds. The middle dot separates them.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      },
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "tabsNewTab": "New tab",
+  "@tabsNewTab": {
+    "description": "Button that opens a new tab at the site's home page. The tab the user was on is kept and parked."
+  },
+  "tabsThisSite": "This site",
+  "@tabsThisSite": {
+    "description": "Tab-list filter showing only the current site's tabs."
+  },
+  "tabsAllSites": "All sites",
+  "@tabsAllSites": {
+    "description": "Tab-list filter showing the tabs of every site."
+  },
+  "tabsMemoryNote": "One tab per site stays loaded; the others reload when opened",
+  "@tabsMemoryNote": {
+    "description": "Footer of the tab list. Each site keeps at most one tab loaded in memory (the one it is showing); every other tab is stored and its page loads again when the user opens it, so a long list costs little memory."
+  },
+  "tabsCloseTab": "Close tab",
+  "@tabsCloseTab": {
+    "description": "Tooltip on the button that closes one tab. Any tabs opened from it move up to its own parent."
+  },
+  "tabsCloseSubtree": "Close tab and the tabs opened from it",
+  "@tabsCloseSubtree": {
+    "description": "Tooltip on the button that closes a tab together with every tab opened from it."
+  },
+  "tabsLive": "open",
+  "@tabsLive": {
+    "description": "Read by a screen reader for the one tab of the current site that is loaded and on screen; sighted users see it drawn at full strength and highlighted. The others are stored."
+  },
+  "tabsLoaded": "loaded",
+  "@tabsLoaded": {
+    "description": "Read by a screen reader for a tab whose page is loaded in memory but paused, because its site is not the one on screen; sighted users see it drawn at full strength while stored tabs are faded."
+  },
+  "tabsExpand": "Show the tabs opened from this one",
+  "@tabsExpand": {
+    "description": "Tooltip on the control that reveals a tab's children in the list."
+  },
+  "tabsCollapse": "Hide the tabs opened from this one",
+  "@tabsCollapse": {
+    "description": "Tooltip on the control that hides a tab's children in the list."
+  },
+  "tabsHiddenChildren": "{count, plural, =1{1 tab hidden} other{{count} tabs hidden}}",
+  "@tabsHiddenChildren": {
+    "description": "Shown under a collapsed tab, saying how many tabs opened from it are hidden.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "tabsOpenInNewTab": "Open in new tab",
+  "@tabsOpenInNewTab": {
+    "description": "Menu item shown after a long press on a link: opens it in a new tab in the background, leaving the current page on screen."
+  },
+  "tabsOpenedInNewTab": "Opened in a new tab",
+  "@tabsOpenedInNewTab": {
+    "description": "Confirmation shown after a link was opened in a background tab."
+  },
+  "tabsSwitchAction": "Switch",
+  "@tabsSwitchAction": {
+    "description": "Action on the confirmation that opens the tab that was just created in the background."
+  },
+  "tabsInSite": "In {site}",
+  "@tabsInSite": {
+    "description": "Heading in a site's tab list over another site's tabs, listed there because some of them run as this site: a link or a search in that other site opened them. {site} is the other site's name, for example 'In DuckDuckGo'.",
+    "placeholders": {
+      "site": {
+        "type": "String",
+        "example": "DuckDuckGo"
+      }
+    }
+  },
+  "tabsMoreInSite": "{count, plural, =1{1 more {site} tab} other{{count} more {site} tabs}}",
+  "@tabsMoreInSite": {
+    "description": "Tappable line at the end of another site's tabs in a site's tab list. Only the tabs that run as this site, and the tabs above them, are shown; this says how many of the other site's tabs are folded away, and tapping it shows them all. {site} is the other site's name, for example '3 more GitHub tabs'.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      },
+      "site": {
+        "type": "String",
+        "example": "GitHub"
+      }
+    }
+  },
+  "tabsWhereYouWere": "where you were",
+  "@tabsWhereYouWere": {
+    "description": "Added after a tab's web address in the tab list, on the tab the user was on before opening a tab of another site from this list. Tapping that tab, or pressing Back at the start of the new one, goes back to it. Lowercase unless the language requires otherwise."
+  },
+  "tabsRunsAs": "as {site}",
+  "@tabsRunsAs": {
+    "description": "In the tab list, beside a tab's web address: the tab belongs to the current site's list but runs as another of the user's sites, with that site's sign-in and settings. {site} is that site's name, for example 'as DuckDuckGo'. Lowercase unless the language requires otherwise.",
+    "placeholders": {
+      "site": {
+        "type": "String",
+        "example": "DuckDuckGo"
+      }
+    }
+  },
+  "tabsLinkOutsideSite": "{host} belongs to another site, so it opens on top of this one instead of in a tab",
+  "@tabsLinkOutsideSite": {
+    "description": "Explains why a long-pressed link cannot become a tab: a tab always stays within its own site.",
+    "placeholders": {
+      "host": {
+        "type": "String"
+      }
+    }
+  },
+  "httpAuthTitle": "Sign in",
+  "@httpAuthTitle": {
+    "description": "Title of the dialog shown when a website's server requires a username and password before it will show the page (HTTP authentication, for example a folder protected by an htpasswd file)."
+  },
+  "httpAuthBody": "{host} is asking for a username and password.",
+  "@httpAuthBody": {
+    "description": "Body of the HTTP authentication sign-in dialog, naming the server that asked for credentials.",
+    "placeholders": {
+      "host": {
+        "type": "String",
+        "example": "nas.example.com"
+      }
+    }
+  },
+  "httpAuthRejected": "That username and password were not accepted.",
+  "@httpAuthRejected": {
+    "description": "Error line in the HTTP authentication sign-in dialog when it reopens because the server refused the username and password that were sent last time."
+  },
+  "httpAuthUsername": "Username",
+  "@httpAuthUsername": {
+    "description": "Label of the username text field in the HTTP authentication sign-in dialog."
+  },
+  "httpAuthPassword": "Password",
+  "@httpAuthPassword": {
+    "description": "Label of the password text field in the HTTP authentication sign-in dialog."
+  },
+  "httpAuthRemember": "Remember for this site",
+  "@httpAuthRemember": {
+    "description": "Checkbox in the HTTP authentication sign-in dialog. When ticked, the username and password are saved on this device so the site signs in by itself next time."
+  },
+  "httpAuthSignIn": "Sign in",
+  "@httpAuthSignIn": {
+    "description": "Button in the HTTP authentication sign-in dialog that sends the typed username and password to the server."
+  },
+  "siteSettingsSavedSignIns": "Saved sign-ins",
+  "@siteSettingsSavedSignIns": {
+    "description": "Title of the site settings row listing usernames and passwords saved from the HTTP authentication sign-in dialog for this site."
+  },
+  "siteSettingsSavedSignInsCount": "{count, plural, =1{1 saved} other{{count} saved}}",
+  "@siteSettingsSavedSignInsCount": {
+    "description": "Subtitle of the Saved sign-ins row in site settings: how many username and password pairs are saved for this site. Never shown for zero; siteSettingsSavedSignInsNone is shown instead.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "siteSettingsSavedSignInsNone": "None",
+  "@siteSettingsSavedSignInsNone": {
+    "description": "Subtitle of the Saved sign-ins row in site settings when no username and password is saved for this site."
+  },
+  "siteSettingsSavedSignInsHint": "When this site's server asks for a username and password (HTTP authentication, such as a folder protected by an htpasswd file), a sign-in dialog opens. Ticking \"Remember for this site\" keeps that sign-in in this device's secure storage, where only this site can use it. Saved sign-ins are never included in settings backups or shared QR codes. Clearing them does not sign out a page that is already open.",
+  "@siteSettingsSavedSignInsHint": {
+    "description": "Explanation shown in the hint dialog of the Saved sign-ins row in site settings. Explains when the sign-in dialog appears, where remembered usernames and passwords are kept, that backups never contain them, and that clearing them does not end a session already open."
+  },
+  "siteSettingsSavedSignInsClearTitle": "Forget saved sign-ins for this site?",
+  "@siteSettingsSavedSignInsClearTitle": {
+    "description": "Title of the confirmation dialog shown before deleting every username and password saved for this site from the HTTP authentication sign-in dialog."
+  },
+  "savedProxiesTitle": "Saved proxies",
+  "@savedProxiesTitle": {
+    "description": "Title of the App Settings row and of the screen listing proxies the user configured once so several sites can use the same one (for example one VPN for several sites)."
+  },
+  "savedProxiesHint": "A saved proxy is a gateway, meaning a proxy's type and address, plus the credentials to sign in with. Save one and pick it by name in any site's Network settings or as the app-wide proxy. When a gateway or a set of credentials is shared, for example one account that works on several gateways, or several accounts on one gateway, save it under Gateways or Credentials. A saved proxy or a site can then pick it, and editing it changes everything that uses it. Credentials list the gateways they work on and can only be paired with those. Deleting an entry blocks what uses it until you pick something else, rather than sending it out directly. Passwords stay in this device's secure storage and are never included in backups.",
+  "@savedProxiesHint": {
+    "description": "Explanation shown in the hint dialog of the Saved proxies row in App Settings and on the Saved proxies screen: what a saved proxy, a gateway and a set of credentials are, how they combine, what editing and deleting do, and where passwords are kept."
+  },
+  "savedProxiesCount": "{count, plural, =0{None saved} =1{1 saved} other{{count} saved}}",
+  "@savedProxiesCount": {
+    "description": "Subtitle of the Saved proxies row in App Settings: how many entries (saved proxies, gateways and credentials together) the user has saved.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "savedProxiesAdd": "Add proxy",
+  "@savedProxiesAdd": {
+    "description": "Label of the floating button on the Saved proxies screen that opens the form for a new saved proxy."
+  },
+  "savedProxiesCheckAll": "Check all proxies",
+  "@savedProxiesCheckAll": {
+    "description": "Tooltip of the toolbar button on the Saved proxies screen that checks again whether every saved proxy can be reached."
+  },
+  "savedProxyUsage": "{count, plural, =0{Not used by any site} =1{Used by 1 site} other{Used by {count} sites}}",
+  "@savedProxyUsage": {
+    "description": "Line under a saved proxy in the Saved proxies list: how many of the user's sites are set to use it.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "savedProxyUsageWithAppWide": "{count, plural, =0{Used as the app-wide proxy} =1{Used by 1 site and as the app-wide proxy} other{Used by {count} sites and as the app-wide proxy}}",
+  "@savedProxyUsageWithAppWide": {
+    "description": "Line under a saved proxy in the Saved proxies list when the app-wide proxy is also set to it: how many sites use it, and that the app-wide proxy does too.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "savedProxyNew": "New proxy",
+  "@savedProxyNew": {
+    "description": "Title of the form for adding a saved proxy."
+  },
+  "savedProxyName": "Name",
+  "@savedProxyName": {
+    "description": "Label of the text field holding the name the user gives a saved proxy, such as the name of their VPN. The name is what sites' proxy pickers show."
+  },
+  "savedProxyNameRequired": "Enter a name",
+  "@savedProxyNameRequired": {
+    "description": "Error under the name field of the saved proxy form when it is left empty."
+  },
+  "savedProxyDeleteTitle": "Delete {name}?",
+  "@savedProxyDeleteTitle": {
+    "description": "Title of the confirmation dialog shown before deleting a saved proxy. {name} is the name the user gave it.",
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "savedProxyDeleteBody": "{count, plural, =0{No site uses it.} =1{1 site uses it and will be blocked until you pick something else for it.} other{{count} sites use it and will be blocked until you pick something else for them.}}",
+  "@savedProxyDeleteBody": {
+    "description": "Body of the confirmation dialog shown before deleting a saved proxy, gateway or set of credentials: how many sites use it, and that those sites stop loading rather than connecting without a proxy.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "savedProxyDeleteAppWide": "The app-wide proxy uses it too, so the app's own downloads and every site without a proxy of its own will be blocked as well.",
+  "@savedProxyDeleteAppWide": {
+    "description": "Extra paragraph in the delete confirmation for a saved proxy that the app-wide proxy is set to."
+  },
+  "savedProxyMissing": "Missing saved proxy",
+  "@savedProxyMissing": {
+    "description": "Shown in place of a saved proxy's name when a site or the app-wide proxy names a saved proxy that was deleted. Such a site does not load until another proxy is picked."
+  },
+  "proxyStatusChecking": "Checking the proxy…",
+  "@proxyStatusChecking": {
+    "description": "Status line of the connection indicator while it is sending a request through a proxy to see whether it answers."
+  },
+  "proxyStatusCheckAgain": "Check again",
+  "@proxyStatusCheckAgain": {
+    "description": "Tooltip of the small button beside the connection indicator that checks the proxy again now."
+  },
+  "siteInfoConnection": "Connection",
+  "@siteInfoConnection": {
+    "description": "Label of the row in the site info sheet that names the route the site's traffic takes: no proxy, the app-wide proxy, a saved proxy, the site's own proxy or Tor."
+  },
+  "siteInfoConnectionDirect": "Direct, no proxy",
+  "@siteInfoConnectionDirect": {
+    "description": "Value of the Connection row in the site info sheet when the site's traffic goes out without any proxy."
+  },
+  "proxyLibraryGateways": "Gateways",
+  "@proxyLibraryGateways": {
+    "description": "Heading of the list of saved gateways on the Saved proxies screen, and of the saved gateways in proxy pickers. A gateway is a proxy's type and address (host and port), without credentials."
+  },
+  "proxyLibraryCredentials": "Credentials",
+  "@proxyLibraryCredentials": {
+    "description": "Heading of the list of saved usernames and passwords on the Saved proxies screen, and label of the row that picks which credentials to sign in to a gateway with."
+  },
+  "proxyLibraryNone": "None yet",
+  "@proxyLibraryNone": {
+    "description": "Shown under a heading on the Saved proxies screen when that list (saved proxies, gateways or credentials) is empty."
+  },
+  "proxyLibraryAddGateway": "Add gateway",
+  "@proxyLibraryAddGateway": {
+    "description": "Button beside the Gateways heading on the Saved proxies screen that opens the form for a new gateway."
+  },
+  "proxyLibraryAddCredentials": "Add credentials",
+  "@proxyLibraryAddCredentials": {
+    "description": "Button beside the Credentials heading on the Saved proxies screen that opens the form for a new username and password."
+  },
+  "proxyLibraryNewGateway": "New gateway",
+  "@proxyLibraryNewGateway": {
+    "description": "Title of the form for adding a gateway (a proxy's type and address)."
+  },
+  "proxyLibraryNewCredentials": "New credentials",
+  "@proxyLibraryNewCredentials": {
+    "description": "Title of the form for adding saved credentials (a username and password for proxies)."
+  },
+  "proxyLibraryGateway": "Gateway",
+  "@proxyLibraryGateway": {
+    "description": "Label of the picker in the saved proxy form that chooses the gateway: a saved gateway, or a type (HTTP, HTTPS, SOCKS5) with an address typed below."
+  },
+  "proxyLibraryCredentialsTyped": "Enter below",
+  "@proxyLibraryCredentialsTyped": {
+    "description": "Option in the credentials picker meaning the username and password are typed into the fields below rather than taken from saved credentials. Leaving the fields empty means no credentials."
+  },
+  "proxyLibraryWorksOn": "Works on",
+  "@proxyLibraryWorksOn": {
+    "description": "Heading above the list of saved gateways in the credentials form; the user ticks the gateways these credentials can sign in to."
+  },
+  "proxyLibraryWorksOnRequired": "Pick at least one gateway",
+  "@proxyLibraryWorksOnRequired": {
+    "description": "Error in the credentials form when no gateway is ticked: credentials can only be used with gateways they list."
+  },
+  "proxyLibraryWorksOnList": "Works on {gateways}",
+  "@proxyLibraryWorksOnList": {
+    "description": "Line under saved credentials in the Saved proxies list naming the gateways they can sign in to. {gateways} is a comma-separated list of gateway names.",
+    "placeholders": {
+      "gateways": {
+        "type": "String"
+      }
+    }
+  },
+  "proxyLibraryNoGateways": "Add a gateway first.",
+  "@proxyLibraryNoGateways": {
+    "description": "Shown in the credentials form when there are no saved gateways to pair the credentials with."
+  },
+  "proxyLibraryGatewayMissing": "Missing gateway",
+  "@proxyLibraryGatewayMissing": {
+    "description": "Shown in place of a gateway's name when a site or saved proxy uses a saved gateway that was deleted. Such a site does not load until another is picked."
+  },
+  "proxyLibraryCredentialsMissing": "Missing credentials",
+  "@proxyLibraryCredentialsMissing": {
+    "description": "Shown when a site or saved proxy signs in with saved credentials that were deleted. Such a site does not load until other credentials are picked."
+  },
+  "proxyLibraryCredentialsMismatch": "Credentials don't fit this gateway",
+  "@proxyLibraryCredentialsMismatch": {
+    "description": "Shown when saved credentials are paired with a gateway they do not list as one they work on. Such a site does not load until the pairing is fixed."
+  },
+  "appSettingsBackgroundLog": "Background log",
+  "@appSettingsBackgroundLog": {
+    "description": "Title of a developer-mode row in App Settings that opens the background log: a record of what the app did while it was not on screen (scheduled refreshes, wakes, notifications)."
+  },
+  "appSettingsBackgroundLogHint": "Records what happens while WebSpace is not on screen: leaving and returning, the background refresh the system schedules, each wake and the notifications it posts, including steps iOS and Android run before the app starts. Kept across restarts while developer mode is on; turning it off deletes the log. Entries that name a site, a page title or notification text stay in memory and never reach a file.",
+  "@appSettingsBackgroundLogHint": {
+    "description": "Explanation behind the hint button of the Background log row in App Settings. Says what the log records, that it persists across restarts only while developer mode is on, that turning developer mode off deletes it, and that entries naming sites stay in memory."
+  },
+  "devToolsTabBackground": "Background",
+  "@devToolsTabBackground": {
+    "description": "Tab label in Developer Tools for the background log (what the app did while it was not on screen). Shown only in developer mode."
+  },
+  "devToolsBackgroundSystemState": "System state",
+  "@devToolsBackgroundSystemState": {
+    "description": "Header of an expandable list in the Background tab of Developer Tools that shows operating-system settings that decide whether background refreshes and notifications can run (notification permission, background refresh, battery restrictions)."
+  },
+  "devToolsBackgroundEmpty": "No background events recorded yet",
+  "@devToolsBackgroundEmpty": {
+    "description": "Empty-state text in the Background tab of Developer Tools when nothing has been recorded while the app was in the background."
+  },
+  "devToolsBackgroundSensitiveShow": "Show entries that name sites (names, page titles, notification text)",
+  "@devToolsBackgroundSensitiveShow": {
+    "description": "Label next to a switch in the Background tab of Developer Tools. Turning it on also shows the log entries that name sites or carry page titles and notification text."
+  },
+  "devToolsBackgroundSensitiveShowing": "Showing entries that name sites. They are kept in memory only and reset on app restart.",
+  "@devToolsBackgroundSensitiveShowing": {
+    "description": "Label next to the switch in the Background tab of Developer Tools while entries that name sites are being shown."
+  },
+  "devToolsBackgroundCopySensitiveBody": "{count} of the entries shown name sites or carry page titles and notification text. The clipboard can sync off the device.",
+  "@devToolsBackgroundCopySensitiveBody": {
+    "description": "Body of the confirmation dialog before copying background-log entries that name sites. {count} is how many of the copied entries do.",
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
   }
 }

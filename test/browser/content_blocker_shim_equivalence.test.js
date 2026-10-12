@@ -16,62 +16,11 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const http = require('node:http');
 const {
-  setupBrowser, requireBrowser, readFixture,
+  setupBrowser, requireBrowser,
 } = require('./helpers/launch');
-
-const COSMETIC = readFixture('content_blocker/cosmetic.js');
-
-// Same CSS-only shim shape as the tier-1 test. Inlined here so this
-// file is self-contained and the contract under test is visible.
-const COSMETIC_CSS_ONLY = `
-(function() {
-  var ID = '_webspace_content_blocker_style';
-  if (!document.getElementById(ID)) {
-    var s = document.createElement('style');
-    s.id = ID;
-    s.textContent =
-      '.ad-banner { display: none !important; } ' +
-      '.sponsored { display: none !important; } ' +
-      '#sidebar-ad { display: none !important; } ' +
-      '[data-ad-slot] { display: none !important; } ' +
-      'a[href*="track."] { display: none !important; } ';
-    (document.head || document.documentElement).appendChild(s);
-  }
-  var TEXT_RULES = [{sel:'div.article > p', pats:['Sponsored content']}];
-  function hideText() {
-    for (var i = 0; i < TEXT_RULES.length; i++) {
-      var r = TEXT_RULES[i];
-      try {
-        document.querySelectorAll(r.sel).forEach(function(el) {
-          var text = el.textContent || '';
-          for (var j = 0; j < r.pats.length; j++) {
-            if (text.indexOf(r.pats[j]) !== -1) {
-              el.style.display = 'none';
-              break;
-            }
-          }
-        });
-      } catch (e) {}
-    }
-  }
-  hideText();
-  var t = null;
-  var obs = new MutationObserver(function() {
-    if (t) clearTimeout(t);
-    t = setTimeout(hideText, 50);
-  });
-  if (document.body) {
-    obs.observe(document.body, { childList: true, subtree: true });
-  } else {
-    document.addEventListener('DOMContentLoaded', function() {
-      hideText();
-      obs.observe(document.body, { childList: true, subtree: true });
-    });
-  }
-})();
-`;
+const { COSMETIC, COSMETIC_CSS_ONLY } = require('../js/helpers/content_blocker_samples');
+const { startBlankServer, originOf } = require('./helpers/blank_server');
 
 const browser = setupBrowser();
 
@@ -110,16 +59,8 @@ const SELECTOR_IDS =
 // pages don't observe each other through the static GET.
 let host = null;
 test.before(async () => {
-  await new Promise((resolve) => {
-    const s = http.createServer((req, res) => {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(HOST_HTML);
-    });
-    s.listen(0, '127.0.0.1', () => {
-      host = { url: `http://127.0.0.1:${s.address().port}/`, server: s };
-      resolve();
-    });
-  });
+  const server = await startBlankServer(HOST_HTML, 'text/html; charset=utf-8');
+  host = { url: `${originOf(server)}/`, server };
 });
 test.after(async () => {
   if (host) await new Promise((r) => host.server.close(r));

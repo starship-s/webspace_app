@@ -1,12 +1,12 @@
 import 'package:webspace/services/cookie_secure_storage.dart';
 import 'package:webspace/services/log_service.dart';
-import 'package:webspace/services/webview.dart';
 import 'package:webspace/web_view_model.dart';
+import 'package:webspace/services/cookie_manager.dart';
 
 /// Returns true if `cookie.domain` falls under `baseDomain` per standard
 /// HTTP cookie domain-match semantics (exact match or any subdomain).
 /// Leading `.` is stripped before comparison.
-bool cookieMatchesBaseDomain(Cookie cookie, String baseDomain) {
+bool cookieMatchesBaseDomain(Cookie cookie, {required String baseDomain}) {
   var domain = (cookie.domain ?? '').trim().toLowerCase();
   if (domain.isEmpty || baseDomain.isEmpty) return false;
   if (domain.startsWith('.')) domain = domain.substring(1);
@@ -33,13 +33,13 @@ class CookieIsolationEngine {
     required this.storage,
   });
 
-  /// Captures the conflicting site's cookies to siteId-keyed storage (last
-  /// chance — the webview is about to be disposed), then disposes it and
-  /// removes it from `loadedIndices`.
+  /// Captures the site's cookies to siteId-keyed storage, then disposes its
+  /// webview and removes it from `loadedIndices`; every unload reason comes
+  /// through here (ISO-002).
   ///
-  /// The native cookie jar is NOT nuked here. Callers MUST invoke
-  /// [restoreCookiesForSite] immediately after so the jar is wiped and the
-  /// target's cookies are restored in the same transaction.
+  /// The native jar keeps the site's cookies until the next activation's
+  /// [restoreCookiesForSite], which attributes the jar to the loaded sites
+  /// only and then empties it, so this capture is all the site keeps.
   Future<void> unloadSiteForDomainSwitch({
     required int index,
     required List<WebViewModel> models,
@@ -48,13 +48,11 @@ class CookieIsolationEngine {
     if (index < 0 || index >= models.length) return;
 
     final model = models[index];
-    LogService.instance.log(
-      'CookieIsolation',
-      'Unloading site $index: "${model.name}" (siteId: ${model.siteId})',
-      sensitivity: LogSensitivity.sensitive,
-    );
+    LogTag.cookieIsolation.debug(
+        'Unloading site $index: "${model.name}" (siteId: ${model.siteId})',
+        sensitive: true);
 
-    if (!model.incognito) {
+    if (!model.effectiveIncognito) {
       // Snapshot the full native jar and attribute by base-domain so
       // sibling-subdomain cookies (e.g. `accounts.google.com` for a
       // `mail.google.com` site) aren't lost — a URL-scoped capture alone
@@ -64,22 +62,17 @@ class CookieIsolationEngine {
       );
       final base = getBaseDomain(model.initUrl);
       model.cookies = allCookies
-          .where((c) => cookieMatchesBaseDomain(c, base))
+          .where((c) => cookieMatchesBaseDomain(c, baseDomain: base))
           .toList();
-      await storage.saveCookiesForSite(model.siteId, model.cookies);
-      LogService.instance.log(
-        'CookieIsolation',
-        'Captured ${model.cookies.length} cookies for site $index: "${model.name}"',
-        sensitivity: LogSensitivity.sensitive,
-      );
+      await storage.saveCookiesForSite(model.siteId, cookies: model.cookies);
+      LogTag.cookieIsolation.debug(
+          'Captured ${model.cookies.length} cookies for site $index: "${model.name}"',
+          sensitive: true);
     }
 
     model.disposeWebView();
-    LogService.instance.log(
-      'CookieIsolation',
-      'Disposed webview for site $index',
-      sensitivity: LogSensitivity.sensitive,
-    );
+    LogTag.cookieIsolation.debug(
+        'Disposed webview for site $index', sensitive: true);
     loadedIndices.remove(index);
   }
 
@@ -110,9 +103,9 @@ class CookieIsolationEngine {
     if (index < 0 || index >= models.length) return;
 
     final model = models[index];
-    if (model.incognito) return;
+    if (model.effectiveIncognito) return;
 
-    // Snapshot _loadedIndices before iterating: a concurrent _setCurrentIndex
+    // Snapshot _loadedIndices before iterating: a concurrent setCurrentIndex
     // may mutate it via unloadSiteForDomainSwitch between our awaits. The
     // version guard ultimately aborts us, but iterating a mutating Set
     // directly would throw ConcurrentModificationError first.
@@ -123,10 +116,10 @@ class CookieIsolationEngine {
     final candidateModels = <WebViewModel>[];
     for (final i in loadedSnapshot) {
       if (i < 0 || i >= models.length) continue;
-      if (models[i].incognito) continue;
+      if (models[i].effectiveIncognito) continue;
       candidateModels.add(models[i]);
     }
-    if (!loadedSnapshot.contains(index) && !model.incognito) {
+    if (!loadedSnapshot.contains(index) && !model.effectiveIncognito) {
       candidateModels.add(model);
     }
     final allCookies = await cookieManager.getAllCookies(
@@ -139,14 +132,14 @@ class CookieIsolationEngine {
     for (final loadedIndex in loadedSnapshot) {
       if (loadedIndex >= models.length) continue;
       final loadedModel = models[loadedIndex];
-      if (loadedModel.incognito) continue;
+      if (loadedModel.effectiveIncognito) continue;
 
       final base = getBaseDomain(loadedModel.initUrl);
       final cookies = allCookies
-          .where((c) => cookieMatchesBaseDomain(c, base))
+          .where((c) => cookieMatchesBaseDomain(c, baseDomain: base))
           .toList();
       loadedModel.cookies = cookies;
-      await storage.saveCookiesForSite(loadedModel.siteId, cookies);
+      await storage.saveCookiesForSite(loadedModel.siteId, cookies: cookies);
       if (versionAtEntry != currentVersion()) return;
       if (loadedIndex != index) otherLoadedModels.add(loadedModel);
     }
@@ -165,17 +158,15 @@ class CookieIsolationEngine {
     final cookies = await storage.loadCookiesForSite(model.siteId);
     model.cookies = cookies;
 
-    LogService.instance.log(
-      'CookieIsolation',
-      'Restoring ${cookies.length} cookies for site $index: "${model.name}" (siteId: ${model.siteId})',
-      sensitivity: LogSensitivity.sensitive,
-    );
+    LogTag.cookieIsolation.debug(
+        'Restoring ${cookies.length} cookies for site $index: "${model.name}" (siteId: ${model.siteId})',
+        sensitive: true);
 
-    await _setCookies(model, cookies);
+    await _setCookies(model, cookies: cookies);
 
     // Step 4b: restore every other still-loaded site's cookies.
     for (final other in otherLoadedModels) {
-      await _setCookies(other, other.cookies);
+      await _setCookies(other, cookies: other.cookies);
     }
   }
 
@@ -196,7 +187,7 @@ class CookieIsolationEngine {
       if (loadedIdx == deletedIndex) continue;
       if (loadedIdx >= models.length) continue;
       final loaded = models[loadedIdx];
-      if (loaded.incognito) continue;
+      if (loaded.effectiveIncognito) continue;
       if (getBaseDomain(loaded.initUrl) == deletedBase) {
         survivingSameBase.add(loaded);
       }
@@ -208,7 +199,7 @@ class CookieIsolationEngine {
         candidateUrls: _candidateUrlsFor(survivingSameBase),
       );
       survivingSnapshot = allCookies
-          .where((c) => cookieMatchesBaseDomain(c, deletedBase))
+          .where((c) => cookieMatchesBaseDomain(c, baseDomain: deletedBase))
           .toList();
     }
 
@@ -217,7 +208,7 @@ class CookieIsolationEngine {
         deletedModel.currentUrl != deletedModel.initUrl) {
       await cookieManager.deleteAllCookiesForUrl(Uri.parse(deletedModel.currentUrl));
     }
-    await storage.saveCookiesForSite(deletedModel.siteId, []);
+    await storage.saveCookiesForSite(deletedModel.siteId, cookies: []);
 
     if (survivingSameBase.isNotEmpty && survivingSnapshot.isNotEmpty) {
       final restoreUrl = Uri.parse(survivingSameBase.first.initUrl);
@@ -252,23 +243,15 @@ class CookieIsolationEngine {
       final base = getBaseDomain(m.initUrl);
       if (base.isNotEmpty) urls.add('https://$base/');
     }
-    return urls
-        .map((s) {
-          try {
-            return Uri.parse(s);
-          } catch (_) {
-            return null;
-          }
-        })
-        .whereType<Uri>()
-        .toList();
+    return urls.map(Uri.tryParse).whereType<Uri>().toList();
   }
 
-  Future<void> _setCookies(WebViewModel model, List<Cookie> cookies) async {
+  Future<void> _setCookies(WebViewModel model,
+      {required List<Cookie> cookies}) async {
     final url = Uri.parse(model.initUrl);
     for (final cookie in cookies) {
       if (cookie.value.isEmpty) continue;
-      if (model.isCookieBlocked(cookie.name, cookie.domain)) continue;
+      if (model.isCookieBlocked(cookie.name, domain: cookie.domain)) continue;
       await cookieManager.setCookie(
         url: url,
         name: cookie.name,

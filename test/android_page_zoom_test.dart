@@ -1,40 +1,48 @@
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
-import 'package:webspace/services/webview.dart';
+import 'package:webspace/services/webview_downloads.dart';
 
 void main() {
   test('Android zoom combines viewport and normalized native scale', () {
-    final source = File('lib/services/webview.dart').readAsStringSync();
-    expect(source, contains('await controller.getZoomScale() ?? 1'));
-    expect(source, contains('targetScale / currentScale'));
-    expect(source, contains('controller.zoomBy(zoomFactor: relativeFactor)'));
-    expect(source, contains("groupName: 'android_page_zoom'"));
-    expect(source, contains('AT_DOCUMENT_START'));
-    expect(source, contains('forMainFrameOnly: true'));
-    expect(source, isNot(contains('settings.initialScale')));
+    final webview = File('lib/services/webview.dart').readAsStringSync();
+    expect(webview, contains('await controller.getZoomScale() ?? 1'));
+    expect(webview, contains('targetScale / currentScale'));
+    expect(webview, contains('controller.zoomBy(zoomFactor: relativeFactor)'));
+    expect(webview, isNot(contains('settings.initialScale')));
+
+    final scripts = File('lib/services/page_scripts.dart').readAsStringSync();
+    expect(scripts, contains('buildPageZoomViewportShim('));
+    expect(scripts, contains("pageShim('page_zoom'"));
+    final shim = File('lib/services/page_shim.dart').readAsStringSync();
+    expect(
+      shim,
+      contains(
+        'ShimTime.start => inapp.UserScriptInjectionTime.AT_DOCUMENT_START',
+      ),
+    );
   });
 
   group('same-origin HTTP download bridge validation', () {
     test('accepts same-origin default ports', () {
       expect(
-        isSameHttpOrigin(
+        WebViewDownloads.isSameHttpOrigin(
           'https://example.com/file',
-          'https://example.com/page',
+          current: 'https://example.com/page',
         ),
         isTrue,
       );
       expect(
-        isSameHttpOrigin(
+        WebViewDownloads.isSameHttpOrigin(
           'http://example.com:80/file',
-          'http://example.com/page',
+          current: 'http://example.com/page',
         ),
         isTrue,
       );
       expect(
-        isSameHttpOrigin(
+        WebViewDownloads.isSameHttpOrigin(
           'https://example.com/page',
-          'https://example.com:443/',
+          current: 'https://example.com:443/',
         ),
         isTrue,
       );
@@ -42,20 +50,23 @@ void main() {
 
     test('rejects mismatched scheme, host, and port', () {
       expect(
-        isSameHttpOrigin('http://example.com/file', 'https://example.com/page'),
-        isFalse,
-      );
-      expect(
-        isSameHttpOrigin(
-          'https://other.example/file',
-          'https://example.com/page',
+        WebViewDownloads.isSameHttpOrigin(
+          'http://example.com/file',
+          current: 'https://example.com/page',
         ),
         isFalse,
       );
       expect(
-        isSameHttpOrigin(
+        WebViewDownloads.isSameHttpOrigin(
+          'https://other.example/file',
+          current: 'https://example.com/page',
+        ),
+        isFalse,
+      );
+      expect(
+        WebViewDownloads.isSameHttpOrigin(
           'https://example.com:8443/file',
-          'https://example.com/page',
+          current: 'https://example.com/page',
         ),
         isFalse,
       );
@@ -63,61 +74,77 @@ void main() {
 
     test('rejects malformed and non-http URLs', () {
       expect(
-        isSameHttpOrigin('not a URL', 'https://example.com/page'),
-        isFalse,
-      );
-      expect(
-        isSameHttpOrigin(
-          'blob:https://example.com/id',
-          'https://example.com/page',
+        WebViewDownloads.isSameHttpOrigin(
+          'not a URL',
+          current: 'https://example.com/page',
         ),
         isFalse,
       );
       expect(
-        isSameHttpOrigin('file:///tmp/report', 'file:///tmp/page'),
+        WebViewDownloads.isSameHttpOrigin(
+          'blob:https://example.com/id',
+          current: 'https://example.com/page',
+        ),
         isFalse,
       );
       expect(
-        isSameHttpOrigin('https:///missing-host', 'https://example.com/page'),
+        WebViewDownloads.isSameHttpOrigin(
+          'file:///tmp/report',
+          current: 'file:///tmp/page',
+        ),
+        isFalse,
+      );
+      expect(
+        WebViewDownloads.isSameHttpOrigin(
+          'https:///missing-host',
+          current: 'https://example.com/page',
+        ),
         isFalse,
       );
     });
   });
 
   test('registers the guarded HTTP bridge and native fallback', () {
-    final source = File('lib/services/webview.dart').readAsStringSync();
+    final source = File('lib/services/page_handlers.dart').readAsStringSync();
+    final webview = File('lib/services/webview.dart').readAsStringSync();
     expect(source, contains("handlerName: '_webspaceHttpDownloadStart'"));
-    expect(source, contains('lastStableUrl ?? controllerUrl'));
-    expect(source, contains('isSameHttpOrigin(urlString, liveUrl)'));
-    expect(source, contains('await _handleHttpDownload('));
+    expect(source, contains('sourceUrl() ?? (await controller.getUrl())'));
+    expect(source, contains('isSameHttpOrigin(url, current: liveUrl)'));
+    expect(source, contains('WebViewDownloads.handleHttpDownloadFromAnchor('));
+    expect(
+      webview,
+      contains('sourceUrl: () => lastStableUrl ?? lastLoadStartUrl'),
+    );
   });
 
   test('Android HTTP downloads fall back after internal failures', () {
-    final source = File('lib/services/webview.dart').readAsStringSync();
+    final downloads = File(
+      'lib/services/webview_downloads.dart',
+    ).readAsStringSync();
     final bindings = [
       File('lib/web_view_model.dart').readAsStringSync(),
       File('lib/screens/inappbrowser.dart').readAsStringSync(),
     ].join().replaceAll(RegExp(r'\s+'), ' ');
 
-    expect(source, contains('webViewController: controller'));
-    expect(source, contains('Internal cookie read failed'));
+    expect(downloads, contains('webViewController: controller'));
+    expect(downloads, contains('Internal cookie read failed'));
     expect(
-      source,
+      downloads,
       contains("await handOffToBrowser('Internal cookie read failed')"),
     );
-    expect(source, contains('on DownloadException catch (e)'));
+    expect(downloads, contains('on DownloadException catch (e)'));
     expect(
-      source,
+      downloads,
       contains("await handOffToBrowser('Internal download failed')"),
     );
-    expect(source, contains('DownloadsService.instance.cancel(task.id);'));
-    expect(source, contains('final savedPath = await _saveViaPicker(result);'));
-    expect(source, contains("case 'data':"));
-    expect(source, contains("case 'blob':"));
+    expect(downloads, contains('DownloadsService.instance.cancel(task.id);'));
     expect(
-      source,
-      contains('await _handleHttpDownload(\n          controller,'),
+      downloads,
+      contains('final savedPath = await saveViaPicker(result);'),
     );
+    expect(downloads, contains("case 'data':"));
+    expect(downloads, contains("case 'blob':"));
+    expect(downloads, contains('cookieHeaderFor: (uri) async'));
     expect(
       RegExp(
         'onHttpDownload: hostIsAndroid '

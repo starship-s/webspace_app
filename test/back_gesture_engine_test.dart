@@ -163,4 +163,18 @@ void main() {
       );
     });
   });
+
+  group('platform availability (NAV-009)', () {
+    test('the setting is offered where the app sees the gesture', () {
+      expect(
+        backAtHistoryStartConfigurable(isIOS: false, isMacOS: false),
+        isTrue,
+      );
+    });
+
+    test('Apple never sees the start-of-history swipe, so no setting', () {
+      expect(backAtHistoryStartConfigurable(isIOS: true, isMacOS: false), isFalse);
+      expect(backAtHistoryStartConfigurable(isIOS: false, isMacOS: true), isFalse);
+    });
+  });
 }

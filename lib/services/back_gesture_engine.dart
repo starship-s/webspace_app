@@ -16,7 +16,6 @@ enum BackGestureAction {
   /// `canGoBack()` under-reports `pushState` entries (NAV-002, iOS/macOS).
   attemptGoBack,
 
-  /// Close the open drawer.
   closeDrawer,
 
   /// Close the open drawer and leave the app (NAV-009).
@@ -34,7 +33,8 @@ enum BackGestureAction {
 /// [BackAtHistoryStart.ignore] is the default (issue #369): the gesture only
 /// ever walks webview history. [BackAtHistoryStart.openMenu] restores the
 /// pre-#371 behaviour (issue #431): the drawer opens, and a second gesture on
-/// that drawer leaves the app.
+/// that drawer leaves the app. Only offered where the app sees the gesture at
+/// all — see [backAtHistoryStartConfigurable].
 enum BackAtHistoryStart { ignore, openMenu }
 
 /// Decides what a back gesture means before any webview navigation is
@@ -83,3 +83,18 @@ BackGestureAction decideAfterAttemptedGoBack({
       ? BackGestureAction.openDrawer
       : BackGestureAction.ignore;
 }
+
+/// Whether the NAV-009 setting is offered on this platform.
+///
+/// Apple is out. WKWebView owns the root site webview's left edge natively
+/// (`allowsBackForwardNavigationGestures`, NAV-001) and resolves the swipe
+/// inside itself, and the root route has no Flutter pop for `PopScope` to
+/// intercept, so the app never learns a start-of-history swipe happened. An
+/// app-side edge recognizer put the gesture back in reach but had to infer
+/// history from `goBack()` plus a URL diff, which misreads the start of
+/// history often enough that the drawer appears mid-history.
+bool backAtHistoryStartConfigurable({
+  required bool isIOS,
+  required bool isMacOS,
+}) =>
+    !isIOS && !isMacOS;

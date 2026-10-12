@@ -17,15 +17,15 @@ class SiteDeletionPatch {
   /// from this map were unaffected.
   final Map<String, List<int>> newSiteIndicesByWebspaceId;
 
-  /// Updated value for `_currentIndex`. Semantics mirror `_deleteSite`:
+  /// Updated value for `_currentIndex`. Semantics mirror `SiteEditingController.deleteSite`:
   ///   * deletedIndex == currentIndex       → null (cleared; caller must
-  ///                                          call `_setCurrentIndex(null)`)
+  ///                                          call `setCurrentIndex(null)`)
   ///   * deletedIndex <  currentIndex       → currentIndex - 1
   ///   * deletedIndex >  currentIndex, null → unchanged
   final int? newCurrentIndex;
 
   /// True iff the deleted site was the active one. Signals the caller that
-  /// `_setCurrentIndex(null)` must run (which pauses the now-missing webview
+  /// `setCurrentIndex(null)` must run (which pauses the now-missing webview
   /// and clears fullscreen/canGoBack state) before the list is saved.
   final bool wasCurrentIndex;
 
@@ -92,8 +92,7 @@ class SiteLifecycleEngine {
   ///     filter anything that would be out-of-bounds in the post-removal list.
   ///   * Each webspace's `siteIndices`: drop any entry equal to `deletedIndex`,
   ///     shift `i > deletedIndex` to `i - 1`. Out-of-bounds entries are filtered
-  ///     as a defensive measure (the pre-existing `_cleanupWebspaceIndices`
-  ///     semantics).
+  ///     as a defensive measure.
   ///   * `currentIndex`: cleared if equal to `deletedIndex`, shifted down by
   ///     one if strictly greater, unchanged otherwise.
   ///
