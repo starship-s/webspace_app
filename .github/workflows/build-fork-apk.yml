@@ -222,6 +222,10 @@ jobs:
       - name: Setup Android SDK
         if: steps.sync.outputs.should_build == 'true'
         uses: android-actions/setup-android@v3
+        with:
+          # v3's default also requests the obsolete "tools" package, which
+          # Google removed from its repository.
+          packages: platform-tools
 
       - name: Read Rust toolchain
         if: steps.sync.outputs.should_build == 'true'
@@ -272,20 +276,9 @@ jobs:
         if: steps.sync.outputs.should_build == 'true'
         run: npm run test:js
 
-      - name: Analyze touched overlay production files
+      - name: Analyze production code
         if: steps.sync.outputs.should_build == 'true'
-        run: |
-          fvm flutter analyze --no-fatal-warnings --no-fatal-infos \
-            lib/main.dart \
-            lib/screens/inappbrowser.dart \
-            lib/services/android_page_zoom.dart \
-            lib/services/blob_url_capture.dart \
-            lib/services/diag_seed.dart \
-            lib/services/download_engine.dart \
-            lib/services/surface_diag_native.dart \
-            lib/services/surface_repaint_engine.dart \
-            lib/services/webview.dart \
-            lib/web_view_model.dart
+        run: fvm flutter analyze --no-fatal-warnings --no-fatal-infos lib
 
       - name: Build signed ARM64 fmain APK
         if: steps.sync.outputs.should_build == 'true'
